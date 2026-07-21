@@ -36,7 +36,14 @@ def extract_video_thumbnails(
             str(destination),
         ]
         try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, creationflags=no_window_flags())
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=45,
+                creationflags=no_window_flags(),
+            )
             return destination.exists() and destination.stat().st_size > 0
         except Exception:
             return False
@@ -48,7 +55,14 @@ def extract_video_thumbnails(
     if not make_frame(main_offset, thumb):
         fallback = [str(ffmpeg), "-y", "-hide_banner", "-loglevel", "error", "-i", str(src), "-vf", f"thumbnail,{vf}", "-frames:v", "1", str(thumb)]
         try:
-            subprocess.run(fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, creationflags=no_window_flags())
+            subprocess.run(
+                fallback,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=45,
+                creationflags=no_window_flags(),
+            )
         except Exception:
             return None, []
     for index, offset in enumerate(offsets[:10], start=1):

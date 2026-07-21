@@ -22,10 +22,10 @@ Notes:
 - Pending dashboard work is restored from mestersync_tasks.json after restarting the app.
 - Duplicate review rows appear when checksum or same-name checks find a likely duplicate; use Import anyway when that is intentional.
 - Preset safety warnings appear in Settings when FFmpeg args look risky, such as missing audio handling, unsupported encoders, or large-output settings.
-- Settings includes a preset test that converts a 15-second sample from the middle of a selected video. Test files are stored under data\preset_tests and never replace or modify the selected source.
-- Use Compact: On in the Dashboard header to fit more active files on screen. This preference saves automatically.
+- Preset test has its own sidebar page and converts a 15-second sample from the middle of a selected video. Test files are stored under data\preset_tests and never replace or modify the selected source. A successful new test automatically deletes previous test videos.
+- Use Compact: On above Show log in the Dashboard sidebar to fit more active files on screen. This preference saves automatically.
 - Dashboard rows show the safe final name MesterSync would choose right now. Final output/NAS filenames are checked again at the moment files are finalized so videos cannot overwrite each other.
 - Imports run one at a time. Use the row Up/Down controls or Alt+Up/Down to change which waiting video goes next.
 - A green Disk ready to remove notice appears after every video from a detected recording disk has been copied and checksum-verified. Conversion and NAS transfer may continue afterward.
-- Settings save automatically after a short pause. Save now is available when you want immediate confirmation.
+- Settings save automatically after a short pause.
 - Imported and NAS copies are checksum-verified before MesterSync removes any local working file. Converted media is checked with FFprobe for readable video, duration, and expected audio.

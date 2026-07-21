@@ -1,8 +1,24 @@
 # MesterSync runtime and personal data
 /data/
 /MesterSync.lnk
+**/mestersync_config.json
+**/mestersync_config.json.bak
+**/mestersync_history.json
+**/mestersync_history.json.bak
+**/mestersync_tasks.json
+**/mestersync_tasks.json.bak
+**/mestersync_checksums.json
+**/mestersync_checksums.json.bak
+**/mestersync_settings_backup*.json
+**/mestersync_settings_backup*.json.bak
+**/.mestersync_thumbnails/
+**/preset_tests/
 
 # Local development files
+/.agents/
+/.codex/
+/.vscode/
+/.idea/
 **/__pycache__/
 *.py[cod]
 *.log

@@ -125,6 +125,42 @@ def preset_dir() -> Path:
     return path
 
 
+def same_location(left: Path | str, right: Path | str) -> bool:
+    try:
+        return os.path.normcase(os.path.abspath(str(left))) == os.path.normcase(os.path.abspath(str(right)))
+    except Exception:
+        return str(left) == str(right)
+
+
+def migrate_thumbnail_path(value: Any) -> str:
+    """Relocate a thumbnail reference from an older MesterSync installation.
+
+    Only paths whose immediate parent is MesterSync's private thumbnail-cache
+    directory are eligible. Media paths and other user-selected locations are
+    deliberately left untouched.
+    """
+    raw_path = str(value or "").strip()
+    if not raw_path:
+        return ""
+    saved_path = Path(raw_path)
+    if saved_path.parent.name.lower() != THUMBNAIL_DIRNAME.lower():
+        return raw_path
+    current_folder = thumbnail_dir()
+    if same_location(saved_path.parent, current_folder):
+        return raw_path
+    return str(current_folder / saved_path.name)
+
+
+def migrate_record_thumbnail_paths(record: Dict[str, Any]) -> Dict[str, Any]:
+    migrated = dict(record)
+    if migrated.get("thumbnail_path"):
+        migrated["thumbnail_path"] = migrate_thumbnail_path(migrated["thumbnail_path"])
+    previews = migrated.get("thumbnail_preview_paths")
+    if isinstance(previews, list):
+        migrated["thumbnail_preview_paths"] = [migrate_thumbnail_path(path) for path in previews if path]
+    return migrated
+
+
 def read_json_file(path: Path, default: Any) -> Any:
     backup = path.with_suffix(path.suffix + ".bak")
     try:
@@ -176,7 +212,9 @@ def write_json_file(path: Path, data: Any) -> None:
 
 def load_history_records() -> list[Dict[str, Any]]:
     data = read_json_file(history_path(), [])
-    return data if isinstance(data, list) else []
+    if not isinstance(data, list):
+        return []
+    return [migrate_record_thumbnail_paths(record) for record in data if isinstance(record, dict)]
 
 
 def save_history_records(records: list[Dict[str, Any]]) -> None:
@@ -185,7 +223,9 @@ def save_history_records(records: list[Dict[str, Any]]) -> None:
 
 def load_task_records() -> list[Dict[str, Any]]:
     data = read_json_file(tasks_path(), [])
-    return data if isinstance(data, list) else []
+    if not isinstance(data, list):
+        return []
+    return [migrate_record_thumbnail_paths(record) for record in data if isinstance(record, dict)]
 
 
 def save_task_records(records: list[Dict[str, Any]]) -> None:
@@ -196,17 +236,30 @@ def normalize_config_data(config_data: Dict[str, Any], default_ffmpeg_args: list
     cfg = dict(config_data)
     if not isinstance(cfg.get("ffmpeg_args"), list):
         cfg["ffmpeg_args"] = default_ffmpeg_args[:]
+    else:
+        legacy_default_args = default_ffmpeg_args[:]
+        try:
+            legacy_default_args[legacy_default_args.index("0:a:0?")] = "0:a:0"
+        except ValueError:
+            pass
+        if cfg["ffmpeg_args"] == legacy_default_args:
+            cfg["ffmpeg_args"] = default_ffmpeg_args[:]
     checksum_path = str(cfg.get("checksum_database_path", "")).strip()
     if not checksum_path or Path(checksum_path).name.lower() in {"mestersync_checksums.json", ".checksums.json"}:
         cfg["checksum_database_path"] = str(default_checksum_path())
     preset_folder = str(cfg.get("preset_folder", "")).strip()
     preset_path = Path(preset_folder) if preset_folder else None
+    current_preset_dir = preset_dir()
     if (
         not preset_folder
         or (preset_path and preset_path.name.lower() == "ffmpeg_presets")
-        or (preset_path and preset_path.name.lower() == PRESET_DIRNAME and not preset_path.exists())
+        or (
+            preset_path
+            and preset_path.name.lower() == PRESET_DIRNAME
+            and not same_location(preset_path, current_preset_dir)
+        )
     ):
-        cfg["preset_folder"] = str(preset_dir())
+        cfg["preset_folder"] = str(current_preset_dir)
     return cfg
 
 
@@ -273,9 +326,10 @@ def task_to_record(task: TaskState) -> Dict[str, Any]:
 
 def record_to_task(record: Dict[str, Any]) -> Optional[TaskState]:
     try:
-        original_path = Path(record.get("original_path") or "")
-        if not str(original_path):
+        original_value = str(record.get("original_path") or "").strip()
+        if not original_value:
             return None
+        original_path = Path(original_value)
         task = TaskState(
             task_id=str(record.get("task_id") or uuid.uuid4().hex),
             original_path=original_path,

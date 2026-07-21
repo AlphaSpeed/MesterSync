@@ -178,6 +178,9 @@ def sanitize_base_name(value: str, auto_underscores: bool) -> str:
         base = re.sub(r"\s+", "_", base)
     invalid = '<>:"/\\|?*'
     base = "".join("_" if ch in invalid else ch for ch in base).rstrip(" .")
+    reserved = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+    if base.split(".", 1)[0].upper() in reserved:
+        base = f"_{base}"
     return base
 
 

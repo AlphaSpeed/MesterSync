@@ -52,6 +52,8 @@ from file_utils import (
 )
 from importer import collect_import_candidates, scan_drive_importable_videos, scan_watchfolder_candidates
 from presets import analyze_preset_args, arg_value, detect_output_extension, preset_badges
+from preset_testing import delete_previous_preset_tests, preset_sample_window, preset_test_output_paths
+from rename_utils import batch_rename_bases
 from storage import (
     app_dir,
     config_path,
@@ -101,7 +103,7 @@ from ui_widgets import ChipSelector
 from worker_utils import wait_for_conversion_task, wait_for_transfer_task
 
 APP_NAME = "MesterSync"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 APP_USER_MODEL_ID = "MesterSync.VideoWorkflow.App"
 LOGO_FILENAME = "mestersync_logo.png"
 ICON_FILENAME = "mestersync_icon.ico"
@@ -391,7 +393,7 @@ class MesterSyncApp:
             if not str(self.config.get(key, "")).strip():
                 missing.append(label)
         ffmpeg = str(self.config.get("ffmpeg_path", "")).strip()
-        if not ffmpeg or not Path(ffmpeg).exists():
+        if not ffmpeg or not Path(ffmpeg).is_file():
             missing.append("FFmpeg.exe")
         return missing
 
@@ -612,6 +614,10 @@ class MesterSyncApp:
             if missing:
                 messagebox.showerror(APP_NAME, "Please choose:\n" + "\n".join(f"- {item}" for item in missing), parent=wizard)
                 return
+            ffmpeg_candidate = Path(values["ffmpeg_path"].get().strip())
+            if not ffmpeg_candidate.is_file():
+                messagebox.showerror(APP_NAME, f"FFmpeg.exe was not found:\n\n{ffmpeg_candidate}", parent=wizard)
+                return
             folder_errors = [
                 validate_writable_folder(values["input_folder"].get().strip(), "Importfolder"),
                 validate_writable_folder(values["output_folder"].get().strip(), "Output folder"),
@@ -682,8 +688,11 @@ class MesterSyncApp:
 
     def check_ffmpeg_health(self, cfg: Dict[str, Any]) -> List[str]:
         lines: List[str] = []
-        ffmpeg = Path(cfg.get("ffmpeg_path", ""))
-        if not ffmpeg.exists():
+        ffmpeg_value = str(cfg.get("ffmpeg_path", "")).strip()
+        if not ffmpeg_value:
+            return ["ERROR FFmpeg.exe is not configured."]
+        ffmpeg = Path(ffmpeg_value)
+        if not ffmpeg.is_file():
             return [f"ERROR FFmpeg not found: {ffmpeg}"]
         lines.append(f"OK FFmpeg found: {ffmpeg}")
         ffprobe = ffmpeg.parent / "ffprobe.exe"
@@ -706,7 +715,7 @@ class MesterSyncApp:
         key = str(ffmpeg)
         if key in self.encoder_cache:
             return self.encoder_cache[key]
-        if not ffmpeg.exists():
+        if not ffmpeg.is_file():
             return None
         try:
             result = subprocess.run([str(ffmpeg), "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=15, creationflags=no_window_flags())
@@ -1177,35 +1186,46 @@ class MesterSyncApp:
         left.configure(width=160)
         left.pack_propagate(False)
         self.tab_buttons: Dict[str, tk.Button] = {}
-        for key, label in [("dashboard", "Dashboard"), ("history", "History"), ("settings", "Settings")]:
+        for key, label in [("dashboard", "Dashboard"), ("history", "History"), ("settings", "Settings"), ("preset_test", "Preset test")]:
             btn = self.button(left, label, lambda k=key: self.show_tab(k), self.CARD3)
             btn.pack(fill="x", pady=(0, 10))
             self.tab_buttons[key] = btn
         tk.Frame(left, bg=self.CARD).pack(fill="both", expand=True)
-        self.log_toggle = self.button(left, "Show log", self.toggle_log, self.CARD3)
-        self.log_toggle.pack(fill="x", side="bottom")
+        self.dashboard_side_controls = tk.Frame(left, bg=self.CARD)
+        self.dashboard_side_controls.pack(fill="x", side="bottom")
+        self.compact_dashboard_btn = self.button(
+            self.dashboard_side_controls,
+            "",
+            self.toggle_compact_dashboard,
+            self.BLUE if self.compact_dashboard else self.CARD3,
+        )
+        self.compact_dashboard_btn.pack(fill="x", pady=(0, 10))
+        self.update_compact_dashboard_button()
+        self.log_toggle = self.button(self.dashboard_side_controls, "Show log", self.toggle_log, self.CARD3)
+        self.log_toggle.pack(fill="x")
         self.content = tk.Frame(body, bg=self.BG)
         self.content.pack(side="left", fill="both", expand=True)
         self.dashboard_frame = tk.Frame(self.content, bg=self.BG)
         self.history_frame = tk.Frame(self.content, bg=self.BG)
         self.settings_frame = tk.Frame(self.content, bg=self.BG)
+        self.preset_test_frame = tk.Frame(self.content, bg=self.BG)
         self.build_dashboard()
         self.build_history()
         self.build_settings()
+        self.build_preset_test()
         self.show_tab("dashboard")
 
     def show_tab(self, key: str) -> None:
-        for frame in (self.dashboard_frame, self.history_frame, self.settings_frame):
+        for frame in (self.dashboard_frame, self.history_frame, self.settings_frame, self.preset_test_frame):
             frame.pack_forget()
         for k, b in self.tab_buttons.items():
             b.configure(bg=self.BLUE if k == key else self.CARD3)
         getattr(self, f"{key}_frame").pack(fill="both", expand=True)
-        if hasattr(self, "log_toggle"):
-            if key == "dashboard":
-                if not self.log_toggle.winfo_ismapped():
-                    self.log_toggle.pack(fill="x", side="bottom")
-            else:
-                self.log_toggle.pack_forget()
+        if hasattr(self, "dashboard_side_controls"):
+            if key == "dashboard" and not self.dashboard_side_controls.winfo_ismapped():
+                self.dashboard_side_controls.pack(fill="x", side="bottom")
+            elif key != "dashboard" and self.dashboard_side_controls.winfo_ismapped():
+                self.dashboard_side_controls.pack_forget()
         if key == "dashboard":
             self.refresh_dashboard_rows()
 
@@ -1341,9 +1361,6 @@ class MesterSyncApp:
         self.update_session_summary()
         right = tk.Frame(header, bg=self.CARD)
         right.pack(side="right")
-        self.compact_dashboard_btn = self.small_button(right, "", self.toggle_compact_dashboard, self.BLUE if self.compact_dashboard else self.CARD3)
-        self.compact_dashboard_btn.pack(side="left", padx=(0, 8))
-        self.update_compact_dashboard_button()
         self.add_files_button = self.button(right, "Add files", self.add_files_dialog, self.CARD3)
         self.add_files_button.pack(side="left", padx=(0, 8))
         self.scan_button = self.button(right, "Scan now", self.manual_scan, self.CARD3)
@@ -1582,22 +1599,6 @@ class MesterSyncApp:
         tk.Label(preset_row, textvariable=self.output_ext_var, bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9)).pack(side="right")
         self.preset_warning_var = tk.StringVar(value=self.preset_warning_text(self.config["ffmpeg_args"]))
         tk.Label(ff, textvariable=self.preset_warning_var, bg=self.CARD, fg=self.YELLOW, font=("Segoe UI", 9, "bold"), anchor="w", justify="left", wraplength=1180).pack(fill="x", pady=(0, 8))
-        test_box = tk.Frame(ff, bg=self.CARD2, padx=10, pady=10, highlightthickness=2, highlightbackground=self.BORDER)
-        test_box.pack(fill="x", pady=(0, 8))
-        test_text = tk.Frame(test_box, bg=self.CARD2)
-        test_text.pack(side="left", fill="x", expand=True)
-        tk.Label(test_text, text="Preset test", bg=self.CARD2, fg=self.TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        tk.Label(test_text, text="Converts a 15-second sample from the middle of a selected video using the parameters below. The source video is never changed.", bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 8), anchor="w", justify="left", wraplength=760).pack(anchor="w", pady=(2, 3))
-        self.preset_test_status_var = tk.StringVar(value="No test has been run this session.")
-        self.preset_test_status_label = tk.Label(test_text, textvariable=self.preset_test_status_var, bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 9, "bold"), anchor="w")
-        self.preset_test_status_label.pack(fill="x")
-        test_buttons = tk.Frame(test_box, bg=self.CARD2)
-        test_buttons.pack(side="right", padx=(12, 0))
-        self.preset_test_open_btn = self.small_button(test_buttons, "Open last test", self.open_last_preset_test, self.CARD3)
-        self.preset_test_open_btn.pack(side="left", padx=(0, 8))
-        self.preset_test_open_btn.configure(state="disabled")
-        self.preset_test_run_btn = self.small_button(test_buttons, "Run 15s test", self.start_or_cancel_preset_test, self.BLUE)
-        self.preset_test_run_btn.pack(side="left")
         self.ffmpeg_args_text = scrolledtext.ScrolledText(ff, height=18, wrap="none", font=("Consolas", 9), bg="#07111e", fg="#d7e8ff", insertbackground="#d7e8ff", relief="flat")
         self.ffmpeg_args_text.pack(fill="both", expand=True)
         self.ffmpeg_args_text.insert("1.0", "\n".join(self.config["ffmpeg_args"]))
@@ -1609,7 +1610,6 @@ class MesterSyncApp:
         self.total_converted_var = tk.StringVar(value=f"Total converted with MesterSync: {self.total_converted_count()}")
         tk.Label(footer, textvariable=self.total_converted_var, bg=self.BG, fg=self.MUTED, font=("Segoe UI", 10, "bold")).pack(side="left")
         tk.Label(footer, text="Settings save automatically", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(side="right", padx=(0, 10))
-        self.button(footer, "Save now", self.save_config, self.GREEN).pack(side="right")
 
         for var in [
             self.input_folder_var,
@@ -1628,6 +1628,33 @@ class MesterSyncApp:
             self.preset_folder_var,
         ]:
             var.trace_add("write", lambda *_args: self.on_setting_changed())
+
+    def build_preset_test(self) -> None:
+        card = self.card_frame(self.preset_test_frame, fill="both", expand=True)
+        tk.Label(card, text="Preset test", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        tk.Label(
+            card,
+            text="Convert a 15-second sample from the middle of a selected video using the current FFmpeg parameters from Settings. The selected source is never changed. After a successful test, the previous test video is deleted automatically.",
+            bg=self.CARD,
+            fg=self.MUTED,
+            font=("Segoe UI", 10),
+            anchor="w",
+            justify="left",
+            wraplength=900,
+        ).pack(fill="x", pady=(6, 18))
+        status_box = tk.Frame(card, bg=self.CARD2, padx=14, pady=14, highlightthickness=2, highlightbackground=self.BORDER)
+        status_box.pack(fill="x")
+        self.preset_test_status_var = tk.StringVar(value="No test has been run this session.")
+        self.preset_test_status_label = tk.Label(status_box, textvariable=self.preset_test_status_var, bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 10, "bold"), anchor="w")
+        self.preset_test_status_label.pack(fill="x")
+        buttons = tk.Frame(card, bg=self.CARD)
+        buttons.pack(anchor="w", pady=(14, 0))
+        self.preset_test_run_btn = self.button(buttons, "Run 15s test", self.start_or_cancel_preset_test, self.BLUE)
+        self.preset_test_run_btn.pack(side="left")
+        self.preset_test_open_btn = self.button(buttons, "Open last test", self.open_last_preset_test, self.CARD3)
+        self.preset_test_open_btn.pack(side="left", padx=(10, 0))
+        self.preset_test_open_btn.configure(state="disabled")
+        self.button(buttons, "Open Settings", lambda: self.show_tab("settings"), self.CARD3).pack(side="left", padx=(10, 0))
 
     def update_total_converted_label(self) -> None:
         if hasattr(self, "total_converted_var"):
@@ -2046,29 +2073,22 @@ class MesterSyncApp:
         }))
         self.emit_status()
 
-    @staticmethod
-    def preset_test_window(duration: float) -> Tuple[float, float]:
-        sample_duration = min(15.0, max(0.0, duration))
-        return max(0.0, (duration - sample_duration) / 2.0), sample_duration
-
     def run_preset_test_worker(self, source: Path, ffmpeg: Path, ffmpeg_args: List[str], preset_name: str) -> None:
         output_path: Optional[Path] = None
         temp_output: Optional[Path] = None
+        process: Optional[subprocess.Popen[str]] = None
         try:
             duration = self.get_duration(source, ffmpeg)
             if not duration or duration <= 0:
                 self.finish_preset_test("Could not read the selected video's duration.", error=True, show_error=True)
                 return
-            start_at, sample_duration = self.preset_test_window(duration)
+            start_at, sample_duration = preset_sample_window(duration)
             if self.preset_test_cancel.is_set() or self.shutdown_event.is_set():
                 self.finish_preset_test("Preset test cancelled.")
                 return
             folder = preset_test_dir()
             extension = detect_output_extension(ffmpeg_args)
-            safe_preset = sanitize_base_name(preset_name, True) or "preset"
-            safe_source = sanitize_base_name(source.stem, True) or "video"
-            output_path = unique_path(folder / f"{safe_source}_{safe_preset}_15s_test{extension}")
-            temp_output = output_path.with_name(f".mestersync_test_{uuid.uuid4().hex}_{output_path.name}")
+            output_path, temp_output = preset_test_output_paths(folder, source, preset_name, extension)
             safe_args = [arg for arg in ffmpeg_args if str(arg).strip().lower() not in {"-y", "-n"}]
             command = [
                 str(ffmpeg), "-n", "-hide_banner", "-ss", f"{start_at:.3f}", "-i", str(source),
@@ -2128,7 +2148,11 @@ class MesterSyncApp:
                 force_delete(output_path)
                 self.finish_preset_test(f"Preset test failed validation: {validation_error}", error=True, show_error=True)
                 return
-            self.cleanup_old_preset_tests(output_path)
+            removed, cleanup_warnings = delete_previous_preset_tests(folder, output_path)
+            if removed:
+                self.emit_log(f"Deleted {removed} previous preset test video(s).")
+            for warning in cleanup_warnings:
+                self.emit_log(f"Preset test cleanup warning: {warning}")
             self.emit_log(f"Preset test complete: {output_path}")
             self.finish_preset_test(f"Ready: {output_path.name}", path=output_path)
         except Exception as exc:
@@ -2136,19 +2160,18 @@ class MesterSyncApp:
                 force_delete(temp_output)
             self.emit_log(f"Preset test error: {exc}")
             self.finish_preset_test(f"Preset test error: {exc}", error=True, show_error=True)
-
-    def cleanup_old_preset_tests(self, keep_path: Path, keep_count: int = 20) -> None:
-        try:
-            files = sorted(
-                (path for path in preset_test_dir().iterdir() if path.is_file() and not path.name.startswith(".mestersync_test_")),
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
-            for path in files[keep_count:]:
-                if path_key(path) != path_key(keep_path):
-                    force_delete(path)
-        except OSError as exc:
-            self.emit_log(f"Preset test cleanup warning: {exc}")
+        finally:
+            if process and process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                except OSError as exc:
+                    self.emit_log(f"Preset test process cleanup warning: {exc}")
+            with self.preset_test_process_lock:
+                if self.preset_test_process is process:
+                    self.preset_test_process = None
 
     def open_last_preset_test(self) -> None:
         if not self.preset_test_last_path or not self.preset_test_last_path.exists():
@@ -2738,9 +2761,15 @@ class MesterSyncApp:
             if folder_errors:
                 messagebox.showerror(APP_NAME, "MesterSync cannot safely start with these folders:\n\n" + "\n".join(f"- {error}" for error in folder_errors))
                 return
-            ffmpeg = Path(cfg["ffmpeg_path"])
-            if not ffmpeg.exists():
-                if not messagebox.askyesno(APP_NAME, f"FFmpeg was not found at:\n{ffmpeg}\n\nStart anyway?"):
+            ffmpeg_value = str(cfg.get("ffmpeg_path", "")).strip()
+            ffmpeg = Path(ffmpeg_value) if ffmpeg_value else None
+            conversion_allowed = bool(ffmpeg and ffmpeg.is_file())
+            if not conversion_allowed:
+                shown_path = str(ffmpeg) if ffmpeg else "Not configured"
+                if not messagebox.askyesno(
+                    APP_NAME,
+                    f"FFmpeg was not found at:\n{shown_path}\n\nStart importing without conversion?",
+                ):
                     return
             transfer_allowed = bool(str(cfg.get("nas_folder", "")).strip())
         except Exception as exc:
@@ -2749,7 +2778,7 @@ class MesterSyncApp:
         self.ensure_workers_running()
         self.import_cancel_requested.clear()
         self.import_enabled = True
-        self.conversion_enabled = True
+        self.conversion_enabled = conversion_allowed
         self.transfer_enabled = transfer_allowed
         self.pause_event.clear()
         self.queue_ready_conversions()
@@ -2760,7 +2789,10 @@ class MesterSyncApp:
             self.queue_condition.notify_all()
         with self.transfer_condition:
             self.transfer_condition.notify_all()
-        self.log("Started all services." if transfer_allowed else "Started import/conversion. Transfer is off because no NAS folder is configured.")
+        if not conversion_allowed:
+            self.log("Started import only. Conversion is off because FFmpeg is not configured.")
+        else:
+            self.log("Started all services." if transfer_allowed else "Started import/conversion. Transfer is off because no NAS folder is configured.")
         self.emit_status()
 
     def stop_all(self) -> None:
@@ -3757,24 +3789,17 @@ class MesterSyncApp:
         selected = [tid for tid in self.selected_ids if tid in self.tasks]
         if len(selected) < 2:
             return
-        cfg = self.get_config()
-        auto = bool(cfg.get("auto_underscore_renames", False))
-        text = sanitize_base_name(self.batch_name_var.get(), auto)
-        if not text:
-            return
+        auto = bool(self.auto_underscore_var.get()) if hasattr(self, "auto_underscore_var") else bool(self.get_config().get("auto_underscore_renames", False))
         with self.task_lock:
             ordered = sorted([self.tasks[tid] for tid in selected], key=lambda t: t.created_at)
         prefix = bool(self.batch_prefix_var.get())
         suffix = bool(self.batch_suffix_var.get())
-        for i, task in enumerate(ordered, start=1):
-            current = sanitize_base_name(task.rename_base or Path(task.display_name).stem, auto) or Path(task.display_name).stem
-            if prefix:
-                new_base = f"{text}{current}"
-            elif suffix:
-                new_base = f"{current}{text}"
-            else:
-                new_base = f"{text}_{i:02d}"
-            self.update_task(task.task_id, rename_base=sanitize_base_name(new_base, auto) or current)
+        current_bases = [task.rename_base or Path(task.display_name).stem for task in ordered]
+        new_bases = batch_rename_bases(current_bases, self.batch_name_var.get(), auto, prefix, suffix)
+        if not new_bases:
+            return
+        for task, new_base in zip(ordered, new_bases):
+            self.update_task(task.task_id, rename_base=new_base)
         self.log(f"Batch rename applied to {len(ordered)} selected files.")
 
     def update_batch_box_visibility(self) -> None:
@@ -3813,8 +3838,7 @@ class MesterSyncApp:
         if len(selected) <= 1 and raw_base == task.rename_base:
             row["dirty"] = False
             return
-        cfg = self.get_config()
-        auto = bool(cfg.get("auto_underscore_renames", False))
+        auto = bool(self.auto_underscore_var.get()) if hasattr(self, "auto_underscore_var") else bool(self.get_config().get("auto_underscore_renames", False))
         if len(selected) > 1 and task_id in selected:
             base = sanitize_base_name(raw_base or "renamed_video", auto)
             with self.task_lock:
@@ -4502,7 +4526,8 @@ class MesterSyncApp:
             if destination.exists():
                 self.emit_log(f"Copy stopped because destination already exists: {destination}")
                 return False
-            total = source.stat().st_size
+            source_stat = source.stat()
+            total = source_stat.st_size
             free = free_space_bytes(destination)
             if free is not None and free < total:
                 self.emit_log(f"Copy stopped: not enough free space for {destination}. Need {format_size(total)}, free {format_size(free)}.")
@@ -4537,6 +4562,15 @@ class MesterSyncApp:
                     maybe_callback(int(copied / total * 100) if total else 100)
                 dst.flush()
                 os.fsync(dst.fileno())
+            final_source_stat = source.stat()
+            if (
+                copied != total
+                or final_source_stat.st_size != total
+                or final_source_stat.st_mtime_ns != source_stat.st_mtime_ns
+            ):
+                force_delete(temp)
+                self.emit_log(f"Copy stopped because the source changed while it was being read: {source}")
+                return False
             if not self.promote_temp_no_overwrite(temp, destination):
                 force_delete(temp)
                 self.emit_log(f"Copy stopped because destination appeared during copy: {destination}")
@@ -4905,6 +4939,7 @@ class MesterSyncApp:
         cmd = [str(ffmpeg_path), "-n", "-hide_banner", "-i", str(source)] + ffmpeg_args + [str(temp_output)]
         start = time.time()
         last_lines: List[str] = []
+        proc: Optional[subprocess.Popen[str]] = None
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, bufsize=1, creationflags=no_window_flags())
             with self.current_process_lock:
@@ -4995,6 +5030,18 @@ class MesterSyncApp:
             self.update_task(task_id, stage=STAGE_ERROR, detail=f"Conversion error: {exc}", error_log=str(exc))
             self.emit_log(f"Conversion error for {source.name}: {exc}")
         finally:
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                except OSError as exc:
+                    self.emit_log(f"FFmpeg process cleanup warning for {source.name}: {exc}")
+            with self.current_process_lock:
+                if self.current_process is proc:
+                    self.current_process = None
+                    self.current_process_paused = False
             self.release_output_target(output_path)
             self.emit_progress("conversion", "Conversion: idle", 0, None)
 
@@ -5546,6 +5593,10 @@ class MesterSyncApp:
                 for path in (task.original_path, task.local_input_path, task.output_path, task.nas_path):
                     if path:
                         self.task_by_path[path_key(path)] = task_id
+            try:
+                self.save_pending_tasks(force=True)
+            except Exception as recovery_exc:
+                self.emit_log(f"Could not persist restored completion task {task.display_name}: {recovery_exc}")
             self.emit_task(task_id)
             raise
         self.gui_queue.put(("archive_ui", task_id))

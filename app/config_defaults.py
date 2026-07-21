@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 
 DEFAULT_FFMPEG_ARGS: List[str] = [
     "-map", "0:v:0",
-    "-map", "0:a:0",
+    "-map", "0:a:0?",
     "-map", "-0:d",
     "-map", "-0:t",
     "-map", "-0:s",
