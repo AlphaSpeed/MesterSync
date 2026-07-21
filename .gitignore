@@ -1,0 +1,13 @@
+# MesterSync runtime and personal data
+/data/
+/MesterSync.lnk
+
+# Local development files
+**/__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.part
+Thumbs.db
+Desktop.ini
+.DS_Store
