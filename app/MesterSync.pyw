@@ -12,7 +12,6 @@ import time
 import traceback
 import uuid
 import ctypes
-import hashlib
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +27,7 @@ except Exception:
     TkinterDnD = None
 
 from config_defaults import COMMON_VIDEO_EXTENSIONS, DEFAULT_CONFIG, DEFAULT_FFMPEG_ARGS
+from diagnostics import query_video_encoders, run_diagnostics
 from duplicates import exact_duplicate_reason, remove_missing_checksum_entries
 from file_utils import (
     ensure_folder,
@@ -51,9 +51,25 @@ from file_utils import (
     validate_writable_folder,
 )
 from importer import collect_import_candidates, scan_drive_importable_videos, scan_watchfolder_candidates
+from media_validation import (
+    ffprobe_media_info as probe_media_info,
+    get_duration as probe_duration,
+    validate_converted_output as validate_media_output,
+)
+from output_names import (
+    next_final_name,
+    release_reserved_path,
+    reserve_final_target,
+    reserve_unique_path,
+)
 from presets import analyze_preset_args, arg_value, detect_output_extension, preset_badges
 from preset_testing import delete_previous_preset_tests, preset_sample_window, preset_test_output_paths
 from rename_utils import batch_rename_bases
+from safe_files import (
+    copy_file_safely as copy_path_safely,
+    move_file_no_overwrite as move_path_no_overwrite,
+    promote_temp_no_overwrite as promote_path_no_overwrite,
+)
 from storage import (
     app_dir,
     config_path,
@@ -191,6 +207,8 @@ class MesterSyncApp:
         self.history_widgets: List[tk.Widget] = []
         self.thumbnail_images = ImageCache(MAX_IMAGE_CACHE_ITEMS)
         self.encoder_cache: Dict[str, set[str]] = {}
+        self.encoder_queries_pending: set[str] = set()
+        self.health_check_running = False
         self.session_stats = {"imported": 0, "converted": 0, "transferred": 0, "skipped": 0, "errors": 0}
         self.session_bytes_saved = 0
         self.session_error_ids: set[str] = set()
@@ -656,75 +674,24 @@ class MesterSyncApp:
         self.button(buttons, "Save", lambda: save_setup(False), self.BLUE).pack(side="right", padx=(0, 8))
         self.button(buttons, "Close", wizard.destroy, self.CARD3).pack(side="right", padx=(0, 8))
 
-    def folder_space_message(self, label: str, folder: Path) -> str:
-        free = free_space_bytes(folder)
-        if free is None:
-            return f"WARNING {label}: could not read free space for {folder}"
-        return f"OK {label}: {format_size(free)} free"
-
-    def check_folder_health(self, cfg: Dict[str, Any]) -> List[str]:
-        lines: List[str] = []
-        folders = [
-            ("input_folder", "Importfolder", True),
-            ("output_folder", "Output folder", True),
-            ("nas_folder", "NAS folder", False),
-        ]
-        for key, label, required in folders:
-            raw = str(cfg.get(key, "")).strip()
-            if not raw:
-                if required:
-                    lines.append(f"ERROR {label} is not configured.")
-                else:
-                    lines.append(f"INFO {label} is optional and not configured.")
-                continue
-            folder = Path(raw)
-            error = validate_writable_folder(raw, label, required=required)
-            if error:
-                lines.append(f"ERROR {error}")
-                continue
-            lines.append(f"OK {label} exists and is writable: {folder}")
-            lines.append(self.folder_space_message(label, folder))
-        return lines
-
-    def check_ffmpeg_health(self, cfg: Dict[str, Any]) -> List[str]:
-        lines: List[str] = []
-        ffmpeg_value = str(cfg.get("ffmpeg_path", "")).strip()
-        if not ffmpeg_value:
-            return ["ERROR FFmpeg.exe is not configured."]
-        ffmpeg = Path(ffmpeg_value)
-        if not ffmpeg.is_file():
-            return [f"ERROR FFmpeg not found: {ffmpeg}"]
-        lines.append(f"OK FFmpeg found: {ffmpeg}")
-        ffprobe = ffmpeg.parent / "ffprobe.exe"
-        lines.append(f"{'OK' if ffprobe.exists() else 'WARNING'} FFprobe {'found' if ffprobe.exists() else 'not found'}: {ffprobe}")
-        try:
-            result = subprocess.run([str(ffmpeg), "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=15, creationflags=no_window_flags())
-            encoder_text = (result.stdout or "") + (result.stderr or "")
-            args_text = " ".join(str(x) for x in cfg.get("ffmpeg_args", []))
-            wanted = re.findall(r"-c:v\s+(\S+)", args_text)
-            for encoder in wanted or ["hevc_nvenc"]:
-                if encoder in encoder_text:
-                    lines.append(f"OK video encoder available: {encoder}")
-                else:
-                    lines.append(f"WARNING video encoder not listed by FFmpeg: {encoder}")
-        except Exception as exc:
-            lines.append(f"WARNING could not query FFmpeg encoders: {exc}")
-        return lines
-
     def available_video_encoders(self, ffmpeg: Path) -> Optional[set[str]]:
         key = str(ffmpeg)
         if key in self.encoder_cache:
             return self.encoder_cache[key]
         if not ffmpeg.is_file():
             return None
-        try:
-            result = subprocess.run([str(ffmpeg), "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=15, creationflags=no_window_flags())
-            text = (result.stdout or "") + (result.stderr or "")
-            encoders = set(re.findall(r"^\s*[A-Z.]{6}\s+(\S+)", text, flags=re.MULTILINE))
-            self.encoder_cache[key] = encoders
-            return encoders
-        except Exception:
-            return None
+        if key not in self.encoder_queries_pending:
+            self.encoder_queries_pending.add(key)
+
+            def query() -> None:
+                try:
+                    encoders = query_video_encoders(ffmpeg)
+                    self.gui_queue.put(("encoder_cache_ready", (key, encoders, "")))
+                except Exception as exc:
+                    self.gui_queue.put(("encoder_cache_ready", (key, None, str(exc))))
+
+            threading.Thread(target=query, daemon=True, name="FFmpegEncoderQuery").start()
+        return None
 
     def preset_safety_warnings(self, ffmpeg_args: Iterable[str], check_encoder: bool = False) -> List[str]:
         args = [str(arg).strip() for arg in ffmpeg_args if str(arg).strip()]
@@ -744,18 +711,52 @@ class MesterSyncApp:
         return "Preset safety warnings: " + "  ".join(warnings)
 
     def run_health_check(self) -> None:
+        if self.health_check_running:
+            self.log("Health check is already running.")
+            return
         try:
             self.set_config_from_ui()
             cfg = self.get_config()
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"Could not read settings:\n{exc}")
             return
-        lines: List[str] = []
-        lines.extend(self.check_folder_health(cfg))
-        lines.extend(self.check_ffmpeg_health(cfg))
-        text = "\n".join(lines)
+        self.health_check_running = True
+        if hasattr(self, "health_check_button"):
+            self.health_check_button.configure(text="Checking...", state="disabled")
+        self.log("Health check started.")
+
+        def check() -> None:
+            try:
+                lines, encoders = run_diagnostics(cfg)
+                payload = {
+                    "text": "\n".join(lines),
+                    "ffmpeg_key": str(cfg.get("ffmpeg_path", "")).strip(),
+                    "encoders": encoders,
+                    "error": "",
+                }
+            except Exception as exc:
+                payload = {"text": "", "ffmpeg_key": "", "encoders": None, "error": str(exc)}
+            self.gui_queue.put(("health_check_complete", payload))
+
+        threading.Thread(target=check, daemon=True, name="HealthCheck").start()
+
+    def finish_health_check(self, payload: Dict[str, Any]) -> None:
+        self.health_check_running = False
+        if hasattr(self, "health_check_button"):
+            self.health_check_button.configure(text="Run health check", state="normal")
+        error = str(payload.get("error") or "")
+        if error:
+            self.log(f"Health check failed: {error}")
+            messagebox.showerror(APP_NAME, f"Health check failed:\n{error}")
+            return
+        ffmpeg_key = str(payload.get("ffmpeg_key") or "")
+        encoders = payload.get("encoders")
+        if ffmpeg_key and isinstance(encoders, set):
+            self.encoder_cache[ffmpeg_key] = encoders
+            self.encoder_queries_pending.discard(ffmpeg_key)
+            self.update_preset_status(check_encoder=True)
         self.log("Health check complete.")
-        messagebox.showinfo(APP_NAME, text)
+        messagebox.showinfo(APP_NAME, str(payload.get("text") or "Health check completed."))
 
     def load_history(self) -> List[Dict[str, Any]]:
         return load_history_records()
@@ -1523,7 +1524,8 @@ class MesterSyncApp:
         self.small_button(settings_buttons, "Run setup wizard", self.run_setup_wizard, self.CARD3).pack(side="left", padx=(0, 8))
         self.small_button(settings_buttons, "Export settings backup", self.export_settings_backup, self.CARD3).pack(side="left", padx=(0, 8))
         self.small_button(settings_buttons, "Import settings backup", self.import_settings_backup, self.CARD3).pack(side="left", padx=(0, 8))
-        self.small_button(settings_buttons, "Run health check", self.run_health_check, self.BLUE).pack(side="left")
+        self.health_check_button = self.small_button(settings_buttons, "Run health check", self.run_health_check, self.BLUE)
+        self.health_check_button.pack(side="left")
 
         dex = self.card_frame(inner, fill="x", pady=(0, 10))
         tk.Label(dex, text="Drives and extensions", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 16, "bold")).pack(anchor="w")
@@ -2283,6 +2285,16 @@ class MesterSyncApp:
                     pending_session_update = True
                 elif event == "message_error":
                     messagebox.showerror(APP_NAME, str(payload))
+                elif event == "health_check_complete":
+                    self.finish_health_check(dict(payload))
+                elif event == "encoder_cache_ready":
+                    key, encoders, error = payload
+                    self.encoder_queries_pending.discard(str(key))
+                    if isinstance(encoders, set):
+                        self.encoder_cache[str(key)] = encoders
+                        self.update_preset_status(check_encoder=True)
+                    elif error:
+                        self.log(f"Could not query FFmpeg encoders: {error}")
                 elif event == "archive_ui":
                     self.remove_archived_task_ui(str(payload))
                 elif event == "disk_ready":
@@ -3104,22 +3116,14 @@ class MesterSyncApp:
         system is not enough in that case, so we also keep a short-lived in-memory
         reservation set for import, output, and NAS destinations.
         """
-        with self.task_lock:
-            reserved: set[str] = getattr(self, reserved_attr)
-            candidate = desired
-            counter = 1
-            while candidate.exists() or path_key(candidate) in reserved:
-                candidate = desired.parent / f"{desired.stem}_{counter}{desired.suffix}"
-                counter += 1
-            reserved.add(path_key(candidate))
-            return candidate
+        reserved: set[str] = getattr(self, reserved_attr)
+        return reserve_unique_path(desired, reserved, self.task_lock)
 
     def release_unique_target(self, target: Optional[Path], reserved_attr: str) -> None:
         if not target:
             return
-        with self.task_lock:
-            reserved: set[str] = getattr(self, reserved_attr)
-            reserved.discard(path_key(target))
+        reserved: set[str] = getattr(self, reserved_attr)
+        release_reserved_path(target, reserved, self.task_lock)
 
     def reserve_import_target(self, desired: Path) -> Path:
         """Reserve a unique import/watchfolder destination before copying starts."""
@@ -3201,19 +3205,6 @@ class MesterSyncApp:
         threading.Thread(target=refresh, daemon=True, name="FinalNameSnapshot").start()
 
     def safe_final_name_now(self, task: TaskState, fresh: bool = False) -> str:
-        base = sanitize_base_name(task.rename_base or Path(task.display_name).stem, bool(self.get_config().get("auto_underscore_renames", False))) or Path(task.display_name).stem
-        ext = task.output_ext or ".mp4"
-        pattern = re.compile(rf"^{re.escape(base)}(?:_(\d+))?{re.escape(ext)}$", re.IGNORECASE)
-        highest: Optional[int] = None
-
-        def inspect_name(name: str) -> None:
-            nonlocal highest
-            match = pattern.match(name)
-            if not match:
-                return
-            number = int(match.group(1)) if match.group(1) else 0
-            highest = number if highest is None else max(highest, number)
-
         if fresh:
             names = self.collect_final_name_snapshot()
             with self.final_name_snapshot_lock:
@@ -3223,101 +3214,46 @@ class MesterSyncApp:
             self.request_final_name_snapshot()
             with self.final_name_snapshot_lock:
                 names = list(self.final_name_snapshot)
-        own_output_key = path_key(task.output_path) if task.output_path else ""
-        for file_key, name in names:
-            if own_output_key and file_key == own_output_key:
-                continue
-            inspect_name(name)
         with self.task_lock:
-            for reserved in list(self.reserved_output_paths) + list(self.reserved_nas_paths):
-                if own_output_key and reserved == own_output_key:
-                    continue
-                inspect_name(Path(reserved).name)
-        if highest is None:
-            return f"{base}{ext}"
-        return f"{base}_{highest + 1}{ext}"
+            reserved = list(self.reserved_output_paths) + list(self.reserved_nas_paths)
+        cfg = self.get_config()
+        return next_final_name(
+            task.rename_base,
+            task.display_name,
+            task.output_ext,
+            bool(cfg.get("auto_underscore_renames", False)),
+            names,
+            reserved,
+            task.output_path,
+        )
 
     def reserve_safe_final_target(self, task: TaskState, folder: Path, reserved_attr: str) -> Path:
         ensure_folder(folder)
-        return self.reserve_unique_target(folder / self.safe_final_name_now(task, fresh=True), reserved_attr)
+        names = self.collect_final_name_snapshot()
+        with self.final_name_snapshot_lock:
+            self.final_name_snapshot = names
+            self.final_name_snapshot_at = time.time()
+        cfg = self.get_config()
+        target_reserved: set[str] = getattr(self, reserved_attr)
+        return reserve_final_target(
+            folder,
+            task.rename_base,
+            task.display_name,
+            task.output_ext,
+            bool(cfg.get("auto_underscore_renames", False)),
+            names,
+            self.reserved_output_paths,
+            self.reserved_nas_paths,
+            target_reserved,
+            self.task_lock,
+            task.output_path,
+        )
 
     def promote_temp_no_overwrite(self, temp: Path, destination: Path) -> bool:
-        """Move a finished .part file into place without overwriting a real file."""
-        if destination.exists():
-            return False
-        try:
-            if os.name == "nt":
-                # On Windows, os.rename refuses to replace an existing file.
-                os.rename(temp, destination)
-                return True
-            try:
-                # Atomic no-overwrite promotion on POSIX-like systems.
-                os.link(temp, destination)
-                force_delete(temp)
-                return True
-            except FileExistsError:
-                return False
-            except OSError:
-                # Fallback for filesystems that do not support hardlinks. Reserve
-                # the final path with O_EXCL so an existing file is never replaced.
-                fd = os.open(str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-                try:
-                    with os.fdopen(fd, "wb") as dst, temp.open("rb") as src:
-                        shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
-                        dst.flush()
-                        os.fsync(dst.fileno())
-                except Exception:
-                    try:
-                        os.close(fd)
-                    except Exception:
-                        pass
-                    force_delete(destination)
-                    raise
-                force_delete(temp)
-                return True
-        except FileExistsError:
-            return False
-        except Exception as exc:
-            self.emit_log(f"Could not move file into place without overwrite: {destination}: {exc}")
-            return False
+        return promote_path_no_overwrite(temp, destination, self.emit_log)
 
     def move_file_no_overwrite(self, source: Path, destination: Path) -> bool:
-        """Rename/move one finished media file without overwriting destination."""
-        if path_key(source) == path_key(destination):
-            return True
-        if destination.exists():
-            return False
-        try:
-            if os.name == "nt":
-                os.rename(source, destination)
-                return True
-            try:
-                os.link(source, destination)
-                force_delete(source)
-                return True
-            except FileExistsError:
-                return False
-            except OSError:
-                fd = os.open(str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-                try:
-                    with os.fdopen(fd, "wb") as dst, source.open("rb") as src:
-                        shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
-                        dst.flush()
-                        os.fsync(dst.fileno())
-                except Exception:
-                    try:
-                        os.close(fd)
-                    except Exception:
-                        pass
-                    force_delete(destination)
-                    raise
-                force_delete(source)
-                return True
-        except FileExistsError:
-            return False
-        except Exception as exc:
-            self.emit_log(f"Could not move file without overwrite: {source} -> {destination}: {exc}")
-            return False
+        return move_path_no_overwrite(source, destination, self.emit_log)
 
     def update_task(self, task_id: str, **kwargs: Any) -> None:
         should_save = False
@@ -4518,78 +4454,18 @@ class MesterSyncApp:
         callback: Callable[[int, int, int], None],
         checksum_callback: Optional[Callable[[str], None]] = None,
     ) -> bool:
-        cfg = self.get_config()
-        chunk = max(1, int(cfg.get("copy_chunk_mb", 4))) * 1024 * 1024
-        # Use a per-copy temp name so one task never deletes another task's .part file.
-        temp = destination.with_name(f"{destination.name}.{uuid.uuid4().hex}.part")
-        try:
-            if destination.exists():
-                self.emit_log(f"Copy stopped because destination already exists: {destination}")
-                return False
-            source_stat = source.stat()
-            total = source_stat.st_size
-            free = free_space_bytes(destination)
-            if free is not None and free < total:
-                self.emit_log(f"Copy stopped: not enough free space for {destination}. Need {format_size(total)}, free {format_size(free)}.")
-                return False
-            copied = 0
-            last_percent = -1
-            last_callback_time = 0.0
-            hasher = hashlib.sha256() if checksum_callback else None
-
-            def maybe_callback(percent: int, force: bool = False) -> None:
-                nonlocal last_percent, last_callback_time
-                now = time.time()
-                percent = max(0, min(100, int(percent)))
-                if force or percent != last_percent and (now - last_callback_time >= 0.25):
-                    last_percent = percent
-                    last_callback_time = now
-                    callback(percent, copied, total)
-
-            maybe_callback(0, force=True)
-            with source.open("rb") as src, temp.open("xb") as dst:
-                while True:
-                    if self.shutdown_event.is_set() or stop_event.is_set():
-                        raise InterruptedError()
-                    self.wait_if_paused()
-                    data = src.read(chunk)
-                    if not data:
-                        break
-                    if hasher:
-                        hasher.update(data)
-                    dst.write(data)
-                    copied += len(data)
-                    maybe_callback(int(copied / total * 100) if total else 100)
-                dst.flush()
-                os.fsync(dst.fileno())
-            final_source_stat = source.stat()
-            if (
-                copied != total
-                or final_source_stat.st_size != total
-                or final_source_stat.st_mtime_ns != source_stat.st_mtime_ns
-            ):
-                force_delete(temp)
-                self.emit_log(f"Copy stopped because the source changed while it was being read: {source}")
-                return False
-            if not self.promote_temp_no_overwrite(temp, destination):
-                force_delete(temp)
-                self.emit_log(f"Copy stopped because destination appeared during copy: {destination}")
-                return False
-            try:
-                shutil.copystat(source, destination)
-            except OSError as exc:
-                self.emit_log(f"Copy completed, but file dates could not be preserved for {destination.name}: {exc}")
-            if hasher and checksum_callback:
-                checksum_callback(hasher.hexdigest())
-            callback(100, total, total)
-            return True
-        except InterruptedError:
-            force_delete(temp)
-            return False
-        except Exception as exc:
-            force_delete(temp)
-            self.emit_log(f"Copy error: {source} -> {destination}: {exc}")
-            return False
+        chunk_bytes = max(1, int(self.get_config().get("copy_chunk_mb", 4))) * 1024 * 1024
+        return copy_path_safely(
+            source,
+            destination,
+            chunk_bytes,
+            lambda: self.shutdown_event.is_set() or stop_event.is_set(),
+            self.wait_if_paused,
+            callback,
+            self.promote_temp_no_overwrite,
+            self.emit_log,
+            checksum_callback,
+        )
 
     def manual_scan(self) -> None:
         threading.Thread(target=self.scan_existing_input_as_detected, daemon=True).start()
@@ -4776,44 +4652,10 @@ class MesterSyncApp:
                 self.emit_status()
 
     def get_duration(self, input_path: Path, ffmpeg_path: Path) -> Optional[float]:
-        ffprobe = ffmpeg_path.parent / "ffprobe.exe"
-        if not ffprobe.exists():
-            found = shutil.which("ffprobe")
-            if found:
-                ffprobe = Path(found)
-        if not ffprobe.exists():
-            return None
-        try:
-            res = subprocess.run([str(ffprobe), "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)], capture_output=True, text=True, timeout=15, creationflags=no_window_flags())
-            return float(res.stdout.strip())
-        except Exception:
-            return None
+        return probe_duration(input_path, ffmpeg_path)
 
     def ffprobe_media_info(self, path: Path, ffmpeg_path: Path) -> Tuple[Optional[Dict[str, Any]], str]:
-        ffprobe = ffmpeg_path.parent / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
-        if not ffprobe.exists():
-            found = shutil.which("ffprobe")
-            if found:
-                ffprobe = Path(found)
-        if not ffprobe.exists():
-            return None, "FFprobe is required for post-conversion safety checks."
-        try:
-            result = subprocess.run(
-                [
-                    str(ffprobe), "-v", "error", "-show_entries",
-                    "format=duration,size:stream=codec_type,width,height", "-of", "json", str(path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                creationflags=no_window_flags(),
-            )
-            if result.returncode != 0:
-                return None, (result.stderr or "FFprobe could not read the converted file.").strip()
-            info = json.loads(result.stdout or "{}")
-            return info if isinstance(info, dict) else None, ""
-        except Exception as exc:
-            return None, f"FFprobe validation failed: {exc}"
+        return probe_media_info(path, ffmpeg_path)
 
     def validate_converted_output(
         self,
@@ -4823,35 +4665,7 @@ class MesterSyncApp:
         ffmpeg_args: List[str],
         expected_duration: Optional[float],
     ) -> Optional[str]:
-        if not output_path.exists() or output_path.stat().st_size <= 0:
-            return "Converted output is missing or empty."
-        output_info, output_error = self.ffprobe_media_info(output_path, ffmpeg_path)
-        if not output_info:
-            return output_error or "Converted output could not be validated."
-        streams = output_info.get("streams") if isinstance(output_info.get("streams"), list) else []
-        video_streams = [stream for stream in streams if stream.get("codec_type") == "video"]
-        if not video_streams:
-            return "Converted output contains no video stream."
-        if any(int(stream.get("width") or 0) <= 0 or int(stream.get("height") or 0) <= 0 for stream in video_streams):
-            return "Converted output has an invalid video size."
-        try:
-            output_duration = float((output_info.get("format") or {}).get("duration") or 0)
-        except (TypeError, ValueError):
-            output_duration = 0
-        if output_duration <= 0:
-            return "Converted output has no readable duration."
-        if expected_duration and expected_duration > 1:
-            tolerance = max(5.0, expected_duration * 0.02)
-            if abs(output_duration - expected_duration) > tolerance:
-                return f"Converted duration differs from the source by more than {format_duration(tolerance)}."
-        source_info, _source_error = self.ffprobe_media_info(source_path, ffmpeg_path)
-        source_streams = source_info.get("streams", []) if source_info else []
-        source_has_audio = any(stream.get("codec_type") == "audio" for stream in source_streams)
-        args_lower = [str(arg).lower() for arg in ffmpeg_args]
-        audio_disabled = "-an" in args_lower
-        if source_has_audio and not audio_disabled and not any(stream.get("codec_type") == "audio" for stream in streams):
-            return "Source audio exists, but the converted output contains no audio stream."
-        return None
+        return validate_media_output(output_path, source_path, ffmpeg_path, ffmpeg_args, expected_duration)
 
     def convert_task(self, task_id: str) -> None:
         task = self.tasks.get(task_id)

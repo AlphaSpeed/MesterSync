@@ -12,6 +12,7 @@ MesterSync is a Windows desktop tool for safely importing, renaming, converting,
 - Collision-safe naming across import, output, and NAS folders
 - Verified NAS transfers and disk-ready-to-remove feedback
 - Persistent queues, history, keyboard controls, and automatic settings saves
+- Background folder, free-space, FFmpeg, FFprobe, and encoder diagnostics
 - A dedicated Preset test page that converts a 15-second middle sample and automatically removes prior test outputs after a successful replacement
 
 ## Requirements
@@ -41,6 +42,8 @@ The first-run wizard asks for FFmpeg, working folders, the optional NAS destinat
 ## File safety
 
 MesterSync writes imports, conversions, and transfers to temporary files first. It verifies completed files and promotes them without replacing an existing destination. Final names are checked again immediately before each file is committed.
+
+Matching filenames are not treated as proof that two recordings are duplicates. When a same-name and same-size candidate is found, MesterSync compares full-file checksums. Different recordings are imported separately and receive unique names such as `recording.mov`, `recording_1.mov`, and `recording_2.mov`. Final converted names are reserved across both the output and NAS folders so simultaneous jobs cannot select the same name.
 
 Run the core safety checks with:
 

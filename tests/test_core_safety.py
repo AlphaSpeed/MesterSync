@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,8 +17,10 @@ sys.path.insert(0, str(APP_DIR))
 
 import duplicates
 import file_utils
+import media_validation
 import preset_testing
 import rename_utils
+import safe_files
 import storage
 from config_defaults import DEFAULT_FFMPEG_ARGS
 
@@ -253,6 +256,20 @@ class CoreSafetyTests(unittest.TestCase):
             source.write_bytes(os.urandom(2 * 1024 * 1024))
             app = self.bare_app()
 
+            copied_destination = folder / "copied.bin"
+            copied_digests = []
+            self.assertTrue(
+                app.copy_file_safely(
+                    source,
+                    copied_destination,
+                    threading.Event(),
+                    lambda *_: None,
+                    copied_digests.append,
+                )
+            )
+            self.assertEqual(copied_destination.read_bytes(), source.read_bytes())
+            self.assertEqual(copied_digests, [hashlib.sha256(source.read_bytes()).hexdigest()])
+
             destination = folder / "destination.bin"
             destination.write_bytes(b"existing")
             self.assertFalse(app.copy_file_safely(source, destination, threading.Event(), lambda *_: None))
@@ -289,6 +306,130 @@ class CoreSafetyTests(unittest.TestCase):
             self.assertFalse(changed_destination.exists())
             self.assertFalse(list(folder.glob("*.part")))
             self.assertTrue(any("source changed" in line.lower() for line in app.test_logs))
+
+    def test_promote_and_move_helpers_never_overwrite(self):
+        with tempfile.TemporaryDirectory() as value:
+            folder = Path(value)
+            logs = []
+
+            temp = folder / "finished.part"
+            destination = folder / "final.mp4"
+            temp.write_bytes(b"new")
+            destination.write_bytes(b"existing")
+            self.assertFalse(safe_files.promote_temp_no_overwrite(temp, destination, logs.append))
+            self.assertEqual(destination.read_bytes(), b"existing")
+            self.assertEqual(temp.read_bytes(), b"new")
+
+            destination.unlink()
+            self.assertTrue(safe_files.promote_temp_no_overwrite(temp, destination, logs.append))
+            self.assertEqual(destination.read_bytes(), b"new")
+            self.assertFalse(temp.exists())
+
+            source = folder / "source.mp4"
+            source.write_bytes(b"source")
+            occupied = folder / "occupied.mp4"
+            occupied.write_bytes(b"occupied")
+            self.assertFalse(safe_files.move_file_no_overwrite(source, occupied, logs.append))
+            self.assertEqual(source.read_bytes(), b"source")
+            self.assertEqual(occupied.read_bytes(), b"occupied")
+
+            moved = folder / "moved.mp4"
+            self.assertTrue(safe_files.move_file_no_overwrite(source, moved, logs.append))
+            self.assertFalse(source.exists())
+            self.assertEqual(moved.read_bytes(), b"source")
+
+    def test_media_validation_rejects_incomplete_conversions(self):
+        source_info = {
+            "streams": [
+                {"codec_type": "video", "width": 1920, "height": 1080},
+                {"codec_type": "audio"},
+            ]
+        }
+        valid_output = {
+            "format": {"duration": "60.0"},
+            "streams": [
+                {"codec_type": "video", "width": 1920, "height": 1080},
+                {"codec_type": "audio"},
+            ],
+        }
+        self.assertIsNone(media_validation.validate_media_info(valid_output, source_info, [], 60.0))
+
+        no_video = {"format": {"duration": "60.0"}, "streams": [{"codec_type": "audio"}]}
+        self.assertIn("no video stream", media_validation.validate_media_info(no_video, source_info, [], 60.0))
+
+        truncated = dict(valid_output, format={"duration": "40.0"})
+        self.assertIn("duration differs", media_validation.validate_media_info(truncated, source_info, [], 60.0))
+
+        silent = {
+            "format": {"duration": "60.0"},
+            "streams": [{"codec_type": "video", "width": 1920, "height": 1080}],
+        }
+        self.assertIn("contains no audio", media_validation.validate_media_info(silent, source_info, [], 60.0))
+        self.assertIsNone(media_validation.validate_media_info(silent, source_info, ["-an"], 60.0))
+
+    def test_media_validation_rejects_missing_output_before_ffprobe(self):
+        with tempfile.TemporaryDirectory() as value:
+            folder = Path(value)
+            result = media_validation.validate_converted_output(
+                folder / "missing.mp4",
+                folder / "source.mov",
+                folder / "ffmpeg.exe",
+                [],
+                None,
+            )
+            self.assertEqual(result, "Converted output is missing or empty.")
+
+    def test_encoder_query_returns_without_waiting_for_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as value:
+            ffmpeg = Path(value) / "ffmpeg.exe"
+            ffmpeg.write_bytes(b"placeholder")
+            app = self.bare_app()
+            app.encoder_cache = {}
+            app.encoder_queries_pending = set()
+            app.gui_queue = queue.Queue()
+            started = threading.Event()
+            release = threading.Event()
+
+            def slow_query(_ffmpeg):
+                started.set()
+                release.wait(timeout=2)
+                return {"libx264"}
+
+            with mock.patch.object(app_module, "query_video_encoders", side_effect=slow_query):
+                result = app.available_video_encoders(ffmpeg)
+                self.assertIsNone(result)
+                self.assertTrue(started.wait(timeout=1))
+                self.assertEqual(app.available_video_encoders(ffmpeg), None)
+                release.set()
+                event, payload = app.gui_queue.get(timeout=2)
+
+            self.assertEqual(event, "encoder_cache_ready")
+            self.assertEqual(payload[1], {"libx264"})
+
+    def test_health_check_returns_while_diagnostics_run(self):
+        app = self.bare_app()
+        app.health_check_running = False
+        app.gui_queue = queue.Queue()
+        app.set_config_from_ui = lambda: None
+        app.get_config = lambda: {"ffmpeg_path": "ffmpeg.exe"}
+        app.log = app.test_logs.append
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_diagnostics(_cfg):
+            started.set()
+            release.wait(timeout=2)
+            return ["OK diagnostics"], {"libx264"}
+
+        with mock.patch.object(app_module, "run_diagnostics", side_effect=slow_diagnostics):
+            app.run_health_check()
+            self.assertTrue(app.health_check_running)
+            self.assertTrue(started.wait(timeout=1))
+            release.set()
+            event, payload = app.gui_queue.get(timeout=2)
+
+        self.assertEqual(event, "health_check_complete")
+        self.assertEqual(payload["text"], "OK diagnostics")
 
 
 if __name__ == "__main__":
