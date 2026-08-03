@@ -1,4 +1,4 @@
-# MesterSync 2.0
+# MesterSync 2.0.3
 
 MesterSync is a Windows desktop tool for safely importing, renaming, converting, and transferring video files. It uses FFmpeg for conversion and FFprobe to verify completed media before local working files are removed.
 
@@ -78,7 +78,7 @@ The build uses PyInstaller's folder mode so the installed app does not need to u
 1. Change `APP_VERSION` in `app\version.py`.
 2. Commit and push the finished changes to `main`.
 
-The `Build Windows installer` GitHub workflow runs all tests, builds the executable and installer on Windows, creates the matching tag (for example `v2.0.1`), and publishes both files in a GitHub Release. If that version already exists, the release is left unchanged. Existing installations will find a newly published version during their next update check.
+The `Build Windows installer` GitHub workflow runs all tests, builds the executable and installer on Windows, creates the matching tag (for example `v2.0.3`), and publishes both files in a GitHub Release. If that version already exists, the release is left unchanged. Existing installations will find a newly published version during their next update check.
 
 ## File safety
 
