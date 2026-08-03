@@ -366,6 +366,12 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertNotIn("messagebox.showwarning", source)
         self.assertNotIn("messagebox.showerror", source)
 
+    def test_about_page_has_one_update_check_action(self):
+        source = (APP_DIR / "MesterSync.pyw").read_text(encoding="utf-8")
+        self.assertEqual(source.count('"Check for updates"'), 2)
+        self.assertNotIn('"Check again"', source)
+        self.assertNotIn("update_check_button", source)
+
     def test_thumbnail_source_bytes_can_be_prepared_off_ui_thread(self):
         cache = app_module.ImageCache(2)
         cache.put_source_bytes("preview.png", b"png bytes")

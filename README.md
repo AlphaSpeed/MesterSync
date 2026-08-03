@@ -66,7 +66,7 @@ The legacy root `data` folder, generated installer output, user data, and genera
 
 You do not need to build releases on your own computer. Every push to `main` runs the Windows tests and installer build on GitHub. The workflow automatically publishes a GitHub Release when the version in `app\version.py` does not already have one.
 
-For an optional local test build, install Python 3.10 or newer and double-click `Build Windows Installer.bat`. The script creates an isolated Python build environment and installs the signed Inno Setup 6 compiler for the current Windows user if it is not already available. It then creates:
+The files in `packaging` and `requirements-build.txt` are used by that GitHub workflow and should remain in the repository. Developers can also run `packaging\Build-Installer.ps1` directly for an optional local packaging test. It creates:
 
 - `dist\installer\MesterSync-Setup-<version>.exe`
 - `dist\installer\MesterSync-Setup-<version>.exe.sha256`

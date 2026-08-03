@@ -2027,9 +2027,7 @@ class MesterSyncApp:
         update_actions = tk.Frame(updates, bg=self.CARD)
         update_actions.pack(anchor="w", pady=(12, 0))
         self.update_action_button = self.small_button(update_actions, "Check for updates", lambda: self.check_for_updates(manual=True), self.BLUE)
-        self.update_action_button.pack(side="left", padx=(0, 8))
-        self.update_check_button = self.small_button(update_actions, "Check again", lambda: self.check_for_updates(manual=True), self.CARD3)
-        self.update_check_button.pack(side="left")
+        self.update_action_button.pack(side="left")
         self.refresh_update_ui()
 
         footer = tk.Frame(inner, bg=self.BG)
