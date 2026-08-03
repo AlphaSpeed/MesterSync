@@ -1,4 +1,4 @@
-# MesterSync 2.0.3
+# MesterSync 2.0.4
 
 MesterSync is a Windows desktop tool for safely importing, renaming, converting, and transferring video files. It uses FFmpeg for conversion and FFprobe to verify completed media before local working files are removed.
 
@@ -27,7 +27,7 @@ MesterSync is a Windows desktop tool for safely importing, renaming, converting,
 
 ## Install MesterSync
 
-Download `MesterSync-Setup-<version>.exe` from the latest GitHub Release and open it. The installer does not require administrator access. It installs MesterSync for the current Windows user and opens the app when installation completes.
+Download `MesterSync-Setup-<version>.exe` from the latest GitHub Release and open it. The installer does not require administrator access. It installs MesterSync for the current Windows user in `%LOCALAPPDATA%\Programs\MesterSync` and opens the app when installation completes. Updates explicitly use the same per-user location even if an older copy was installed elsewhere.
 
 The installed application checks for an update at most once per day without blocking startup. When a newer release is available, open **Settings → About & updates** and choose **Download and install**. MesterSync verifies the installer against GitHub's SHA-256 digest before allowing it to run. Active imports, conversions, transfers, and preset tests must be stopped before installation.
 
@@ -78,7 +78,7 @@ The build uses PyInstaller's folder mode so the installed app does not need to u
 1. Change `APP_VERSION` in `app\version.py`.
 2. Commit and push the finished changes to `main`.
 
-The `Build Windows installer` GitHub workflow runs all tests, builds the executable and installer on Windows, creates the matching tag (for example `v2.0.3`), and publishes both files in a GitHub Release. If that version already exists, the release is left unchanged. Existing installations will find a newly published version during their next update check.
+The `Build Windows installer` GitHub workflow runs all tests, builds the executable and installer on Windows, creates the matching tag (for example `v2.0.4`), and publishes both files in a GitHub Release. If that version already exists, the release is left unchanged. Existing installations will find a newly published version during their next update check.
 
 ## File safety
 

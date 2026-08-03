@@ -279,8 +279,8 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertEqual(ui_performance.bounded_log_count(990, 25, 1000), (15, 1000))
         self.assertEqual(ui_performance.bounded_log_count(1000, 80, 1000), (80, 1000))
 
-    def test_version_is_2_0_3(self):
-        self.assertEqual(app_module.APP_VERSION, "2.0.3")
+    def test_version_is_2_0_4(self):
+        self.assertEqual(app_module.APP_VERSION, "2.0.4")
 
     def test_launcher_has_python_fallbacks_and_visible_failure_message(self):
         launcher = (APP_DIR / "MesterSync.vbs").read_text(encoding="utf-8-sig").lower()

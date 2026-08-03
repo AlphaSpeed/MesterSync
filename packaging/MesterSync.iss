@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "2.0.3"
+  #define MyAppVersion "2.0.4"
 #endif
 
 #define MyAppName "MesterSync"
@@ -29,7 +29,7 @@ SolidCompression=yes
 WizardStyle=modern
 CloseApplications=yes
 RestartApplications=no
-UsePreviousAppDir=yes
+UsePreviousAppDir=no
 ArchitecturesInstallIn64BitMode=x64compatible
 ArchitecturesAllowed=x64compatible
 MinVersion=10.0

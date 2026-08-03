@@ -221,12 +221,22 @@ def verify_installer(installer: Path, release: ReleaseInfo) -> None:
         raise UpdateError("The downloaded installer changed after verification.")
 
 
+def per_user_install_dir() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "Programs" / "MesterSync"
+    return Path.home() / "AppData" / "Local" / "Programs" / "MesterSync"
+
+
 def installer_command(installer: Path, migration_root: Path) -> list[str]:
     return [
         str(installer),
         "/CURRENTUSER",
         "/SILENT",
+        "/SUPPRESSMSGBOXES",
         "/NORESTART",
+        "/CLOSEAPPLICATIONS",
+        f"/DIR={per_user_install_dir()}",
         f"/MIGRATEFROM={migration_root}",
     ]
 

@@ -142,10 +142,19 @@ class InstallerUpdateTests(unittest.TestCase):
                 storage._storage_setup_complete = old_ready
 
     def test_installer_command_requests_a_current_user_upgrade(self):
-        command = updater.installer_command(Path("MesterSync-Setup-2.0.exe"), Path("C:/Portable/MesterSync"))
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": r"C:\Users\Video\AppData\Local"}):
+            command = updater.installer_command(Path("MesterSync-Setup-2.0.exe"), Path("C:/Portable/MesterSync"))
         self.assertIn("/CURRENTUSER", command)
         self.assertIn("/SILENT", command)
+        self.assertIn("/CLOSEAPPLICATIONS", command)
+        self.assertIn(r"/DIR=C:\Users\Video\AppData\Local\Programs\MesterSync", command)
         self.assertTrue(any(item.startswith("/MIGRATEFROM=") for item in command))
+
+    def test_installer_definition_never_reuses_a_protected_install_location(self):
+        script = (ROOT / "packaging" / "MesterSync.iss").read_text(encoding="utf-8-sig")
+        self.assertIn(r"DefaultDirName={localappdata}\Programs\MesterSync", script)
+        self.assertIn("PrivilegesRequired=lowest", script)
+        self.assertIn("UsePreviousAppDir=no", script)
 
 
 if __name__ == "__main__":
