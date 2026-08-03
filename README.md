@@ -64,7 +64,7 @@ The legacy root `data` folder, generated installer output, user data, and genera
 
 ## Build the Windows installer
 
-Install Python 3.10 or newer and [Inno Setup 6](https://jrsoftware.org/isdl.php), then double-click `Build Windows Installer.bat`. The build creates:
+Install Python 3.10 or newer, then double-click `Build Windows Installer.bat`. The build creates an isolated Python build environment and installs the signed Inno Setup 6 compiler for the current Windows user if it is not already available. It then creates:
 
 - `dist\installer\MesterSync-Setup-<version>.exe`
 - `dist\installer\MesterSync-Setup-<version>.exe.sha256`
