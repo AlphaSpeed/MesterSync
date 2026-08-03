@@ -51,6 +51,7 @@ from file_utils import (
     validate_writable_folder,
 )
 from importer import collect_import_candidates, scan_drive_importable_videos, scan_watchfolder_candidates
+from history_utils import history_page, recorded_input_file, skipped_input_path_keys
 from media_validation import (
     ffprobe_media_info as probe_media_info,
     get_duration as probe_duration,
@@ -70,6 +71,7 @@ from safe_files import (
     move_file_no_overwrite as move_path_no_overwrite,
     promote_temp_no_overwrite as promote_path_no_overwrite,
 )
+from skip_undo import new_skip_deadline, skip_is_due, skip_undo_button_text, skip_undo_detail
 from storage import (
     app_dir,
     config_path,
@@ -113,18 +115,27 @@ from tasks import (
     STAGE_WAITING_TRANSFER,
     TaskState,
 )
+from task_view import TaskViewSnapshot
 from thumbnails import extract_video_thumbnails
 from thumbnail_ui import ImageCache, ThumbnailPopup, scale_photo, scrub_index_from_event
 from ui_widgets import ChipSelector
+from ui_performance import bounded_log_count, compact_notification_text, inertial_scroll_step, virtual_row_window
 from worker_utils import wait_for_conversion_task, wait_for_transfer_task
 
 APP_NAME = "MesterSync"
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.9"
 APP_USER_MODEL_ID = "MesterSync.VideoWorkflow.App"
 LOGO_FILENAME = "mestersync_logo.png"
 ICON_FILENAME = "mestersync_icon.ico"
 ICON_PNG_FILENAME = "mestersync_icon.png"
 MAX_IMAGE_CACHE_ITEMS = 160
+HISTORY_PAGE_SIZE = 25
+TASK_RENDER_INTERVAL_SECONDS = 0.25
+DASHBOARD_VIRTUAL_THRESHOLD = 40
+DASHBOARD_VIRTUAL_OVERSCAN = 5
+HISTORY_RENDER_BATCH_SIZE = 4
+LOG_MAX_LINES = 1000
+THUMBNAIL_SETTLE_DELAY_SECONDS = 1.25
 
 class MesterSyncApp:
     BG = "#06111f"
@@ -137,6 +148,9 @@ class MesterSyncApp:
     BLUE = "#3f8fd8"
     GREEN = "#18834c"
     DARK_GREEN = "#082c1c"
+    DARK_ORANGE = "#3a1d08"
+    DARK_PURPLE = "#24143d"
+    INACTIVE_STAGE_BG = "#171b21"
     RED = "#9d2337"
     YELLOW = "#9b7b13"
     PAUSE_BG = "#3b3213"
@@ -176,6 +190,9 @@ class MesterSyncApp:
         self.transfer_condition = threading.Condition()
 
         self.config = self.load_config()
+        self.settings_built = False
+        self.settings_building = False
+        self.initialize_settings_state()
         self.compact_dashboard = bool(self.config.get("compact_dashboard", True))
         self.history_records: List[Dict[str, Any]] = self.load_history()
         self.checksum_db: Dict[str, Any] = {}
@@ -199,12 +216,33 @@ class MesterSyncApp:
         self.reserved_import_paths: set[str] = set()
         self.reserved_output_paths: set[str] = set()
         self.reserved_nas_paths: set[str] = set()
-        self.skipped_path_keys: set[str] = set()
+        self.skipped_path_keys: set[str] = skipped_input_path_keys(self.history_records)
         self.selected_ids: List[str] = []
         self.selection_anchor_id: Optional[str] = None
         self.saved_settings_snapshot: Optional[Dict[str, Any]] = None
         self.row_widgets: Dict[str, Dict[str, Any]] = {}
+        self.deferred_dashboard_task_ids: set[str] = set()
+        self.throttled_dashboard_task_ids: set[str] = set()
+        self.last_task_render_at: Dict[str, float] = {}
+        self.task_event_lock = threading.Lock()
+        self.pending_task_events: Dict[str, bool] = {}
+        self.dashboard_virtual_range: Tuple[int, int] = (0, 0)
+        self.dashboard_virtual_ids: set[str] = set()
+        self.dashboard_virtual_total = -1
+        self.dashboard_virtual_order: Tuple[str, ...] = ()
+        self.dashboard_virtual_refresh_after_id: Optional[str] = None
+        self.smooth_scroll_velocity: Dict[int, float] = {}
+        self.smooth_scroll_after_ids: Dict[int, str] = {}
+        self.smooth_scroll_regions: List[Tuple[tk.Widget, tk.Canvas]] = []
+        self.smooth_scroll_bound = False
         self.history_widgets: List[tk.Widget] = []
+        self.history_render_after_id: Optional[str] = None
+        self.history_render_generation = 0
+        self.history_loading_widget: Optional[tk.Widget] = None
+        self.current_tab = ""
+        self.history_view_dirty = True
+        self.history_display_limit = HISTORY_PAGE_SIZE
+        self.preset_menu_values_cache: Optional[List[str]] = None
         self.thumbnail_images = ImageCache(MAX_IMAGE_CACHE_ITEMS)
         self.encoder_cache: Dict[str, set[str]] = {}
         self.encoder_queries_pending: set[str] = set()
@@ -221,6 +259,15 @@ class MesterSyncApp:
         self.config_save_after_id: Optional[str] = None
         self.settings_autosave_ready = False
         self.settings_ui_refreshing = False
+        self.log_line_count = 0
+        self.log_entries: Deque[str] = deque(maxlen=LOG_MAX_LINES)
+        self.log_text: Optional[scrolledtext.ScrolledText] = None
+        self.log_visible = False
+        self.stage_card_view_cache: Dict[str, Tuple[str, int, str]] = {}
+        self.status_view_cache: Optional[Tuple[Any, ...]] = None
+        self.notification_after_id: Optional[str] = None
+        self.notification_active = False
+        self.notification_queue: Deque[Tuple[str, str, int]] = deque(maxlen=6)
 
         self.shutdown_event = threading.Event()
         self.pause_event = threading.Event()
@@ -232,6 +279,7 @@ class MesterSyncApp:
         self.current_import_id: Optional[str] = None
         self.import_cancel_requested = threading.Event()
         self.import_progress_lock = threading.Lock()
+        self.watchfolder_scan_lock = threading.Lock()
         self.import_progress_by_task: Dict[str, Tuple[str, int, Optional[float]]] = {}
         self.import_cycle_task_id: Optional[str] = None
         self.import_cycle_last_switch = 0.0
@@ -246,6 +294,10 @@ class MesterSyncApp:
         self.thumbnail_generation_requested: set[str] = set()
         self.thumbnail_queue: "queue.Queue[Tuple[str, Path, float]]" = queue.Queue()
         self.thumbnail_worker_started = False
+        self.thumbnail_display_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
+        self.thumbnail_display_requested: set[str] = set()
+        self.thumbnail_display_worker_started = False
+        self.history_thumbnail_labels: Dict[str, Tuple[tk.Label, str]] = {}
         self.checksum_queue: "queue.Queue[Path]" = queue.Queue()
         self.checksum_generation_requested: set[str] = set()
         self.checksum_worker_started = False
@@ -264,10 +316,13 @@ class MesterSyncApp:
         self.settings_autosave_ready = True
         self.load_pending_tasks()
         self.saved_settings_snapshot = self.current_settings_snapshot()
-        self.refresh_history_view()
+        # History is intentionally built only when its tab is opened. Large
+        # histories otherwise make startup and unrelated navigation feel slow.
+        self.history_view_dirty = True
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.bind_keyboard_shortcuts()
         self.ensure_thumbnail_worker_running()
+        self.ensure_thumbnail_display_worker_running()
         self.ensure_checksum_worker_running()
         self.root.after(100, self.process_gui_events)
         self.root.after(1000, self.tick)
@@ -333,7 +388,30 @@ class MesterSyncApp:
         return max(minimum, value) if minimum is not None else value
 
     def ui_ffmpeg_args(self) -> List[str]:
-        return [line.strip() for line in self.ffmpeg_args_text.get("1.0", "end").splitlines() if line.strip()]
+        if hasattr(self, "ffmpeg_args_text"):
+            return [line.strip() for line in self.ffmpeg_args_text.get("1.0", "end").splitlines() if line.strip()]
+        return list(self.config.get("ffmpeg_args", DEFAULT_FFMPEG_ARGS))
+
+    def initialize_settings_state(self) -> None:
+        """Create lightweight settings variables without constructing the page."""
+        self.input_folder_var = tk.StringVar(value=self.config["input_folder"])
+        self.output_folder_var = tk.StringVar(value=self.config["output_folder"])
+        self.nas_folder_var = tk.StringVar(value=self.config["nas_folder"])
+        self.ffmpeg_path_var = tk.StringVar(value=self.config["ffmpeg_path"])
+        self.exclude_files_var = tk.StringVar(value=", ".join(self.config["exclude_files"]))
+        self.exclude_folders_var = tk.StringVar(value=", ".join(self.config["exclude_folders"]))
+        self.auto_delay_var = tk.StringVar(value=str(self.config["auto_import_delay_seconds"]))
+        self.scan_interval_var = tk.StringVar(value=str(self.config["scan_interval_seconds"]))
+        self.stable_seconds_var = tk.StringVar(value=str(self.config["file_stable_seconds"]))
+        self.copy_chunk_var = tk.StringVar(value=str(self.config["copy_chunk_mb"]))
+        self.max_wait_var = tk.StringVar(value=str(self.config["max_ready_wait_seconds"]))
+        self.low_disk_warning_var = tk.StringVar(value=str(self.config.get("low_disk_warning_gb", 20)))
+        self.checksum_path_var = tk.StringVar(value=self.config["checksum_database_path"])
+        self.duplicate_var = tk.BooleanVar(value=bool(self.config["enable_duplicate_detection"]))
+        self.check_input_var = tk.BooleanVar(value=bool(self.config["check_existing_in_input"]))
+        self.auto_underscore_var = tk.BooleanVar(value=bool(self.config.get("auto_underscore_renames", False)))
+        self.prevent_sleep_var = tk.BooleanVar(value=bool(self.config.get("prevent_sleep_while_working", True)))
+        self.preset_folder_var = tk.StringVar(value=self.config.get("preset_folder") or str(preset_dir()))
 
     def set_config_from_ui(self) -> None:
         with self.config_lock:
@@ -341,9 +419,10 @@ class MesterSyncApp:
             self.config["output_folder"] = self.output_folder_var.get().strip()
             self.config["nas_folder"] = self.nas_folder_var.get().strip()
             self.config["ffmpeg_path"] = self.ffmpeg_path_var.get().strip()
-            self.config["ignored_drives"] = self.ignored_drives_widget.get()
-            self.config["import_extensions"] = self.import_ext_widget.get()
-            self.config["conversion_extensions"] = self.convert_ext_widget.get()
+            if self.settings_built:
+                self.config["ignored_drives"] = self.ignored_drives_widget.get()
+                self.config["import_extensions"] = self.import_ext_widget.get()
+                self.config["conversion_extensions"] = self.convert_ext_widget.get()
             self.config["exclude_files"] = parse_csv_list(self.exclude_files_var.get())
             self.config["exclude_folders"] = parse_csv_list(self.exclude_folders_var.get())
             self.config["auto_import_delay_seconds"] = self.ui_int(self.auto_delay_var, 5)
@@ -359,7 +438,10 @@ class MesterSyncApp:
             self.config["prevent_sleep_while_working"] = bool(self.prevent_sleep_var.get())
             self.config["compact_dashboard"] = bool(self.compact_dashboard)
             if hasattr(self, "preset_folder_var"):
-                self.config["preset_folder"] = self.preset_folder_var.get().strip()
+                preset_folder_value = self.preset_folder_var.get().strip()
+                if preset_folder_value != str(self.config.get("preset_folder", "")):
+                    self.preset_menu_values_cache = None
+                self.config["preset_folder"] = preset_folder_value
             if hasattr(self, "top_preset_var"):
                 self.config["default_preset_name"] = self.top_preset_var.get() or "Current settings"
             self.config["ffmpeg_args"] = self.ui_ffmpeg_args()
@@ -373,9 +455,9 @@ class MesterSyncApp:
                 "output_folder": self.output_folder_var.get().strip(),
                 "nas_folder": self.nas_folder_var.get().strip(),
                 "ffmpeg_path": self.ffmpeg_path_var.get().strip(),
-                "ignored_drives": self.ignored_drives_widget.get(),
-                "import_extensions": self.import_ext_widget.get(),
-                "conversion_extensions": self.convert_ext_widget.get(),
+                "ignored_drives": self.ignored_drives_widget.get() if self.settings_built else list(self.config.get("ignored_drives", [])),
+                "import_extensions": self.import_ext_widget.get() if self.settings_built else list(self.config.get("import_extensions", [])),
+                "conversion_extensions": self.convert_ext_widget.get() if self.settings_built else list(self.config.get("conversion_extensions", [])),
                 "exclude_files": parse_csv_list(self.exclude_files_var.get()),
                 "exclude_folders": parse_csv_list(self.exclude_folders_var.get()),
                 "auto_import_delay_seconds": self.ui_int(self.auto_delay_var, 5),
@@ -451,9 +533,9 @@ class MesterSyncApp:
             self.update_unsaved_settings_warning()
             self.update_startup_warning()
             self.log("Settings saved.")
-            messagebox.showinfo(APP_NAME, "Settings saved.")
+            self.show_notification("Settings saved.", "success")
         except Exception as exc:
-            messagebox.showerror(APP_NAME, f"Could not save settings:\n{exc}")
+            self.show_notification(f"Could not save settings:\n{exc}", "error")
 
     def schedule_config_autosave(self) -> None:
         if not self.settings_autosave_ready or self.settings_ui_refreshing:
@@ -503,6 +585,10 @@ class MesterSyncApp:
             self.prevent_sleep_var.set(bool(self.config.get("prevent_sleep_while_working", True)))
             self.compact_dashboard = bool(self.config.get("compact_dashboard", True))
             self.preset_folder_var.set(self.config.get("preset_folder") or str(preset_dir()))
+            if not self.settings_built:
+                self.update_compact_dashboard_button()
+                self.apply_dashboard_density()
+                return
             self.ignored_drives_widget.values = list(self.config.get("ignored_drives", []))
             self.import_ext_widget.values = list(self.config.get("import_extensions", []))
             self.convert_ext_widget.values = list(self.config.get("conversion_extensions", []))
@@ -532,9 +618,9 @@ class MesterSyncApp:
                 return
             write_json_file(Path(target), self.config)
             self.log(f"Settings backup exported: {target}")
-            messagebox.showinfo(APP_NAME, "Settings backup exported.")
+            self.show_notification("Settings backup exported.", "success")
         except Exception as exc:
-            messagebox.showerror(APP_NAME, f"Could not export settings backup:\n{exc}")
+            self.show_notification(f"Could not export settings backup:\n{exc}", "error")
 
     def import_settings_backup(self) -> None:
         try:
@@ -546,7 +632,7 @@ class MesterSyncApp:
                 return
             data = json.loads(Path(source).read_text(encoding="utf-8"))
             if not isinstance(data, dict):
-                messagebox.showerror(APP_NAME, "That backup file did not contain settings.")
+                self.show_notification("That backup file did not contain settings.", "error")
                 return
             cfg = dict(DEFAULT_CONFIG)
             cfg.update(data)
@@ -558,9 +644,9 @@ class MesterSyncApp:
             self.refresh_settings_ui_from_config()
             self.saved_settings_snapshot = self.current_settings_snapshot()
             self.log(f"Settings backup imported: {source}")
-            messagebox.showinfo(APP_NAME, "Settings backup imported.")
+            self.show_notification("Settings backup imported.", "success")
         except Exception as exc:
-            messagebox.showerror(APP_NAME, f"Could not import settings backup:\n{exc}")
+            self.show_notification(f"Could not import settings backup:\n{exc}", "error")
 
     def run_setup_wizard(self) -> None:
         wizard = tk.Toplevel(self.root)
@@ -625,16 +711,38 @@ class MesterSyncApp:
         for index, (drive, var) in enumerate(ignored_drive_vars.items()):
             tk.Checkbutton(drive_grid, text=drive, variable=var, indicatoron=False, bg=self.CARD3, fg=self.TEXT, selectcolor=self.BLUE, activebackground=self.BLUE, activeforeground=self.TEXT, relief="flat", bd=0, padx=10, pady=5).grid(row=index // 8, column=index % 8, sticky="w", padx=(0, 8), pady=(0, 6))
 
+        wizard_notice_var = tk.StringVar(value="")
+        wizard_notice = tk.Label(
+            wrap,
+            textvariable=wizard_notice_var,
+            bg="#421f27",
+            fg="#ffb4bd",
+            font=("Segoe UI", 9, "bold"),
+            justify="left",
+            anchor="w",
+            padx=10,
+            pady=8,
+            wraplength=850,
+        )
+
+        def set_wizard_notice(text: str, success: bool = False) -> None:
+            wizard_notice_var.set(text)
+            bg = self.DARK_GREEN if success else "#421f27"
+            fg = "#a9f3c5" if success else "#ffb4bd"
+            wizard_notice.configure(bg=bg, fg=fg)
+            if not wizard_notice.winfo_ismapped():
+                wizard_notice.pack(fill="x", pady=(0, 8))
+
         buttons = tk.Frame(wrap, bg=self.BG)
         buttons.pack(fill="x", pady=(8, 0))
         def save_setup(close_after_save: bool = False) -> None:
             missing = [label for key, label in [("input_folder", "Importfolder"), ("output_folder", "Output folder"), ("ffmpeg_path", "FFmpeg.exe")] if not values[key].get().strip()]
             if missing:
-                messagebox.showerror(APP_NAME, "Please choose:\n" + "\n".join(f"- {item}" for item in missing), parent=wizard)
+                set_wizard_notice("Please choose: " + ", ".join(missing))
                 return
             ffmpeg_candidate = Path(values["ffmpeg_path"].get().strip())
             if not ffmpeg_candidate.is_file():
-                messagebox.showerror(APP_NAME, f"FFmpeg.exe was not found:\n\n{ffmpeg_candidate}", parent=wizard)
+                set_wizard_notice(f"FFmpeg.exe was not found: {ffmpeg_candidate}")
                 return
             folder_errors = [
                 validate_writable_folder(values["input_folder"].get().strip(), "Importfolder"),
@@ -643,7 +751,7 @@ class MesterSyncApp:
             ]
             folder_errors = [error for error in folder_errors if error]
             if folder_errors:
-                messagebox.showerror(APP_NAME, "MesterSync cannot safely use these folders:\n\n" + "\n".join(f"- {error}" for error in folder_errors), parent=wizard)
+                set_wizard_notice("MesterSync cannot safely use these folders:\n" + "\n".join(f"- {error}" for error in folder_errors))
                 return
             with self.config_lock:
                 self.config["input_folder"] = values["input_folder"].get().strip()
@@ -659,15 +767,16 @@ class MesterSyncApp:
             self.nas_folder_var.set(self.config["nas_folder"])
             self.ffmpeg_path_var.set(self.config["ffmpeg_path"])
             self.checksum_path_var.set(self.config["checksum_database_path"])
-            self.ignored_drives_widget.values = list(self.config["ignored_drives"])
-            self.ignored_drives_widget.refresh()
+            if self.settings_built:
+                self.ignored_drives_widget.values = list(self.config["ignored_drives"])
+                self.ignored_drives_widget.refresh()
             self.processed_drive_ids.clear()
             self.load_checksum_database()
             self.saved_settings_snapshot = self.current_settings_snapshot()
             self.update_unsaved_settings_warning()
             self.update_startup_warning()
             self.log("Setup wizard saved settings.")
-            messagebox.showinfo(APP_NAME, "Setup settings saved.", parent=wizard)
+            set_wizard_notice("Setup settings saved.", success=True)
             if close_after_save:
                 wizard.destroy()
         self.button(buttons, "Save and close", lambda: save_setup(True), self.GREEN).pack(side="right")
@@ -718,7 +827,7 @@ class MesterSyncApp:
             self.set_config_from_ui()
             cfg = self.get_config()
         except Exception as exc:
-            messagebox.showerror(APP_NAME, f"Could not read settings:\n{exc}")
+            self.show_notification(f"Could not read settings:\n{exc}", "error")
             return
         self.health_check_running = True
         if hasattr(self, "health_check_button"):
@@ -747,7 +856,7 @@ class MesterSyncApp:
         error = str(payload.get("error") or "")
         if error:
             self.log(f"Health check failed: {error}")
-            messagebox.showerror(APP_NAME, f"Health check failed:\n{error}")
+            self.show_notification(f"Health check failed:\n{error}", "error")
             return
         ffmpeg_key = str(payload.get("ffmpeg_key") or "")
         encoders = payload.get("encoders")
@@ -755,8 +864,12 @@ class MesterSyncApp:
             self.encoder_cache[ffmpeg_key] = encoders
             self.encoder_queries_pending.discard(ffmpeg_key)
             self.update_preset_status(check_encoder=True)
-        self.log("Health check complete.")
-        messagebox.showinfo(APP_NAME, str(payload.get("text") or "Health check completed."))
+        health_text = str(payload.get("text") or "Health check completed.")
+        self.log("Health check complete.\n" + health_text)
+        level = "warning" if "WARNING" in health_text or "ERROR" in health_text else "success"
+        issue_count = health_text.count("WARNING") + health_text.count("ERROR")
+        summary = f"Health check complete with {issue_count} warning(s). Open Log for details." if issue_count else "Health check complete. Everything looks healthy."
+        self.show_notification(summary, level, duration_ms=8000)
 
     def load_history(self) -> List[Dict[str, Any]]:
         return load_history_records()
@@ -852,11 +965,11 @@ class MesterSyncApp:
         except Exception as exc:
             (self.log if notify else self.emit_log)(f"Thumbnail cleanup warning: {exc}")
             if notify:
-                messagebox.showwarning(APP_NAME, f"Could not finish thumbnail cleanup:\n\n{exc}")
+                self.show_notification(f"Could not finish thumbnail cleanup:\n{exc}", "warning")
             return
         (self.log if notify else self.emit_log)(f"Cleaned thumbnails: removed {removed}, kept {kept}.")
         if notify:
-            messagebox.showinfo(APP_NAME, f"Thumbnail cleanup complete.\n\nRemoved: {removed}\nKept: {kept}\nBefore: {before}")
+            self.show_notification(f"Thumbnail cleanup complete. Removed: {removed} · Kept: {kept} · Before: {before}", "success")
 
     def save_pending_tasks(self, force: bool = False) -> None:
         if not force:
@@ -993,6 +1106,43 @@ class MesterSyncApp:
         self.checksum_queue.put(path)
         self.ensure_checksum_worker_running()
 
+    def ensure_task_source_fingerprint(self, task_id: str, source: Path) -> bool:
+        """Remember directly watched sources before their working copy is removed."""
+        cfg = self.get_config()
+        if not bool(cfg.get("enable_duplicate_detection", True)):
+            return True
+        task = self.tasks.get(task_id)
+        if not task or task.convert_in_place or task.original_checksum:
+            return True
+        try:
+            source_size = source.stat().st_size
+        except OSError:
+            return False
+        started = time.time()
+
+        def on_progress(percent: int, checked: int, total: int) -> None:
+            elapsed = time.time() - started
+            eta = (elapsed / percent * (100 - percent)) if percent > 0 else None
+            self.update_task(
+                task_id,
+                stage=STAGE_CONVERTING,
+                progress=percent,
+                detail=f"Remembering source fingerprint {format_size(checked)} / {format_size(total)}",
+                eta_seconds=eta,
+            )
+            self.emit_progress("conversion", f"Remembering source: {source.name}", percent, eta)
+
+        digest = sha256_file(source, task.import_stop_event, on_progress)
+        if not digest:
+            return False
+        with self.task_lock:
+            current = self.tasks.get(task_id)
+            if not current:
+                return False
+            current.original_checksum = digest
+        self.remember_original_checksum(digest, source.name, source_size, source)
+        return True
+
     def ensure_checksum_worker_running(self) -> None:
         if self.checksum_worker_started:
             return
@@ -1025,9 +1175,9 @@ class MesterSyncApp:
             self.checksum_db = kept
         self.save_checksum_database()
         self.log(f"Cleaned checksum database: removed {removed} invalid entr{'y' if removed == 1 else 'ies'}, kept {len(kept)} remembered fingerprint(s).")
-        messagebox.showinfo(
-            APP_NAME,
-            f"Checksum cleanup complete.\n\nRemoved invalid entries: {removed}\nKept fingerprints: {len(kept)}\nBefore: {before}\n\nMoved NAS files remain remembered.",
+        self.show_notification(
+            f"Checksum cleanup complete. Removed invalid entries: {removed} · Kept fingerprints: {len(kept)} · Before: {before}. Moved NAS files remain remembered.",
+            "success",
         )
 
     # ---------------- UI ----------------
@@ -1041,9 +1191,9 @@ class MesterSyncApp:
         style.configure("Purple.Horizontal.TProgressbar", troughcolor=self.CARD3, background=self.PURPLE, lightcolor=self.PURPLE, darkcolor=self.PURPLE, bordercolor=self.CARD3, thickness=12)
         style.configure("Orange.Horizontal.TProgressbar", troughcolor=self.CARD3, background=self.ORANGE, lightcolor=self.ORANGE, darkcolor=self.ORANGE, bordercolor=self.CARD3, thickness=12)
         style.configure("Thin.Horizontal.TProgressbar", troughcolor=self.CARD3, background=self.GREEN, lightcolor=self.GREEN, darkcolor=self.GREEN, bordercolor=self.CARD3, thickness=10)
-        style.configure("RowImport.Horizontal.TProgressbar", troughcolor=self.CARD3, background=self.PURPLE, lightcolor=self.PURPLE, darkcolor=self.PURPLE, bordercolor=self.CARD3, thickness=10)
+        style.configure("RowImport.Horizontal.TProgressbar", troughcolor=self.CARD3, background=self.ORANGE, lightcolor=self.ORANGE, darkcolor=self.ORANGE, bordercolor=self.CARD3, thickness=10)
         style.configure("RowConvert.Horizontal.TProgressbar", troughcolor=self.CARD3, background=self.GREEN, lightcolor=self.GREEN, darkcolor=self.GREEN, bordercolor=self.CARD3, thickness=10)
-        style.configure("RowTransfer.Horizontal.TProgressbar", troughcolor=self.CARD3, background=self.ORANGE, lightcolor=self.ORANGE, darkcolor=self.ORANGE, bordercolor=self.CARD3, thickness=10)
+        style.configure("RowTransfer.Horizontal.TProgressbar", troughcolor=self.CARD3, background=self.PURPLE, lightcolor=self.PURPLE, darkcolor=self.PURPLE, bordercolor=self.CARD3, thickness=10)
         style.configure("RowError.Horizontal.TProgressbar", troughcolor=self.CARD3, background=self.RED, lightcolor=self.RED, darkcolor=self.RED, bordercolor=self.CARD3, thickness=10)
         # Readable dropdowns. The rest of the UI is dark, but Tk's dropdown list
         # becomes hard to read with white text on a grey native listbox.
@@ -1054,6 +1204,75 @@ class MesterSyncApp:
         self.root.option_add("*TCombobox*Listbox.selectBackground", "#d7e8ff")
         self.root.option_add("*TCombobox*Listbox.selectForeground", "#000000")
         style.configure("Vertical.TScrollbar", background=self.CARD3, troughcolor=self.CARD, bordercolor=self.BORDER, arrowcolor=self.TEXT)
+
+    def build_notification_toast(self) -> None:
+        self.notification_frame = tk.Frame(self.main, bg=self.BORDER, highlightthickness=0)
+        self.notification_inner = tk.Frame(self.notification_frame, bg=self.CARD2, padx=12, pady=9)
+        self.notification_inner.pack(fill="both", expand=True, padx=2, pady=2)
+        self.notification_var = tk.StringVar(value="")
+        self.notification_label = tk.Label(
+            self.notification_inner,
+            textvariable=self.notification_var,
+            bg=self.CARD2,
+            fg=self.TEXT,
+            font=("Segoe UI", 9, "bold"),
+            justify="left",
+            anchor="w",
+            wraplength=520,
+        )
+        self.notification_label.pack(side="left", fill="x", expand=True)
+        self.small_button(self.notification_inner, "Dismiss", self.hide_notification, self.CARD3).pack(side="right", padx=(12, 0))
+
+    def show_notification(self, text: str, level: str = "info", duration_ms: Optional[int] = None) -> None:
+        if not hasattr(self, "notification_frame"):
+            self.log(str(text))
+            return
+        delay = duration_ms if duration_ms is not None else (9000 if level == "error" else 5500)
+        payload = (compact_notification_text(text), level, max(1000, int(delay)))
+        if self.notification_active:
+            self.notification_queue.append(payload)
+            return
+        self.display_notification(payload)
+
+    def display_notification(self, payload: Tuple[str, str, int]) -> None:
+        text, level, delay = payload
+        colors = {
+            "info": ("#102b46", "#b9dcff"),
+            "success": (self.DARK_GREEN, "#a9f3c5"),
+            "warning": ("#3a3114", "#ffd36a"),
+            "error": ("#421f27", "#ffb4bd"),
+        }
+        bg, fg = colors.get(level, colors["info"])
+        self.notification_active = True
+        self.notification_var.set(text)
+        self.notification_inner.configure(bg=bg)
+        self.notification_label.configure(bg=bg, fg=fg)
+        for child in self.notification_inner.winfo_children():
+            if child is not self.notification_label and isinstance(child, tk.Button):
+                child.configure(bg=self.CARD3, activebackground=self.CARD3)
+        self.notification_frame.place(relx=1.0, rely=1.0, x=-24, y=-24, anchor="se", width=570)
+        self.notification_frame.lift()
+        if self.notification_after_id is not None:
+            try:
+                self.root.after_cancel(self.notification_after_id)
+            except Exception:
+                pass
+        self.notification_after_id = self.root.after(delay, self.hide_notification)
+
+    def hide_notification(self) -> None:
+        if self.notification_after_id is not None:
+            try:
+                self.root.after_cancel(self.notification_after_id)
+            except Exception:
+                pass
+            self.notification_after_id = None
+        if hasattr(self, "notification_frame"):
+            self.notification_frame.place_forget()
+        self.notification_active = False
+        if self.notification_queue:
+            payload = self.notification_queue.popleft()
+            self.notification_active = True
+            self.root.after(80, lambda p=payload: self.display_notification(p))
 
     def button(self, parent: tk.Widget, text: str, command: Callable[[], None], bg: str, fg: str = "white", padx: int = 12) -> tk.Button:
         return tk.Button(parent, text=text, command=command, bg=bg, fg=fg, activebackground=bg, activeforeground=fg, relief="flat", bd=0, highlightthickness=2, highlightbackground=self.BORDER, padx=padx, pady=8, font=("Segoe UI", 10, "bold"), cursor="hand2")
@@ -1075,6 +1294,7 @@ class MesterSyncApp:
         self.main.pack(fill="both", expand=True)
         self.build_header()
         self.build_top_bar()
+        self.build_notification_toast()
         self.build_stage_cards()
         self.build_body()
         self.update_status()
@@ -1083,7 +1303,7 @@ class MesterSyncApp:
         header = tk.Frame(self.main, bg=self.BG)
         header.pack(fill="x", padx=18, pady=(14, 10))
         left = tk.Frame(header, bg=self.BG)
-        left.pack(side="left", fill="x", expand=True)
+        left.pack(side="left")
         logo = resource_path(LOGO_FILENAME)
         if logo.exists():
             try:
@@ -1115,6 +1335,24 @@ class MesterSyncApp:
         self.start_btn.pack(side="left")
         self.pause_btn = self.button(bar, "Pause", self.toggle_pause, self.YELLOW)
         self.pause_btn.pack(side="left", padx=(10, 0))
+        self.log_toggle = self.button(bar, "Log", self.toggle_log, self.CARD3)
+        self.log_toggle.pack(side="left", padx=(10, 0))
+        self.top_log_outer = tk.Frame(bar, bg=self.BORDER, height=48)
+        self.top_log_outer.pack_propagate(False)
+        top_log_panel = tk.Frame(self.top_log_outer, bg="#07111e", padx=5, pady=4)
+        top_log_panel.pack(fill="both", expand=True, padx=2, pady=2)
+        self.log_text = scrolledtext.ScrolledText(
+            top_log_panel,
+            height=2,
+            bg="#07111e",
+            fg="#d7e8ff",
+            insertbackground="#d7e8ff",
+            relief="flat",
+            font=("Consolas", 8),
+            state="disabled",
+            wrap="word",
+        )
+        self.log_text.pack(fill="both", expand=True)
         self.startup_warning_var = tk.StringVar(value="")
         self.startup_warning_frame = tk.Frame(bar, bg="#3a3114", padx=10, pady=6)
         tk.Label(self.startup_warning_frame, textvariable=self.startup_warning_var, bg="#3a3114", fg="#ffd36a", font=("Segoe UI", 9, "bold"), anchor="w").pack(side="left")
@@ -1146,13 +1384,13 @@ class MesterSyncApp:
         wrap = tk.Frame(self.main, bg=self.BG)
         wrap.pack(fill="x", padx=18, pady=(0, 10))
         self.stage_cards: Dict[str, Dict[str, Any]] = {}
-        configs = [("import", "Import/watching", "Purple.Horizontal.TProgressbar"), ("conversion", "Conversion", "Green.Horizontal.TProgressbar"), ("transfer", "Transfer", "Orange.Horizontal.TProgressbar")]
+        configs = [("import", "Import/watching", "Orange.Horizontal.TProgressbar"), ("conversion", "Conversion", "Green.Horizontal.TProgressbar"), ("transfer", "Transfer", "Purple.Horizontal.TProgressbar")]
         for idx, (key, title, style) in enumerate(configs):
-            outer = tk.Frame(wrap, bg=self.BORDER, height=158)
+            outer = tk.Frame(wrap, bg=self.BORDER, height=126)
             outer.grid(row=0, column=idx, sticky="nsew", padx=(0 if idx == 0 else 10, 0))
             outer.grid_propagate(False)
             wrap.grid_columnconfigure(idx, weight=1)
-            card = tk.Frame(outer, bg=self.CARD, padx=14, pady=12, height=154)
+            card = tk.Frame(outer, bg=self.CARD, padx=12, pady=9, height=122)
             card.pack(fill="both", expand=True, padx=2, pady=2)
             card.pack_propagate(False)
             head = tk.Frame(card, bg=self.CARD)
@@ -1171,11 +1409,13 @@ class MesterSyncApp:
                 cancel_btn.pack(side="right", padx=(0, 8))
             label_var = tk.StringVar(value=f"{title}: idle")
             eta_var = tk.StringVar(value="ETA: -")
-            tk.Label(card, textvariable=label_var, bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9), anchor="nw", justify="left", height=2, wraplength=420).pack(fill="x", pady=(8, 2))
-            tk.Label(card, textvariable=eta_var, bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9), anchor="w", height=1).pack(fill="x")
+            detail_row = tk.Frame(card, bg=self.CARD)
+            detail_row.pack(fill="x", pady=(6, 1))
+            tk.Label(detail_row, textvariable=eta_var, bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9), anchor="e").pack(side="right", padx=(8, 0))
+            tk.Label(detail_row, textvariable=label_var, bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9), anchor="w", width=1).pack(side="left", fill="x", expand=True)
             pvar = tk.IntVar(value=0)
             bar = ttk.Progressbar(card, maximum=100, variable=pvar, style=style)
-            bar.pack(fill="x", pady=(10, 6))
+            bar.pack(fill="x", pady=(6, 3))
             percent = tk.StringVar(value="0%")
             tk.Label(card, textvariable=percent, bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10, "bold"), anchor="e").pack(fill="x")
             self.stage_cards[key] = {"outer": outer, "card": card, "dot": dot, "label": label_var, "eta": eta_var, "progress": pvar, "percent": percent, "button": btn, "cancel_button": cancel_btn, "priority_button": priority_btn, "title": title}
@@ -1187,7 +1427,7 @@ class MesterSyncApp:
         left.configure(width=160)
         left.pack_propagate(False)
         self.tab_buttons: Dict[str, tk.Button] = {}
-        for key, label in [("dashboard", "Dashboard"), ("history", "History"), ("settings", "Settings"), ("preset_test", "Preset test")]:
+        for key, label in [("dashboard", "Dashboard"), ("history", "History"), ("settings", "Settings")]:
             btn = self.button(left, label, lambda k=key: self.show_tab(k), self.CARD3)
             btn.pack(fill="x", pady=(0, 10))
             self.tab_buttons[key] = btn
@@ -1202,33 +1442,73 @@ class MesterSyncApp:
         )
         self.compact_dashboard_btn.pack(fill="x", pady=(0, 10))
         self.update_compact_dashboard_button()
-        self.log_toggle = self.button(self.dashboard_side_controls, "Show log", self.toggle_log, self.CARD3)
-        self.log_toggle.pack(fill="x")
         self.content = tk.Frame(body, bg=self.BG)
         self.content.pack(side="left", fill="both", expand=True)
+        self.content.grid_rowconfigure(0, weight=1)
+        self.content.grid_columnconfigure(0, weight=1)
         self.dashboard_frame = tk.Frame(self.content, bg=self.BG)
         self.history_frame = tk.Frame(self.content, bg=self.BG)
         self.settings_frame = tk.Frame(self.content, bg=self.BG)
-        self.preset_test_frame = tk.Frame(self.content, bg=self.BG)
+        for frame in (self.dashboard_frame, self.history_frame, self.settings_frame):
+            frame.grid(row=0, column=0, sticky="nsew")
         self.build_dashboard()
         self.build_history()
-        self.build_settings()
-        self.build_preset_test()
+        self.settings_loading_label = tk.Label(
+            self.settings_frame,
+            text="Loading Settings...",
+            bg=self.BG,
+            fg=self.MUTED,
+            font=("Segoe UI", 13, "bold"),
+        )
+        self.settings_loading_label.pack(pady=30)
         self.show_tab("dashboard")
 
     def show_tab(self, key: str) -> None:
-        for frame in (self.dashboard_frame, self.history_frame, self.settings_frame, self.preset_test_frame):
-            frame.pack_forget()
+        if key not in self.tab_buttons:
+            return
+        if self.current_tab == "history" and key != "history":
+            self.cancel_history_render(mark_dirty=True)
         for k, b in self.tab_buttons.items():
             b.configure(bg=self.BLUE if k == key else self.CARD3)
-        getattr(self, f"{key}_frame").pack(fill="both", expand=True)
+        getattr(self, f"{key}_frame").tkraise()
+        changed = self.current_tab != key
+        self.current_tab = key
+        if key == "settings" and not self.settings_built and not self.settings_building:
+            self.settings_building = True
+            self.root.after(10, self.finish_lazy_settings_build)
         if hasattr(self, "dashboard_side_controls"):
             if key == "dashboard" and not self.dashboard_side_controls.winfo_ismapped():
                 self.dashboard_side_controls.pack(fill="x", side="bottom")
             elif key != "dashboard" and self.dashboard_side_controls.winfo_ismapped():
                 self.dashboard_side_controls.pack_forget()
-        if key == "dashboard":
+        if key == "dashboard" and changed:
             self.refresh_dashboard_rows()
+            self.deferred_dashboard_task_ids.clear()
+        elif key == "history" and self.history_view_dirty:
+            self.refresh_history_view()
+
+    def finish_lazy_settings_build(self) -> None:
+        if self.settings_built:
+            self.settings_building = False
+            return
+        if self.current_tab != "settings":
+            self.settings_building = False
+            return
+        try:
+            for child in self.settings_frame.winfo_children():
+                child.destroy()
+            self.build_settings()
+            self.refresh_settings_ui_from_config()
+        except Exception as exc:
+            self.settings_building = False
+            self.log(f"Settings page build warning: {exc}")
+            tk.Label(
+                self.settings_frame,
+                text=f"Settings could not be opened: {exc}",
+                bg=self.BG,
+                fg=self.RED,
+                font=("Segoe UI", 11, "bold"),
+            ).pack(pady=30)
 
     def row_widget_alive(self, task_id: str) -> bool:
         row = self.row_widgets.get(task_id)
@@ -1240,41 +1520,90 @@ class MesterSyncApp:
             return False
 
     def refresh_dashboard_rows(self) -> None:
-        """Rebuild missing Dashboard rows without touching the running workers.
+        self.refresh_dashboard_virtual_rows(force=True)
+        self.update_batch_box_visibility()
 
-        A settings change can move focus away from an active row while conversion
-        progress events are arriving. This guard makes the Dashboard self-heal if
-        a row widget was hidden/destroyed by a Tk layout refresh while the task is
-        still alive.
-        """
+    def dashboard_row_extent(self) -> int:
+        return 108 if self.compact_dashboard else 174
+
+    def schedule_dashboard_virtual_refresh(self) -> None:
+        if self.dashboard_virtual_refresh_after_id is not None:
+            return
+        self.dashboard_virtual_refresh_after_id = self.root.after_idle(self.refresh_dashboard_virtual_rows)
+
+    def dashboard_task_should_render(self, task_id: str) -> bool:
         with self.task_lock:
-            task_ids = list(self.tasks.keys())
-        for task_id in task_ids:
             if task_id not in self.tasks:
-                continue
-            if not self.row_widget_alive(task_id):
-                self.row_widgets.pop(task_id, None)
-                self.render_task(task_id)
-        # Clean up stale row references for tasks that have legitimately moved
-        # to History or were removed.
-        for task_id in list(self.row_widgets.keys()):
-            if task_id not in self.tasks:
+                return False
+            total = len(self.tasks)
+        return total <= DASHBOARD_VIRTUAL_THRESHOLD or task_id in self.dashboard_virtual_ids
+
+    def refresh_dashboard_virtual_rows(self, force: bool = False) -> None:
+        self.dashboard_virtual_refresh_after_id = None
+        if not hasattr(self, "dashboard_canvas"):
+            return
+        order = self.ordered_task_ids()
+        extent = self.dashboard_row_extent()
+        try:
+            scroll_top = float(self.dashboard_canvas.canvasy(0))
+            viewport = max(1, int(self.dashboard_canvas.winfo_height()))
+        except Exception:
+            scroll_top, viewport = 0.0, 800
+        start, end = virtual_row_window(
+            len(order),
+            scroll_top,
+            viewport,
+            extent,
+            DASHBOARD_VIRTUAL_THRESHOLD,
+            DASHBOARD_VIRTUAL_OVERSCAN,
+        )
+        visible_order = tuple(order[start:end])
+        if (
+            not force
+            and (start, end) == self.dashboard_virtual_range
+            and len(order) == self.dashboard_virtual_total
+            and visible_order == self.dashboard_virtual_order
+        ):
+            return
+        self.dashboard_virtual_range = (start, end)
+        self.dashboard_virtual_total = len(order)
+        self.dashboard_virtual_order = visible_order
+        visible = set(visible_order)
+        self.dashboard_virtual_ids = visible
+        for task_id in list(self.row_widgets):
+            if task_id not in visible or task_id not in self.tasks:
                 row = self.row_widgets.pop(task_id, None)
                 if row:
                     try:
                         row["outer"].destroy()
                     except Exception:
                         pass
-        self.update_batch_box_visibility()
+        top_height = start * extent
+        bottom_height = max(0, len(order) - end) * extent
+        self.dashboard_top_spacer.configure(height=max(1, top_height))
+        self.dashboard_bottom_spacer.configure(height=max(1, bottom_height))
+        for task_id in order[start:end]:
+            self.render_task(task_id)
+        for task_id in order[start:end]:
+            row = self.row_widgets.get(task_id)
+            if row:
+                row["outer"].pack_forget()
+                row["outer"].pack(fill="x", pady=3 if self.compact_dashboard else 7, before=self.dashboard_bottom_spacer)
 
     def make_canvas_area(self, parent: tk.Widget) -> Tuple[tk.Canvas, tk.Frame]:
         holder = tk.Frame(parent, bg=self.BG)
         holder.pack(fill="both", expand=True)
-        canvas = tk.Canvas(holder, bg=self.BG, highlightthickness=0, bd=0)
+        canvas = tk.Canvas(holder, bg=self.BG, highlightthickness=0, bd=0, yscrollincrement=1)
         scrollbar = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
         inner = tk.Frame(canvas, bg=self.BG)
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas._view_changed_callback = None  # type: ignore[attr-defined]
+        def update_scrollbar(first: str, last: str) -> None:
+            scrollbar.set(first, last)
+            callback = getattr(canvas, "_view_changed_callback", None)
+            if callback:
+                callback()
+        canvas.configure(yscrollcommand=update_scrollbar)
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
         def update_scrollregion(event: Optional[tk.Event] = None) -> None:
@@ -1285,21 +1614,61 @@ class MesterSyncApp:
                 canvas.yview_moveto(0)
         inner.bind("<Configure>", update_scrollregion)
         canvas.bind("<Configure>", lambda e: (canvas.itemconfigure(win, width=e.width), update_scrollregion()))
-        self.bind_mousewheel(canvas)
+        self.bind_mousewheel(canvas, holder)
         return canvas, inner
 
-    def bind_mousewheel(self, canvas: tk.Canvas) -> None:
-        def on_wheel(event: tk.Event) -> None:
-            delta = int(-1 * (event.delta / 120)) if getattr(event, "delta", 0) else 0
-            if delta:
-                top, bottom = canvas.yview()
-                if delta < 0 and top <= 0:
-                    return
-                if delta > 0 and bottom >= 1:
-                    return
-                canvas.yview_scroll(delta * 4, "units")
-        canvas.bind("<Enter>", lambda e: self.root.bind_all("<MouseWheel>", on_wheel))
-        canvas.bind("<Leave>", lambda e: self.root.unbind_all("<MouseWheel>"))
+    def bind_mousewheel(self, canvas: tk.Canvas, region: Optional[tk.Widget] = None) -> None:
+        self.smooth_scroll_regions.append((region or canvas, canvas))
+        if not self.smooth_scroll_bound:
+            self.root.bind_all("<MouseWheel>", self.handle_smooth_mousewheel, add="+")
+            self.smooth_scroll_bound = True
+
+    def handle_smooth_mousewheel(self, event: tk.Event) -> Optional[str]:
+        delta = float(getattr(event, "delta", 0) or 0)
+        if not delta:
+            return None
+        try:
+            widget = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            widget = None
+        canvas: Optional[tk.Canvas] = None
+        for region, candidate in reversed(self.smooth_scroll_regions):
+            current = widget
+            while current is not None:
+                if current is region:
+                    canvas = candidate
+                    break
+                current = getattr(current, "master", None)
+            if canvas is not None:
+                break
+        if canvas is None:
+            return None
+        ident = id(canvas)
+        current_velocity = self.smooth_scroll_velocity.get(ident, 0.0)
+        impulse = max(-240.0, min(240.0, -delta * 0.9))
+        self.smooth_scroll_velocity[ident] = max(-720.0, min(720.0, current_velocity + impulse))
+        if ident not in self.smooth_scroll_after_ids:
+            self.smooth_scroll_after_ids[ident] = self.root.after(16, lambda: self.animate_smooth_scroll(canvas))
+        return "break"
+
+    def animate_smooth_scroll(self, canvas: tk.Canvas) -> None:
+        ident = id(canvas)
+        self.smooth_scroll_after_ids.pop(ident, None)
+        if not canvas.winfo_exists():
+            self.smooth_scroll_velocity.pop(ident, None)
+            return
+        velocity = self.smooth_scroll_velocity.get(ident, 0.0)
+        distance, next_velocity = inertial_scroll_step(velocity)
+        top, bottom = canvas.yview()
+        if (distance < 0 and top <= 0) or (distance > 0 and bottom >= 1):
+            next_velocity = 0.0
+        elif distance:
+            canvas.yview_scroll(distance, "units")
+        if next_velocity:
+            self.smooth_scroll_velocity[ident] = next_velocity
+            self.smooth_scroll_after_ids[ident] = self.root.after(16, lambda: self.animate_smooth_scroll(canvas))
+        else:
+            self.smooth_scroll_velocity.pop(ident, None)
 
     def enable_drop_target(self, widget: tk.Widget) -> bool:
         """Make a widget accept dropped files/folders when tkinterdnd2 is available."""
@@ -1353,12 +1722,14 @@ class MesterSyncApp:
 
     def build_dashboard(self) -> None:
         header = self.card_frame(self.dashboard_frame, fill="x", pady=(0, 10))
+        header.configure(padx=10, pady=7)
         left = tk.Frame(header, bg=self.CARD)
         left.pack(side="left", fill="both", expand=True)
-        tk.Label(left, text="Active files", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        tk.Label(left, text="Add, scan, or drag-and-drop files here. Ctrl-click adds/removes. Shift-click selects a range. Rename directly in each row. Batch rename appears when multiple files are selected.", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9), anchor="w").pack(anchor="w", pady=(4, 0))
+        title_row = tk.Frame(left, bg=self.CARD)
+        title_row.pack(fill="x")
+        tk.Label(title_row, text="Active files", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 15, "bold")).pack(side="left")
         self.session_summary_var = tk.StringVar(value="")
-        self.session_summary_label = tk.Label(left, textvariable=self.session_summary_var, bg=self.CARD2, fg="#b9c7d8", font=("Segoe UI", 9, "bold"), anchor="w", padx=10, pady=4)
+        self.session_summary_label = tk.Label(title_row, textvariable=self.session_summary_var, bg=self.CARD2, fg="#b9c7d8", font=("Segoe UI", 9, "bold"), anchor="w", padx=8, pady=3)
         self.update_session_summary()
         right = tk.Frame(header, bg=self.CARD)
         right.pack(side="right")
@@ -1417,17 +1788,14 @@ class MesterSyncApp:
         self.batch_hint_var = tk.StringVar(value="")
         tk.Label(self.batch_frame, textvariable=self.batch_hint_var, bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(10, 0))
         self.dashboard_canvas, self.dashboard_inner = self.make_canvas_area(self.dashboard_frame)
+        self.dashboard_top_spacer = tk.Frame(self.dashboard_inner, bg=self.BG, height=1)
+        self.dashboard_top_spacer.pack(fill="x")
+        self.dashboard_top_spacer.pack_propagate(False)
+        self.dashboard_bottom_spacer = tk.Frame(self.dashboard_inner, bg=self.BG, height=1)
+        self.dashboard_bottom_spacer.pack(fill="x")
+        self.dashboard_bottom_spacer.pack_propagate(False)
+        self.dashboard_canvas._view_changed_callback = self.schedule_dashboard_virtual_refresh  # type: ignore[attr-defined]
         self.enable_dashboard_drop_targets(header, left, right, self.dashboard_frame, self.dashboard_canvas, self.dashboard_inner)
-        self.log_outer = tk.Frame(self.dashboard_frame, bg=self.BORDER)
-        self.log_visible = False
-        self.log_panel = tk.Frame(self.log_outer, bg=self.CARD, padx=12, pady=8)
-        self.log_panel.pack(fill="both", expand=True, padx=2, pady=2)
-        grip = tk.Label(self.log_panel, text="Log - drag this header to resize", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9), cursor="sb_v_double_arrow")
-        grip.pack(fill="x")
-        grip.bind("<B1-Motion>", self.resize_log)
-        self.log_text = scrolledtext.ScrolledText(self.log_panel, height=9, bg="#07111e", fg="#d7e8ff", insertbackground="#d7e8ff", relief="flat", font=("Consolas", 9), state="disabled")
-        self.log_text.pack(fill="both", expand=True, pady=(6, 0))
-
     def build_history(self) -> None:
         header = self.card_frame(self.history_frame, fill="x", pady=(0, 10))
         left = tk.Frame(header, bg=self.CARD)
@@ -1458,6 +1826,7 @@ class MesterSyncApp:
             self.apply_row_density(task_id)
             if not self.compact_dashboard:
                 self.render_task(task_id)
+        self.refresh_dashboard_virtual_rows(force=True)
 
     def apply_row_density(self, task_id: str) -> None:
         row = self.row_widgets.get(task_id)
@@ -1488,28 +1857,33 @@ class MesterSyncApp:
         self.apply_thumbnail(task_id)
 
     def build_settings(self) -> None:
+        if self.settings_built:
+            return
         canvas, inner = self.make_canvas_area(self.settings_frame)
+        self.settings_canvas = canvas
         self.settings_inner = inner
-        self.input_folder_var = tk.StringVar(value=self.config["input_folder"])
-        self.output_folder_var = tk.StringVar(value=self.config["output_folder"])
-        self.nas_folder_var = tk.StringVar(value=self.config["nas_folder"])
-        self.ffmpeg_path_var = tk.StringVar(value=self.config["ffmpeg_path"])
-        self.exclude_files_var = tk.StringVar(value=", ".join(self.config["exclude_files"]))
-        self.exclude_folders_var = tk.StringVar(value=", ".join(self.config["exclude_folders"]))
-        self.auto_delay_var = tk.StringVar(value=str(self.config["auto_import_delay_seconds"]))
-        self.scan_interval_var = tk.StringVar(value=str(self.config["scan_interval_seconds"]))
-        self.stable_seconds_var = tk.StringVar(value=str(self.config["file_stable_seconds"]))
-        self.copy_chunk_var = tk.StringVar(value=str(self.config["copy_chunk_mb"]))
-        self.max_wait_var = tk.StringVar(value=str(self.config["max_ready_wait_seconds"]))
-        self.low_disk_warning_var = tk.StringVar(value=str(self.config.get("low_disk_warning_gb", 20)))
-        self.checksum_path_var = tk.StringVar(value=self.config["checksum_database_path"])
-        self.duplicate_var = tk.BooleanVar(value=bool(self.config["enable_duplicate_detection"]))
-        self.check_input_var = tk.BooleanVar(value=bool(self.config["check_existing_in_input"]))
-        self.auto_underscore_var = tk.BooleanVar(value=bool(self.config.get("auto_underscore_renames", False)))
-        self.prevent_sleep_var = tk.BooleanVar(value=bool(self.config.get("prevent_sleep_while_working", True)))
-        self.preset_folder_var = tk.StringVar(value=self.config.get("preset_folder") or str(preset_dir()))
 
-        paths = self.card_frame(inner, fill="x", pady=(0, 10))
+        category_nav = self.card_frame(inner, fill="x", pady=(0, 10))
+        tk.Label(category_nav, text="Settings", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 16, "bold")).pack(side="left", padx=(0, 16))
+        self.settings_category_buttons: Dict[str, tk.Button] = {}
+        categories = [
+            ("folders", "Folders & tools"),
+            ("drives", "Drives & file types"),
+            ("safety", "Safety & timing"),
+            ("presets", "Presets & test"),
+        ]
+        for key, label in categories:
+            button = self.small_button(category_nav, label, lambda k=key: self.show_settings_category(k), self.CARD3)
+            button.pack(side="left", padx=(0, 8))
+            self.settings_category_buttons[key] = button
+        self.settings_category_host = tk.Frame(inner, bg=self.BG)
+        self.settings_category_host.pack(fill="both", expand=True)
+        self.settings_categories = {
+            key: tk.Frame(self.settings_category_host, bg=self.BG)
+            for key, _label in categories
+        }
+
+        paths = self.card_frame(self.settings_categories["folders"], fill="x", pady=(0, 10))
         tk.Label(paths, text="Folders and FFmpeg", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 16, "bold")).pack(anchor="w")
         grid = tk.Frame(paths, bg=self.CARD)
         grid.pack(fill="x", pady=(10, 0))
@@ -1527,7 +1901,7 @@ class MesterSyncApp:
         self.health_check_button = self.small_button(settings_buttons, "Run health check", self.run_health_check, self.BLUE)
         self.health_check_button.pack(side="left")
 
-        dex = self.card_frame(inner, fill="x", pady=(0, 10))
+        dex = self.card_frame(self.settings_categories["drives"], fill="x", pady=(0, 10))
         tk.Label(dex, text="Drives and extensions", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 16, "bold")).pack(anchor="w")
         cgrid = tk.Frame(dex, bg=self.CARD)
         cgrid.pack(fill="x", pady=(10, 0))
@@ -1542,7 +1916,7 @@ class MesterSyncApp:
         self.import_ext_widget.frame.grid(row=0, column=1, sticky="nsew", padx=8)
         self.convert_ext_widget.frame.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
 
-        misc = self.card_frame(inner, fill="x", pady=(0, 10))
+        misc = self.card_frame(self.settings_categories["safety"], fill="x", pady=(0, 10))
         tk.Label(misc, text="Safety and timing", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 16, "bold")).pack(anchor="w")
         mgrid = tk.Frame(misc, bg=self.CARD)
         mgrid.pack(fill="x", pady=(10, 0))
@@ -1575,7 +1949,7 @@ class MesterSyncApp:
         self.add_checkbox(checkrow, "Prevent sleep while working", self.prevent_sleep_var)
         self.small_button(checkrow, "Clean thumbnails", self.cleanup_thumbnail_cache, self.CARD3).pack(side="left", padx=(12, 0))
 
-        ff = self.card_frame(inner, fill="both", expand=True, pady=(0, 10))
+        ff = self.card_frame(self.settings_categories["presets"], fill="both", expand=True, pady=(0, 10))
         tk.Label(ff, text="FFmpeg parameters and presets", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 16, "bold")).pack(anchor="w")
         folder_row = tk.Frame(ff, bg=self.CARD2, padx=10, pady=10, highlightthickness=2, highlightbackground=self.BORDER)
         folder_row.pack(fill="x", pady=(10, 8))
@@ -1601,10 +1975,12 @@ class MesterSyncApp:
         tk.Label(preset_row, textvariable=self.output_ext_var, bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9)).pack(side="right")
         self.preset_warning_var = tk.StringVar(value=self.preset_warning_text(self.config["ffmpeg_args"]))
         tk.Label(ff, textvariable=self.preset_warning_var, bg=self.CARD, fg=self.YELLOW, font=("Segoe UI", 9, "bold"), anchor="w", justify="left", wraplength=1180).pack(fill="x", pady=(0, 8))
-        self.ffmpeg_args_text = scrolledtext.ScrolledText(ff, height=18, wrap="none", font=("Consolas", 9), bg="#07111e", fg="#d7e8ff", insertbackground="#d7e8ff", relief="flat")
+        self.ffmpeg_args_text = scrolledtext.ScrolledText(ff, height=12, wrap="none", font=("Consolas", 9), bg="#07111e", fg="#d7e8ff", insertbackground="#d7e8ff", relief="flat")
         self.ffmpeg_args_text.pack(fill="both", expand=True)
         self.ffmpeg_args_text.insert("1.0", "\n".join(self.config["ffmpeg_args"]))
         self.ffmpeg_args_text.bind("<KeyRelease>", lambda e: self.on_ffmpeg_args_changed())
+
+        self.build_preset_test(self.settings_categories["presets"])
 
         footer = tk.Frame(inner, bg=self.BG)
         footer.pack(fill="x", pady=(0, 20))
@@ -1630,9 +2006,28 @@ class MesterSyncApp:
             self.preset_folder_var,
         ]:
             var.trace_add("write", lambda *_args: self.on_setting_changed())
+        self.show_settings_category("folders")
+        self.settings_built = True
+        self.settings_building = False
 
-    def build_preset_test(self) -> None:
-        card = self.card_frame(self.preset_test_frame, fill="both", expand=True)
+    def show_settings_category(self, key: str) -> None:
+        categories = getattr(self, "settings_categories", {})
+        if key not in categories:
+            return
+        for name, frame in categories.items():
+            if name == key:
+                frame.pack(fill="both", expand=True)
+            else:
+                frame.pack_forget()
+        for name, button in getattr(self, "settings_category_buttons", {}).items():
+            color = self.BLUE if name == key else self.CARD3
+            button.configure(bg=color, activebackground=color)
+        canvas = getattr(self, "settings_canvas", None)
+        if canvas is not None:
+            self.root.after_idle(lambda: canvas.yview_moveto(0) if canvas.winfo_exists() else None)
+
+    def build_preset_test(self, parent: tk.Widget) -> None:
+        card = self.card_frame(parent, fill="x", pady=(0, 10))
         tk.Label(card, text="Preset test", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 18, "bold")).pack(anchor="w")
         tk.Label(
             card,
@@ -1656,7 +2051,6 @@ class MesterSyncApp:
         self.preset_test_open_btn = self.button(buttons, "Open last test", self.open_last_preset_test, self.CARD3)
         self.preset_test_open_btn.pack(side="left", padx=(10, 0))
         self.preset_test_open_btn.configure(state="disabled")
-        self.button(buttons, "Open Settings", lambda: self.show_tab("settings"), self.CARD3).pack(side="left", padx=(10, 0))
 
     def update_total_converted_label(self) -> None:
         if hasattr(self, "total_converted_var"):
@@ -1677,7 +2071,7 @@ class MesterSyncApp:
             f"Transferred {self.session_stats['transferred']} | Skipped {self.session_stats['skipped']} | Errors {self.session_stats['errors']}{saved}"
         )
         if hasattr(self, "session_summary_label") and not self.session_summary_label.winfo_ismapped():
-            self.session_summary_label.pack(fill="x", anchor="w", pady=(4, 0))
+            self.session_summary_label.pack(side="left", padx=(12, 0))
 
     def record_session_stat(self, key: str, amount: int = 1) -> None:
         if key not in self.session_stats:
@@ -1889,9 +2283,14 @@ class MesterSyncApp:
         return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
     def preset_menu_values(self) -> List[str]:
-        return ["Current settings"] + self.list_presets()
+        cached = getattr(self, "preset_menu_values_cache", None)
+        if cached is None:
+            cached = ["Current settings"] + self.list_presets()
+            self.preset_menu_values_cache = cached
+        return list(cached)
 
     def refresh_preset_menus(self) -> None:
+        self.preset_menu_values_cache = None
         values = self.preset_menu_values()
         if hasattr(self, "top_preset_combo"):
             self.top_preset_combo.configure(values=values)
@@ -1904,6 +2303,7 @@ class MesterSyncApp:
             combo = row.get("preset_combo")
             if combo is not None:
                 combo.configure(values=values)
+                row["preset_values_key"] = tuple(values)
         try:
             self.log(f"Preset list refreshed from: {self.get_preset_folder()}")
         except Exception:
@@ -2009,7 +2409,7 @@ class MesterSyncApp:
             available = bool(self.preset_test_last_path and self.preset_test_last_path.exists())
             self.preset_test_open_btn.configure(state="normal" if available else "disabled")
         if show_error:
-            messagebox.showerror(APP_NAME, status)
+            self.show_notification(status, "error")
 
     def start_or_cancel_preset_test(self) -> None:
         with self.preset_test_process_lock:
@@ -2019,7 +2419,7 @@ class MesterSyncApp:
             return
         ffmpeg = self.resolve_ffmpeg_executable(self.ffmpeg_path_var.get())
         if not ffmpeg:
-            messagebox.showerror(APP_NAME, "FFmpeg.exe was not found. Choose it in Settings before testing a preset.")
+            self.show_notification("FFmpeg.exe was not found. Choose it in Settings before testing a preset.", "error")
             return
         source_value = filedialog.askopenfilename(
             title="Choose a video for the 15-second preset test",
@@ -2186,8 +2586,16 @@ class MesterSyncApp:
     def emit_log(self, text: str) -> None:
         self.gui_queue.put(("log", text))
 
-    def emit_task(self, task_id: str) -> None:
-        self.gui_queue.put(("task", task_id))
+    def emit_task(self, task_id: str, immediate: bool = True) -> None:
+        enqueue = False
+        with self.task_event_lock:
+            if task_id in self.pending_task_events:
+                self.pending_task_events[task_id] = self.pending_task_events[task_id] or bool(immediate)
+            else:
+                self.pending_task_events[task_id] = bool(immediate)
+                enqueue = True
+        if enqueue:
+            self.gui_queue.put(("task", task_id))
 
     def emit_status(self) -> None:
         self.gui_queue.put(("status", None))
@@ -2220,7 +2628,7 @@ class MesterSyncApp:
                 self.import_cycle_task_id = None
                 idle = True
             if idle:
-                label = "Import/watching: idle"
+                label = "Import/watching: watching Importfolder" if self.import_enabled else "Import/watching: stopped"
                 value = 0
                 eta = None
             else:
@@ -2247,16 +2655,20 @@ class MesterSyncApp:
         max_events = 80
         pending_task_renders: List[str] = []
         pending_task_render_seen: set[str] = set()
+        pending_task_render_immediate: set[str] = set()
+        pending_logs: List[str] = []
         pending_status_update = False
         pending_session_update = False
         pending_history_refresh = False
         pending_thumbnail_status: Optional[bool] = None
         pending_progress: Dict[str, Tuple[str, str, float, str]] = {}
 
-        def queue_task_render(task_id: str) -> None:
+        def queue_task_render(task_id: str, immediate: bool = False) -> None:
             if task_id not in pending_task_render_seen:
                 pending_task_render_seen.add(task_id)
                 pending_task_renders.append(task_id)
+            if immediate:
+                pending_task_render_immediate.add(task_id)
 
         while processed < max_events:
             try:
@@ -2266,9 +2678,15 @@ class MesterSyncApp:
             processed += 1
             try:
                 if event == "log":
-                    self.log(str(payload))
+                    pending_logs.append(str(payload))
                 elif event == "task":
-                    queue_task_render(str(payload))
+                    if isinstance(payload, tuple) and len(payload) == 2:
+                        queue_task_render(str(payload[0]), bool(payload[1]))
+                    else:
+                        task_id = str(payload)
+                        with self.task_event_lock:
+                            immediate = self.pending_task_events.pop(task_id, True)
+                        queue_task_render(task_id, immediate)
                 elif event == "status":
                     pending_status_update = True
                 elif event == "progress":
@@ -2277,14 +2695,20 @@ class MesterSyncApp:
                 elif event == "history":
                     pending_history_refresh = True
                 elif event == "thumbnail":
-                    queue_task_render(str(payload))
+                    queue_task_render(str(payload), True)
                     pending_thumbnail_status = False
+                elif event == "thumbnail_prefetched":
+                    target = str(payload)
+                    if target.startswith("history:"):
+                        self.apply_history_thumbnail(target)
+                    else:
+                        queue_task_render(target, True)
                 elif event == "thumbnail_status":
                     pending_thumbnail_status = bool(payload)
                 elif event == "session":
                     pending_session_update = True
                 elif event == "message_error":
-                    messagebox.showerror(APP_NAME, str(payload))
+                    self.show_notification(str(payload), "error")
                 elif event == "health_check_complete":
                     self.finish_health_check(dict(payload))
                 elif event == "encoder_cache_ready":
@@ -2322,6 +2746,11 @@ class MesterSyncApp:
                     self.log(f"GUI update warning: {exc}")
                 except Exception:
                     pass
+        if pending_logs:
+            try:
+                self.append_log_lines(pending_logs)
+            except Exception:
+                pass
         for stage, label, value, eta in pending_progress.values():
             try:
                 self.update_stage_card(stage, label, value, eta)
@@ -2330,9 +2759,23 @@ class MesterSyncApp:
                     self.log(f"Progress update warning: {exc}")
                 except Exception:
                     pass
+        now = time.monotonic()
+        for task_id in list(self.throttled_dashboard_task_ids):
+            if now - self.last_task_render_at.get(task_id, 0.0) >= TASK_RENDER_INTERVAL_SECONDS:
+                queue_task_render(task_id)
+                self.throttled_dashboard_task_ids.discard(task_id)
         for task_id in pending_task_renders:
             try:
-                self.render_task(task_id)
+                if getattr(self, "current_tab", "dashboard") == "dashboard":
+                    immediate = task_id in pending_task_render_immediate
+                    if immediate or now - self.last_task_render_at.get(task_id, 0.0) >= TASK_RENDER_INTERVAL_SECONDS:
+                        self.render_task(task_id)
+                        self.last_task_render_at[task_id] = time.monotonic()
+                        self.throttled_dashboard_task_ids.discard(task_id)
+                    else:
+                        self.throttled_dashboard_task_ids.add(task_id)
+                else:
+                    self.deferred_dashboard_task_ids.add(task_id)
             except Exception as exc:
                 try:
                     self.log(f"Dashboard row update warning: {exc}")
@@ -2364,13 +2807,14 @@ class MesterSyncApp:
                     pass
         if pending_history_refresh:
             try:
-                self.refresh_history_view()
+                self.request_history_view_refresh()
             except Exception as exc:
                 try:
                     self.log(f"History refresh warning: {exc}")
                 except Exception:
                     pass
-        self.root.after(25 if processed >= max_events else 100, self.process_gui_events)
+        busy = processed >= max_events or bool(self.throttled_dashboard_task_ids)
+        self.root.after(25 if busy else 100, self.process_gui_events)
 
     def schedule_pending_tasks_flush(self) -> None:
         if self.tasks_save_after_id is not None:
@@ -2394,21 +2838,24 @@ class MesterSyncApp:
 
     def tick(self) -> None:
         try:
+            self.refresh_skip_undo_rows()
             self.check_skip_countdowns()
             self.refresh_import_progress_cycle()
             self.refresh_session_summary_idle_timer()
             self.refresh_sleep_prevention()
             self.refresh_import_priority()
-            self.update_unsaved_settings_warning()
             # Safety net: a settings/tab focus change must not make a live task vanish
             # from the Dashboard. If a row widget is missing but the task still exists,
             # rebuild it without touching conversion/transfer state.
             with self.task_lock:
                 active_ids = [tid for tid, t in self.tasks.items() if t.stage in self.ACTIVE_STAGES or t.stage in {STAGE_WAITING, STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE, STAGE_STOPPED, STAGE_ERROR}]
             for task_id in active_ids:
-                if not self.row_widget_alive(task_id):
-                    self.row_widgets.pop(task_id, None)
-                    self.render_task(task_id)
+                if self.dashboard_task_should_render(task_id) and not self.row_widget_alive(task_id):
+                    if self.current_tab == "dashboard":
+                        self.row_widgets.pop(task_id, None)
+                        self.render_task(task_id)
+                    else:
+                        self.deferred_dashboard_task_ids.add(task_id)
         except Exception as exc:
             self.log(f"Background UI check warning: {exc}")
         finally:
@@ -2456,26 +2903,46 @@ class MesterSyncApp:
         self.set_sleep_prevention(enabled)
 
     def log(self, text: str) -> None:
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", f"[{now_text()}] {text}\n")
-        self.log_text.configure(state="disabled")
-        self.log_text.see("end")
+        self.append_log_lines([text])
+
+    def append_log_lines(self, messages: Iterable[str]) -> None:
+        rendered: List[str] = []
+        for message in messages:
+            parts = str(message).splitlines() or [""]
+            timestamp = now_text()
+            rendered.extend(f"[{timestamp}] {part}\n" for part in parts)
+        if not rendered:
+            return
+        previous_count = len(self.log_entries)
+        self.log_entries.extend(rendered)
+        self.log_line_count = len(self.log_entries)
+        widget = self.log_text
+        if widget is None:
+            return
+        try:
+            if not widget.winfo_exists():
+                self.log_text = None
+                return
+            trim, _count = bounded_log_count(previous_count, len(rendered), LOG_MAX_LINES)
+            widget.configure(state="normal")
+            widget.insert("end", "".join(rendered))
+            if trim:
+                widget.delete("1.0", f"{trim + 1}.0")
+            widget.configure(state="disabled")
+            widget.see("end")
+        except tk.TclError:
+            self.log_text = None
 
     def toggle_log(self) -> None:
         self.log_visible = not self.log_visible
         if self.log_visible:
-            self.log_outer.pack(fill="both", pady=(10, 0))
-            self.log_toggle.configure(text="Hide log")
+            self.top_log_outer.pack(side="left", fill="x", expand=True, padx=(10, 10), after=self.log_toggle)
+            self.log_toggle.configure(text="Log", bg=self.BLUE)
+            if self.log_text is not None:
+                self.log_text.see("end")
         else:
-            self.log_outer.pack_forget()
-            self.log_toggle.configure(text="Show log")
-
-    def resize_log(self, event: tk.Event) -> None:
-        try:
-            height = max(4, min(24, int((self.log_text.winfo_height() - event.y) / 18)))
-            self.log_text.configure(height=height)
-        except Exception:
-            pass
+            self.top_log_outer.pack_forget()
+            self.log_toggle.configure(text="Log", bg=self.CARD3)
 
     def draw_dot(self, canvas: tk.Canvas, color: str) -> None:
         canvas.delete("all")
@@ -2496,33 +2963,65 @@ class MesterSyncApp:
         else:
             text = "Stopped"
             color = self.RED
-        self.status_var.set(text)
         with self.task_lock:
             importing_now = self.importing_count > 0
-        self.activity_var.set("File importing..." if importing_now else ("Testing preset..." if preset_test_running else ""))
-        self.draw_dot(self.status_dot, color)
+        activity = "File importing..." if importing_now else ("Testing preset..." if preset_test_running else "")
         running_any = self.started and (self.import_enabled or self.conversion_enabled or self.transfer_enabled)
+        view = (
+            text,
+            color,
+            activity,
+            running_any,
+            self.pause_event.is_set(),
+            self.import_enabled,
+            self.conversion_enabled,
+            self.transfer_enabled,
+        )
+        if view == self.status_view_cache:
+            return
+        self.status_view_cache = view
+        self.status_var.set(text)
+        self.activity_var.set(activity)
+        self.draw_dot(self.status_dot, color)
         self.start_btn.configure(text="Stop all" if running_any else "Start all", bg=self.RED if running_any else self.GREEN)
         self.pause_btn.configure(text="Resume" if self.pause_event.is_set() else "Pause")
         self.update_stage_enabled_buttons()
 
     def update_stage_card(self, stage: str, label: str, value: int, eta: Optional[float] = None) -> None:
         card = self.stage_cards[stage]
-        card["label"].set(label)
-        card["progress"].set(max(0, min(100, int(value))))
-        card["percent"].set(f"{max(0, min(100, int(value)))}%")
-        if eta is not None:
-            card["eta"].set(f"ETA: {format_duration(eta)}")
+        progress = max(0, min(100, int(value)))
+        eta_text = f"ETA: {format_duration(eta)}" if eta is not None else "ETA: -"
+        view = (label, progress, eta_text)
+        previous = self.stage_card_view_cache.get(stage)
+        if previous != view:
+            if not previous or previous[0] != label:
+                card["label"].set(label)
+            if not previous or previous[1] != progress:
+                card["progress"].set(progress)
+                card["percent"].set(f"{progress}%")
+            if not previous or previous[2] != eta_text:
+                card["eta"].set(eta_text)
+            self.stage_card_view_cache[stage] = view
         if stage == "import":
             self.update_import_cancel_button()
 
     def update_stage_enabled_buttons(self) -> None:
+        active_backgrounds = {
+            "import": self.DARK_ORANGE,
+            "conversion": self.DARK_GREEN,
+            "transfer": self.DARK_PURPLE,
+        }
+        active_colors = {
+            "import": self.ORANGE,
+            "conversion": self.GREEN,
+            "transfer": self.PURPLE,
+        }
         for key in ["import", "conversion", "transfer"]:
             enabled = getattr(self, f"{key}_enabled")
             card = self.stage_cards[key]
             card["button"].configure(text="Stop" if enabled else "Start", bg=self.RED if enabled else self.GREEN)
-            self.draw_dot(card["dot"], self.GREEN if enabled else self.RED)
-            bg = self.PAUSE_BG if self.pause_event.is_set() else (self.DARK_GREEN if enabled else self.CARD)
+            self.draw_dot(card["dot"], active_colors[key] if enabled else self.RED)
+            bg = active_backgrounds[key] if enabled else self.INACTIVE_STAGE_BG
             card["card"].configure(bg=bg)
             for child in card["card"].winfo_children():
                 try:
@@ -2560,18 +3059,15 @@ class MesterSyncApp:
                 elif btn.winfo_ismapped():
                     btn.pack_forget()
             if priority_btn:
-                if available:
-                    if not priority_btn.winfo_ismapped():
-                        priority_btn.pack(side="right", padx=(0, 8))
-                    active = self.import_priority_enabled
-                    priority_btn.configure(
-                        text="Import priority on" if active else "Prioritize import",
-                        bg=self.YELLOW if active else self.CARD3,
-                        activebackground=self.YELLOW if active else self.CARD3,
-                        fg="white",
-                    )
-                elif priority_btn.winfo_ismapped():
-                    priority_btn.pack_forget()
+                if not priority_btn.winfo_ismapped():
+                    priority_btn.pack(side="right", padx=(0, 8))
+                active = self.import_priority_enabled
+                priority_btn.configure(
+                    text="Import priority on" if active else "Prioritize import",
+                    bg=self.YELLOW if active else self.CARD3,
+                    activebackground=self.YELLOW if active else self.CARD3,
+                    fg="white",
+                )
         except Exception as exc:
             self.emit_log(f"Import cancel button update warning: {exc}")
 
@@ -2579,6 +3075,8 @@ class MesterSyncApp:
         return bool(self.import_priority_enabled and self.import_cancel_available())
 
     def refresh_import_priority(self) -> None:
+        if not self.import_priority_enabled and not self.current_process_paused:
+            return
         if self.import_priority_blocks_conversion():
             self.suspend_current_process()
             return
@@ -2668,7 +3166,7 @@ class MesterSyncApp:
                 return ffmpeg
         except Exception as exc:
             self.log(f"FFmpeg validation warning: {exc}")
-        messagebox.showerror(APP_NAME, "FFmpeg.exe is missing. Choose FFmpeg in Settings or the setup wizard before converting.")
+        self.show_notification("FFmpeg.exe is missing. Choose FFmpeg in Settings or the setup wizard before converting.", "error")
         return None
 
     def create_convert_in_place_task(self, source: Path) -> Optional[str]:
@@ -2676,7 +3174,7 @@ class MesterSyncApp:
             return None
         folder_error = validate_writable_folder(source.parent, "Source folder")
         if folder_error:
-            messagebox.showerror(APP_NAME, f"Cannot convert in place:\n\n{folder_error}")
+            self.show_notification(f"Cannot convert in place:\n{folder_error}", "error")
             return None
         preset_name, ffmpeg_args = self.default_task_preset_snapshot()
         ext = detect_output_extension(ffmpeg_args)
@@ -2712,6 +3210,7 @@ class MesterSyncApp:
                 task = self.tasks.get(task_id)
                 if not task:
                     continue
+                planned_name = self.sync_task_rename_from_row(task_id)
                 if task_id == self.current_conversion_id or task.stage in {STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE, STAGE_TRANSFERRING}:
                     self.log(f"Already busy, not queued for in-place conversion: {task.display_name}")
                     continue
@@ -2727,7 +3226,7 @@ class MesterSyncApp:
                 self.update_task(
                     task_id,
                     local_input_path=source,
-                    rename_base=source.stem,
+                    rename_base=planned_name or source.stem,
                     output_ext=detect_output_extension(ffmpeg_args),
                     preset_name=preset_name,
                     ffmpeg_args=ffmpeg_args,
@@ -2771,7 +3270,7 @@ class MesterSyncApp:
             ]
             folder_errors = [error for error in folder_errors if error]
             if folder_errors:
-                messagebox.showerror(APP_NAME, "MesterSync cannot safely start with these folders:\n\n" + "\n".join(f"- {error}" for error in folder_errors))
+                self.show_notification("MesterSync cannot safely start with these folders:\n" + "\n".join(f"- {error}" for error in folder_errors), "error")
                 return
             ffmpeg_value = str(cfg.get("ffmpeg_path", "")).strip()
             ffmpeg = Path(ffmpeg_value) if ffmpeg_value else None
@@ -2785,7 +3284,7 @@ class MesterSyncApp:
                     return
             transfer_allowed = bool(str(cfg.get("nas_folder", "")).strip())
         except Exception as exc:
-            messagebox.showerror(APP_NAME, f"Could not start safely:\n{exc}\n\nCheck that the configured folders are not protected Windows/system folders and that you have write access.")
+            self.show_notification(f"Could not start safely: {exc}\nCheck that the configured folders are writable and not protected system folders.", "error")
             return
         self.ensure_workers_running()
         self.import_cancel_requested.clear()
@@ -2847,7 +3346,7 @@ class MesterSyncApp:
     def toggle_stage(self, key: str) -> None:
         current = getattr(self, f"{key}_enabled")
         if key == "transfer" and not current and not str(self.get_config().get("nas_folder", "")).strip():
-            messagebox.showwarning(APP_NAME, "Choose a NAS folder in Settings before enabling Transfer.")
+            self.show_notification("Choose a NAS folder in Settings before enabling Transfer.", "warning")
             return
         setattr(self, f"{key}_enabled", not current)
         if not current:
@@ -2977,13 +3476,13 @@ class MesterSyncApp:
             self.root.after_cancel(self.config_save_after_id)
             self.config_save_after_id = None
         if not self.flush_config_autosave():
-            messagebox.showerror(APP_NAME, "Settings could not be saved, so MesterSync will stay open. Check the data folder and try again.")
+            self.show_notification("Settings could not be saved, so MesterSync will stay open. Check the data folder and try again.", "error")
             return
         try:
             self.save_pending_tasks(force=True)
             self.save_history(force=True)
         except Exception as exc:
-            messagebox.showerror(APP_NAME, f"Work state could not be saved, so MesterSync will stay open.\n\n{exc}")
+            self.show_notification(f"Work state could not be saved, so MesterSync will stay open.\n{exc}", "error")
             return
         self.set_sleep_prevention(False)
         self.shutdown_event.set()
@@ -3006,7 +3505,7 @@ class MesterSyncApp:
 
     def wait_if_paused(self) -> None:
         while self.pause_event.is_set() and not self.shutdown_event.is_set():
-            time.sleep(0.2)
+            self.shutdown_event.wait(0.2)
 
     def suspend_current_process(self) -> None:
         if os.name != "nt":
@@ -3275,7 +3774,7 @@ class MesterSyncApp:
             should_save = old_stage != task.stage or any(key not in {"progress", "eta_seconds", "detail"} for key in changed_keys)
         if should_save:
             self.save_pending_tasks()
-        self.emit_task(task_id)
+        self.emit_task(task_id, immediate=should_save)
 
     def task_progress_style(self, task: TaskState) -> str:
         if task.stage == STAGE_ERROR:
@@ -3293,17 +3792,19 @@ class MesterSyncApp:
         if not holder:
             return
         try:
-            holder.configure(bg=bg)
             key = (task.preset_name, tuple(task.ffmpeg_args or self.get_config().get("ffmpeg_args", DEFAULT_FFMPEG_ARGS)))
+            if row.get("preset_badges_key") == key and row.get("preset_badges_bg") == bg:
+                return
+            holder.configure(bg=bg)
             if row.get("preset_badges_key") == key:
-                for child in holder.winfo_children():
-                    child.configure(bg=child.cget("bg"))
+                row["preset_badges_bg"] = bg
                 return
             for child in holder.winfo_children():
                 child.destroy()
             for text, color in preset_badges(task.preset_name, task.ffmpeg_args or self.get_config().get("ffmpeg_args", DEFAULT_FFMPEG_ARGS)):
                 tk.Label(holder, text=text, bg=color, fg="white", font=("Segoe UI", 8, "bold"), padx=7, pady=2).pack(side="left", padx=(0, 5), pady=(0, 2))
             row["preset_badges_key"] = key
+            row["preset_badges_bg"] = bg
         except Exception:
             pass
 
@@ -3319,70 +3820,118 @@ class MesterSyncApp:
             task = self.tasks.get(task_id)
             if not task:
                 return
+            try:
+                priority = self.dashboard_virtual_range[0] + self.dashboard_virtual_order.index(task_id) + 1
+            except ValueError:
+                priority = next((index for index, current_id in enumerate(self.tasks, 1) if current_id == task_id), 1)
+            view = TaskViewSnapshot.from_task(task, priority, task_id in self.selected_ids)
+        if not self.dashboard_task_should_render(task_id):
+            row = self.row_widgets.pop(task_id, None)
+            if row:
+                try:
+                    row["outer"].destroy()
+                except Exception:
+                    pass
+            self.schedule_dashboard_virtual_refresh()
+            return
         if task_id in self.row_widgets and not self.row_widget_alive(task_id):
             self.row_widgets.pop(task_id, None)
         if task_id not in self.row_widgets:
             self.create_task_row(task)
             return
         row = self.row_widgets[task_id]
-        selected = task_id in self.selected_ids
-        is_error = task.stage == STAGE_ERROR
-        active_green = task.stage == STAGE_CONVERTING
-        skipped_bg = "#221b1e" if task.skipped else None
+        cache = row["render_cache"]
+        selected = view.selected
+        is_error = view.stage == STAGE_ERROR
+        active_green = view.stage == STAGE_CONVERTING
+        skipped_bg = "#221b1e" if view.skipped else None
         error_bg = "#3a1018" if is_error else None
         card_bg = error_bg or (self.DARK_GREEN if active_green else (skipped_bg or self.CARD))
         border = "#ffffff" if selected else self.BORDER
-        row["outer"].configure(bg=border)
-        row["card"].configure(bg=card_bg)
-        for widget_key in ["right", "top", "safe_name", "preset_badges", "times", "detail", "src", "ext", "buttons", "preset_holder"]:
-            try:
-                row[widget_key].configure(bg=card_bg)
-            except Exception:
-                pass
-        row["src"].configure(text=f"{task.display_name}  ->  ")
-        if not row.get("dirty"):
-            row["rename_var"].set(task.rename_base)
-        row["ext"].configure(text=task.output_ext)
-        order = self.ordered_task_ids()
-        priority = order.index(task_id) + 1 if task_id in order else 1
-        row["stage"].configure(text=f"#{priority}  {task.stage}")
-        self.update_preset_badges(row, task, card_bg)
-        row["progress_var"].set(task.progress)
-        row["progress_text"].configure(text=f"{task.progress}%", bg=card_bg)
-        row["progressbar"].configure(style=self.task_progress_style(task))
-        preset_locked = self.task_preset_locked(task)
-        if "preset_holder" in row:
+        if cache.get("border") != border:
+            row["outer"].configure(bg=border)
+            cache["border"] = border
+        if cache.get("card_bg") != card_bg:
+            row["card"].configure(bg=card_bg)
+            for widget_key in ["right", "top", "safe_name", "preset_badges", "times", "detail", "src", "ext", "buttons", "preset_holder"]:
+                try:
+                    row[widget_key].configure(bg=card_bg)
+                except Exception:
+                    pass
+            cache["card_bg"] = card_bg
+        source_text = f"{view.display_name}  ->  "
+        if cache.get("source_text") != source_text:
+            row["src"].configure(text=source_text)
+            cache["source_text"] = source_text
+        if not row.get("dirty") and cache.get("rename_base") != view.rename_base:
+            row["rename_var"].set(view.rename_base)
+            cache["rename_base"] = view.rename_base
+        if cache.get("output_ext") != view.output_ext:
+            row["ext"].configure(text=view.output_ext)
+            cache["output_ext"] = view.output_ext
+        stage_text = f"#{view.priority}  {view.stage}"
+        if cache.get("stage_text") != stage_text:
+            row["stage"].configure(text=stage_text)
+            cache["stage_text"] = stage_text
+        self.update_preset_badges(row, view, card_bg)
+        if cache.get("progress") != view.progress:
+            row["progress_var"].set(view.progress)
+            row["progress_text"].configure(text=f"{view.progress}%", bg=card_bg)
+            cache["progress"] = view.progress
+        progress_style = self.task_progress_style(view)
+        if cache.get("progress_style") != progress_style:
+            row["progressbar"].configure(style=progress_style)
+            cache["progress_style"] = progress_style
+        preset_locked = self.task_preset_locked(view)
+        if "preset_holder" in row and cache.get("preset_locked") != preset_locked:
             if preset_locked:
                 if row["preset_holder"].winfo_ismapped():
                     row["preset_holder"].pack_forget()
             else:
                 if not row["preset_holder"].winfo_ismapped():
                     row["preset_holder"].pack(side="right")
+            cache["preset_locked"] = preset_locked
         if "preset_var" in row and not preset_locked and not row.get("preset_dirty"):
-            row["preset_combo"].configure(values=self.preset_menu_values())
-            row["preset_var"].set(task.preset_name)
+            preset_values = tuple(self.preset_menu_values())
+            if row.get("preset_values_key") != preset_values:
+                row["preset_combo"].configure(values=preset_values)
+                row["preset_values_key"] = preset_values
+            if cache.get("preset_name") != view.preset_name:
+                row["preset_var"].set(view.preset_name)
+                cache["preset_name"] = view.preset_name
         if not self.compact_dashboard:
             try:
-                safe_key = (task.rename_base, task.output_ext)
+                safe_key = (view.rename_base, view.output_ext)
                 if row.get("safe_name_key") != safe_key or time.time() - float(row.get("safe_name_checked", 0)) > 5:
-                    row["safe_name"].configure(text=f"Safe final name now: {self.safe_final_name_now(task)}", bg=card_bg)
+                    row["safe_name"].configure(text=f"Safe final name now: {self.safe_final_name_now(view)}", bg=card_bg)
                     row["safe_name_key"] = safe_key
                     row["safe_name_checked"] = time.time()
                 else:
                     row["safe_name"].configure(bg=card_bg)
             except Exception:
                 pass
-        row["times"].configure(text=f"Imported: {pretty_time(task.imported_at)}    Converted: {pretty_time(task.converted_at)}    Transferred: {pretty_time(task.transferred_at)}    ETA: {format_duration(task.eta_seconds)}")
+        times_key = (view.imported_at, view.converted_at, view.transferred_at, int(view.eta_seconds or 0))
+        if cache.get("times_key") != times_key:
+            row["times"].configure(text=f"Imported: {pretty_time(view.imported_at)}    Converted: {pretty_time(view.converted_at)}    Transferred: {pretty_time(view.transferred_at)}    ETA: {format_duration(view.eta_seconds)}")
+            cache["times_key"] = times_key
         if is_error:
-            row["detail"].configure(text=f"ERROR: {task.detail}", fg="#ffffff", font=("Segoe UI", 12, "bold"))
+            detail_view = (f"ERROR: {view.detail}", "#ffffff", ("Segoe UI", 12, "bold"))
+        elif view.skipped:
+            detail_view = (skip_undo_detail(view.skip_archive_due), "#ffd0d8", ("Segoe UI", 10, "bold"))
         else:
-            row["detail"].configure(text=task.detail, fg=self.MUTED, font=("Segoe UI", 9))
+            detail_view = (view.detail, self.MUTED, ("Segoe UI", 9))
+        if cache.get("detail_view") != detail_view:
+            row["detail"].configure(text=detail_view[0], fg=detail_view[1], font=detail_view[2])
+            cache["detail_view"] = detail_view
         self.update_task_buttons(task_id)
-        self.apply_thumbnail(task_id)
+        thumbnail_key = (view.thumbnail_path, view.thumbnail_preview_paths, view.local_input_path, view.output_path)
+        if cache.get("thumbnail_key") != thumbnail_key or not row.get("displayed_thumb_path"):
+            self.apply_thumbnail(task_id)
+            cache["thumbnail_key"] = thumbnail_key
 
     def create_task_row(self, task: TaskState) -> None:
         outer = tk.Frame(self.dashboard_inner, bg=self.BORDER)
-        outer.pack(fill="x", pady=7)
+        outer.pack(fill="x", pady=7, before=self.dashboard_bottom_spacer)
         card = tk.Frame(outer, bg=self.CARD, padx=12, pady=12)
         card.pack(fill="x", padx=2, pady=2)
         thumb_frame = tk.Frame(card, bg=self.CARD3, width=222, height=125, highlightthickness=2, highlightbackground=self.BORDER)
@@ -3446,6 +3995,8 @@ class MesterSyncApp:
             "buttons": buttons, "skip_btn": skip_btn, "resume_btn": resume_btn, "remove_btn": remove_btn, "top_btn": top_btn, "up_btn": up_btn, "down_btn": down_btn, "import_anyway_btn": import_anyway_btn, "retry_btn": retry_btn, "restart_btn": restart_btn, "copy_error_btn": copy_error_btn,
             "preset_holder": preset_holder, "preset_var": preset_var, "preset_combo": preset_combo, "preset_dirty": False,
             "dirty": False, "preview_index": None, "displayed_thumb_path": None, "safe_name_key": None, "safe_name_checked": 0.0,
+            "button_layout": None, "preset_values_key": None,
+            "render_cache": {},
         }
         row_drop_widgets = [outer, card, thumb_frame, thumb, right, top, src, ext, safe_name, preset_badges_frame, times, detail, pwrap, ptxt, buttons, stage]
         for w in row_drop_widgets:
@@ -3472,7 +4023,17 @@ class MesterSyncApp:
         task = self.tasks.get(task_id)
         if not row or not task:
             return
-        # Hide all optional buttons first.
+        waiting = task_id not in {self.current_import_id, self.current_conversion_id, self.current_transfer_id} and (
+            task_id in self.queued_import_ids or task_id in self.queued_conversion_ids or task_id in self.queued_transfer_ids
+        )
+        layout = (task.skipped, task.stage, waiting)
+        if task.skipped:
+            row["resume_btn"].configure(text=skip_undo_button_text(task.skip_archive_due))
+        if row.get("button_layout") == layout:
+            return
+        row["button_layout"] = layout
+        # Rearranging packed buttons on every FFmpeg progress event causes
+        # needless geometry recalculation. Only do it when visibility changes.
         for key in ["resume_btn", "remove_btn", "top_btn", "up_btn", "down_btn", "import_anyway_btn", "retry_btn", "restart_btn", "copy_error_btn"]:
             row[key].pack_forget()
         if task.skipped:
@@ -3490,9 +4051,6 @@ class MesterSyncApp:
                 row["remove_btn"].pack(side="left", padx=(0, 6))
             if task.stage == STAGE_STOPPED:
                 row["restart_btn"].pack(side="left", padx=(0, 6))
-            waiting = task_id not in {self.current_import_id, self.current_conversion_id, self.current_transfer_id} and (
-                task_id in self.queued_import_ids or task_id in self.queued_conversion_ids or task_id in self.queued_transfer_ids
-            )
             if waiting:
                 row["up_btn"].pack(side="left", padx=(0, 6))
                 row["down_btn"].pack(side="left", padx=(0, 6))
@@ -3661,8 +4219,18 @@ class MesterSyncApp:
         row = self.row_widgets.get(task_id)
         canvas = getattr(self, "dashboard_canvas", None)
         inner = getattr(self, "dashboard_inner", None)
-        if not row or not canvas or not inner:
+        if not canvas or not inner:
             return
+        if not row:
+            order = self.ordered_task_ids()
+            if task_id not in order:
+                return
+            total_height = max(1, len(order) * self.dashboard_row_extent())
+            canvas.yview_moveto(max(0.0, min(1.0, order.index(task_id) * self.dashboard_row_extent() / total_height)))
+            self.refresh_dashboard_virtual_rows(force=True)
+            row = self.row_widgets.get(task_id)
+            if not row:
+                return
         try:
             self.root.update_idletasks()
             widget = row["outer"]
@@ -3789,6 +4357,20 @@ class MesterSyncApp:
         row["dirty"] = False
         self.root.focus_set()
 
+    def sync_task_rename_from_row(self, task_id: str) -> str:
+        """Persist text still being edited before a toolbar action uses it."""
+        task = self.tasks.get(task_id)
+        if not task:
+            return ""
+        row = self.row_widgets.get(task_id)
+        if not row or not row.get("dirty"):
+            return task.rename_base
+        auto = bool(self.auto_underscore_var.get()) if hasattr(self, "auto_underscore_var") else bool(self.get_config().get("auto_underscore_renames", False))
+        base = sanitize_base_name(row["rename_var"].get() or Path(task.display_name).stem, auto)
+        self.update_task(task_id, rename_base=base)
+        row["dirty"] = False
+        return base
+
     def commit_rename_and_exit(self, task_id: str) -> str:
         self.commit_rename(task_id)
         self.root.focus_set()
@@ -3833,21 +4415,21 @@ class MesterSyncApp:
                 open_path(candidate)
                 self.log(f"Opened video: {candidate.name}")
             except Exception as exc:
-                messagebox.showerror(APP_NAME, f"Could not open file:\n{candidate}\n\n{exc}")
+                self.show_notification(f"Could not open file: {candidate}\n{exc}", "error")
             return "break"
-        messagebox.showwarning(APP_NAME, f"No existing file was found for:\n{task.display_name}")
+        self.show_notification(f"No existing file was found for: {task.display_name}", "warning")
         return "break"
 
     def open_path_with_feedback(self, path_value: Any, description: str = "item") -> None:
         path = Path(str(path_value or ""))
         if not str(path_value or "").strip() or not path.exists():
-            messagebox.showwarning(APP_NAME, f"The {description} is no longer available at:\n{path}")
+            self.show_notification(f"The {description} is no longer available at: {path}", "warning")
             return
         try:
             open_path(path)
         except Exception as exc:
             self.log(f"Could not open {description} {path}: {exc}")
-            messagebox.showerror(APP_NAME, f"Could not open {description}:\n{path}\n\n{exc}")
+            self.show_notification(f"Could not open {description}: {path}\n{exc}", "error")
 
     def candidate_media_bases(self) -> List[Path]:
         bases = [app_dir()]
@@ -3904,7 +4486,18 @@ class MesterSyncApp:
         task = self.tasks.get(task_id)
         if not row or not task:
             return
+        if (
+            task.thumbnail_path
+            and row.get("displayed_thumb_path") == task.thumbnail_path
+            and (len(task.thumbnail_preview_paths or []) >= 2 or task_id in self.thumbnail_generation_requested)
+        ):
+            return
         if task.thumbnail_path and Path(task.thumbnail_path).exists():
+            if not self.thumbnail_images.has_source(task.thumbnail_path):
+                self.request_thumbnail_display(task_id, task.thumbnail_path)
+                row["thumb"].configure(image="", text="Loading preview...")
+                row["thumb"].image = None
+                return
             self.set_thumb_image(task_id, task.thumbnail_path)
             existing_previews = [p for p in (task.thumbnail_preview_paths or []) if Path(p).exists()]
             if len(existing_previews) >= 2 or task_id in self.thumbnail_generation_requested:
@@ -3972,6 +4565,57 @@ class MesterSyncApp:
             self.set_thumb_image(task_id, task.thumbnail_path)
 
     # ---------------- thumbnails ----------------
+    def request_thumbnail_display(self, task_id: str, path: str) -> None:
+        if self.thumbnail_images.has_source(path) or path in self.thumbnail_display_requested:
+            return
+        self.thumbnail_display_requested.add(path)
+        self.thumbnail_display_queue.put((task_id, path))
+        self.ensure_thumbnail_display_worker_running()
+
+    def request_history_thumbnail_display(self, token: str, path: str) -> None:
+        if self.thumbnail_images.has_source(path):
+            self.apply_history_thumbnail(token)
+            return
+        # History cards are short-lived. Queue their token independently so the
+        # correct live label is notified even when the same source is already
+        # being prepared for a Dashboard row.
+        self.thumbnail_display_queue.put((token, path))
+        self.ensure_thumbnail_display_worker_running()
+
+    def apply_history_thumbnail(self, token: str) -> None:
+        target = self.history_thumbnail_labels.pop(token, None)
+        if not target:
+            return
+        label, path = target
+        try:
+            if label.winfo_exists():
+                self.thumbnail_images.configure_label(label, path)
+        except tk.TclError:
+            pass
+
+    def ensure_thumbnail_display_worker_running(self) -> None:
+        if self.thumbnail_display_worker_started:
+            return
+        self.thumbnail_display_worker_started = True
+        threading.Thread(target=self.thumbnail_display_worker, daemon=True, name="ThumbnailDisplayPrep").start()
+
+    def thumbnail_display_worker(self) -> None:
+        while not self.shutdown_event.is_set():
+            try:
+                task_id, path = self.thumbnail_display_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                if not self.thumbnail_images.has_source(path):
+                    data = Path(path).read_bytes()
+                    self.thumbnail_images.put_source_bytes(path, data)
+                self.gui_queue.put(("thumbnail_prefetched", task_id))
+            except OSError as exc:
+                self.emit_log(f"Preview display preparation warning for {Path(path).name}: {exc}")
+            finally:
+                self.thumbnail_display_requested.discard(path)
+                self.thumbnail_display_queue.task_done()
+
     def generate_thumbnail_async(self, task_id: str, src: Path) -> None:
         if task_id in self.thumbnail_generation_requested:
             return
@@ -3994,9 +4638,10 @@ class MesterSyncApp:
                 continue
             try:
                 while not self.shutdown_event.is_set() and self.pause_event.is_set():
-                    time.sleep(0.75)
-                while not self.shutdown_event.is_set() and time.time() - queued_at < 8:
-                    time.sleep(0.5)
+                    self.shutdown_event.wait(0.2)
+                remaining = THUMBNAIL_SETTLE_DELAY_SECONDS - (time.time() - queued_at)
+                if remaining > 0:
+                    self.shutdown_event.wait(remaining)
                 if self.shutdown_event.is_set():
                     continue
                 self.gui_queue.put(("thumbnail_status", True))
@@ -4469,37 +5114,49 @@ class MesterSyncApp:
 
     def manual_scan(self) -> None:
         threading.Thread(target=self.scan_existing_input_as_detected, daemon=True).start()
-        self.log("Scan now started. Existing files are shown but not auto-converted.")
+        self.log("Scan now started. New videos in Importfolder will be queued when Conversion is on.")
 
-    def scan_existing_input_as_detected(self) -> None:
-        cfg = self.get_config()
-        folder_error = validate_writable_folder(str(cfg.get("input_folder", "")), "Importfolder")
-        if folder_error:
-            self.emit_log(f"Scan stopped: {folder_error}")
-            self.emit_error_message(f"Choose a valid Importfolder in Settings first.\n\n{folder_error}")
-            return
-        input_folder = Path(cfg["input_folder"])
-        exts = cfg.get("conversion_extensions", COMMON_VIDEO_EXTENSIONS)
+    def scan_existing_input_as_detected(self) -> int:
+        if not self.watchfolder_scan_lock.acquire(blocking=False):
+            return 0
         count = 0
-        for path in scan_watchfolder_candidates(input_folder, exts):
-            if path_key(path) in self.skipped_path_keys:
-                continue
-            with self.task_lock:
-                if path_key(path) in self.task_by_path:
+        queued_ids: List[str] = []
+        try:
+            cfg = self.get_config()
+            input_value = str(cfg.get("input_folder", "")).strip()
+            input_folder = Path(input_value) if input_value else None
+            if not input_folder or not input_folder.is_dir():
+                self.emit_log("Importfolder watch is waiting for a valid folder in Settings.")
+                return 0
+            exts = cfg.get("conversion_extensions", COMMON_VIDEO_EXTENSIONS)
+            for path in scan_watchfolder_candidates(input_folder, exts):
+                key = path_key(path)
+                if key in self.skipped_path_keys:
                     continue
-            task_id = self.create_task(path, stage=STAGE_DETECTED, imported=True)
-            self.update_task(task_id, detail="Detected in importfolder. Not auto-converted.")
-            count += 1
-        self.emit_log(f"Scan found {count} new file(s) in importfolder.")
+                with self.task_lock:
+                    if key in self.task_by_path:
+                        continue
+                task_id = self.create_task(path, stage=STAGE_IMPORTED, imported=True)
+                self.update_task(task_id, progress=100, detail="Detected in Importfolder; waiting for conversion")
+                queued_ids.append(task_id)
+                count += 1
+            if queued_ids:
+                self.queue_imported_batch_for_conversion(queued_ids)
+                action = "queued for conversion" if self.conversion_enabled else "ready when Conversion is started"
+                self.emit_log(f"Importfolder watch found {count} new video(s); {action}.")
+            return count
+        finally:
+            self.watchfolder_scan_lock.release()
 
     def drive_monitor_loop(self) -> None:
         while not self.shutdown_event.is_set():
             self.wait_if_paused()
             if not self.import_enabled:
-                time.sleep(0.5)
+                self.shutdown_event.wait(0.5)
                 continue
             cfg = self.get_config()
             try:
+                self.scan_existing_input_as_detected()
                 drives = list_candidate_drives(cfg.get("ignored_drives", []))
                 current_ids = {d for _, d in drives}
                 self.processed_drive_ids.intersection_update(current_ids)
@@ -4510,7 +5167,7 @@ class MesterSyncApp:
                     self.import_drive(Path(root))
             except Exception as exc:
                 self.emit_log(f"Drive monitor error: {exc}")
-            time.sleep(max(1, int(cfg.get("scan_interval_seconds", 3))))
+            self.shutdown_event.wait(max(1, int(cfg.get("scan_interval_seconds", 3))))
 
     def import_drive(self, root: Path) -> None:
         self.import_cancel_requested.clear()
@@ -4609,14 +5266,9 @@ class MesterSyncApp:
             self.transfer_queue.clear()
             self.transfer_queue.extend(reordered)
             self.transfer_condition.notify_all()
-        for tid in order:
-            row = self.row_widgets.get(tid)
-            if row:
-                row["outer"].pack_forget()
-                row["outer"].pack(fill="x", pady=7)
-                task = self.tasks.get(tid)
-                if task:
-                    row["stage"].configure(text=f"#{rank[tid] + 1}  {task.stage}")
+        for row in self.row_widgets.values():
+            row.get("render_cache", {}).pop("stage_text", None)
+        self.refresh_dashboard_virtual_rows(force=True)
         self.save_pending_tasks()
         self.log(f"Priority updated: {self.tasks[task_id].display_name} is #{target_index + 1}.")
 
@@ -4823,6 +5475,17 @@ class MesterSyncApp:
                     self.record_session_saved_bytes(saved)
                 else:
                     space_savings = f"Converted size: {format_size(output_size)}"
+                if not self.ensure_task_source_fingerprint(task_id, source):
+                    self.update_task(
+                        task_id,
+                        stage=STAGE_ERROR,
+                        detail="Conversion finished, but the source fingerprint could not be saved. Output and source were both kept.",
+                        progress=100,
+                        output_path=output_path,
+                        output_size=output_size,
+                    )
+                    self.emit_log(f"Source fingerprint failed; kept both source and converted output: {source}")
+                    return
                 self.record_session_stat("converted")
                 self.update_task(task_id, stage=STAGE_CONVERTED, converted_at=now_iso(), progress=100, detail=space_savings, output_path=output_path, output_size=output_size, imported_size=source_size, space_savings=space_savings, eta_seconds=0)
                 self.emit_log(f"Conversion complete: {output_path.name} | {space_savings}")
@@ -5139,22 +5802,21 @@ class MesterSyncApp:
             task = self.tasks.get(task_id)
             if not task:
                 return
-            remove_without_archive = (
-                not task.copy_thread_active
-                and not task.local_input_path
-                and not task.output_path
-                and not task.nas_path
-                and not task.imported_at
-            )
             task.skipped = True
             task.stage = STAGE_SKIPPED
-            task.detail = "Skipped. Resume within 60 seconds or it will move to history."
-            task.skip_archive_due = time.time() + 60
+            task.skip_archive_due = new_skip_deadline()
+            task.detail = skip_undo_detail(task.skip_archive_due)
             task.import_stop_event.set()
             task.transfer_stop_event.set()
             for p in [task.original_path, task.local_input_path, task.output_path]:
                 if p:
                     self.skipped_path_keys.add(path_key(p))
+        # Skip is a UI action, so redraw the row synchronously before doing any
+        # queue/process cleanup. This also avoids relying on update_task after
+        # the values above have already been assigned.
+        if task_id in getattr(self, "row_widgets", {}):
+            self.render_task(task_id)
+        self.emit_task(task_id)
         with self.queue_condition:
             try:
                 self.conversion_queue.remove(task_id)
@@ -5177,13 +5839,7 @@ class MesterSyncApp:
                     proc.terminate()
                 except Exception:
                     pass
-        if remove_without_archive:
-            display_name = task.display_name
-            self.remove_task(task_id)
-            self.log(f"Skipped before import, removed from list: {display_name}")
-            return
-        self.update_task(task_id, skipped=True, stage=STAGE_SKIPPED, detail="Skipped. Resume within 60 seconds or it will move to history.")
-        self.log(f"Skipped: {self.tasks[task_id].display_name}")
+        self.log(f"Skipped: {task.display_name}")
 
     def resume_task(self, task_id: str) -> None:
         with self.task_lock:
@@ -5249,7 +5905,7 @@ class MesterSyncApp:
             if not task.copy_thread_active:
                 break
             self.update_task(task_id, stage=STAGE_IMPORTING, detail="Waiting for skipped import to stop before resuming...", progress=0)
-            time.sleep(0.1)
+            self.shutdown_event.wait(0.1)
         task = self.tasks.get(task_id)
         if not task or task.skipped:
             return
@@ -5307,14 +5963,25 @@ class MesterSyncApp:
         if task:
             self.cleanup_task_thumbnails(task)
         row = self.row_widgets.pop(task_id, None)
+        self.last_task_render_at.pop(task_id, None)
+        self.throttled_dashboard_task_ids.discard(task_id)
+        self.deferred_dashboard_task_ids.discard(task_id)
+        with self.task_event_lock:
+            self.pending_task_events.pop(task_id, None)
         if row:
             row["outer"].destroy()
         if task_id in self.selected_ids:
             self.selected_ids.remove(task_id)
         self.update_batch_box_visibility()
+        self.schedule_dashboard_virtual_refresh()
 
     def remove_archived_task_ui(self, task_id: str) -> None:
         row = self.row_widgets.pop(task_id, None)
+        self.last_task_render_at.pop(task_id, None)
+        self.throttled_dashboard_task_ids.discard(task_id)
+        self.deferred_dashboard_task_ids.discard(task_id)
+        with self.task_event_lock:
+            self.pending_task_events.pop(task_id, None)
         if row:
             try:
                 row["outer"].destroy()
@@ -5323,16 +5990,37 @@ class MesterSyncApp:
         if task_id in self.selected_ids:
             self.selected_ids.remove(task_id)
         self.update_batch_box_visibility()
+        self.schedule_dashboard_virtual_refresh()
 
     def check_skip_countdowns(self) -> None:
         now = time.time()
         due: List[str] = []
         with self.task_lock:
             for tid, task in self.tasks.items():
-                if task.skipped and task.skip_archive_due and task.skip_archive_due <= now:
+                if task.skipped and skip_is_due(task.skip_archive_due, now):
                     due.append(tid)
         for tid in due:
             self.archive_task(tid, status="skipped")
+
+    def refresh_skip_undo_rows(self) -> None:
+        if getattr(self, "current_tab", "dashboard") != "dashboard":
+            return
+        now = time.time()
+        with self.task_lock:
+            skipped = [
+                (tid, task.skip_archive_due)
+                for tid, task in self.tasks.items()
+                if task.skipped and task.skip_archive_due
+            ]
+        for task_id, deadline in skipped:
+            row = self.row_widgets.get(task_id)
+            if not row or not self.row_widget_alive(task_id):
+                continue
+            try:
+                row["resume_btn"].configure(text=skip_undo_button_text(deadline, now))
+                row["detail"].configure(text=skip_undo_detail(deadline, now), fg="#ffd0d8", font=("Segoe UI", 10, "bold"))
+            except tk.TclError:
+                continue
 
     def archive_task(self, task_id: str, status: str) -> None:
         with self.task_lock:
@@ -5385,6 +6073,8 @@ class MesterSyncApp:
             "thumbnail_path": task.thumbnail_path,
             "thumbnail_preview_paths": task.thumbnail_preview_paths,
             "original_checksum": task.original_checksum,
+            "input_path": str(task.local_input_path) if status == "skipped" and task.local_input_path else "",
+            "input_folder": str(self.get_config().get("input_folder", "")) if status == "skipped" and task.local_input_path else "",
         }
         try:
             self.save_pending_tasks(force=True)
@@ -5417,7 +6107,32 @@ class MesterSyncApp:
         self.gui_queue.put(("history", None))
 
     # ---------------- history UI ----------------
+    def request_history_view_refresh(self, reset_limit: bool = True) -> None:
+        self.history_view_dirty = True
+        if reset_limit:
+            self.history_display_limit = HISTORY_PAGE_SIZE
+        if getattr(self, "current_tab", "") == "history":
+            self.refresh_history_view()
+
+    def show_more_history(self) -> None:
+        self.history_display_limit += HISTORY_PAGE_SIZE
+        self.refresh_history_view()
+
+    def cancel_history_render(self, mark_dirty: bool = False) -> None:
+        self.history_render_generation += 1
+        self.history_thumbnail_labels.clear()
+        if self.history_render_after_id is not None:
+            try:
+                self.root.after_cancel(self.history_render_after_id)
+            except Exception:
+                pass
+            self.history_render_after_id = None
+        if mark_dirty:
+            self.history_view_dirty = True
+
     def refresh_history_view(self) -> None:
+        self.cancel_history_render()
+        self.history_view_dirty = False
         for widget in self.history_widgets:
             try:
                 widget.destroy()
@@ -5426,65 +6141,134 @@ class MesterSyncApp:
         self.history_widgets.clear()
         with self.history_lock:
             records = list(self.history_records)
+        self.update_total_converted_label()
         if not records:
             label = tk.Label(self.history_inner, text="No history yet.", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 11))
             label.pack(anchor="w", pady=16)
             self.history_widgets.append(label)
-            self.update_total_converted_label()
             return
-        for idx, rec in enumerate(records):
-            status = rec.get("status", "")
-            if status == "transferred":
-                bg = self.DARK_GREEN
-                headline = "Transferred to NAS"
-            elif status == "converted_only":
-                bg = self.HISTORY_YELLOW
-                headline = "Converted to output folder; not transferred"
-            elif status == "converted_in_place":
-                bg = self.HISTORY_YELLOW
-                headline = "Converted in place"
-            elif status == "skipped":
-                bg = self.CARD
-                headline = "Skipped"
-            else:
-                bg = self.CARD
-                headline = rec.get("detail", "")
-            outer = tk.Frame(self.history_inner, bg=self.BORDER)
-            outer.pack(fill="x", pady=7)
-            card = tk.Frame(outer, bg=bg, padx=12, pady=12)
-            card.pack(fill="x", padx=2, pady=2)
-            left = tk.Frame(card, bg=bg)
-            left.pack(side="left")
-            thumb_frame = tk.Frame(left, bg=self.CARD3, width=222, height=125, highlightthickness=2, highlightbackground=self.BORDER)
-            thumb_frame.pack()
-            thumb_frame.pack_propagate(False)
-            thumb = tk.Label(thumb_frame, text="Preview", bg=self.CARD3, fg=self.MUTED, width=222, height=125)
-            thumb.pack(fill="both", expand=True)
-            tpath = rec.get("thumbnail_path")
-            if tpath and Path(tpath).exists():
-                self.thumbnail_images.configure_label(thumb, tpath)
-            right = tk.Frame(card, bg=bg)
-            right.pack(side="left", fill="both", expand=True, padx=(14, 0))
-            title = tk.Label(right, text=f"{rec.get('display_name', '')}  ->  {rec.get('final_name', '')}", bg=bg, fg=self.TEXT, font=("Segoe UI", 12, "bold"), anchor="w")
-            title.pack(fill="x")
-            path_value = rec.get("path")
-            if path_value:
-                title.bind("<Double-Button-1>", lambda e, p=path_value: self.open_path_with_feedback(p, "file"))
-            status_label = tk.Label(right, text=headline, bg=bg, fg=self.TEXT, font=("Segoe UI", 14, "bold") if status in {"converted_only", "converted_in_place"} else ("Segoe UI", 11, "bold"), anchor="w")
-            status_label.pack(fill="x", pady=(8, 3))
-            if rec.get("space_savings"):
-                tk.Label(right, text=rec.get("space_savings"), bg=bg, fg=self.TEXT, font=("Segoe UI", 10, "bold"), anchor="w").pack(fill="x", pady=(0, 3))
-            times = f"Imported: {pretty_time(rec.get('imported_at'))}    Converted: {pretty_time(rec.get('converted_at'))}    Transferred: {pretty_time(rec.get('transferred_at'))}    Total: {format_duration(rec.get('total_duration'))}"
-            tk.Label(right, text=times, bg=bg, fg=self.MUTED, font=("Segoe UI", 9), anchor="w").pack(fill="x")
-            btns = tk.Frame(right, bg=bg)
-            btns.pack(fill="x", pady=(9, 0))
-            if status != "skipped" and rec.get("folder"):
-                self.small_button(btns, "Open folder", lambda p=rec.get("folder"): self.open_path_with_feedback(p, "folder"), self.CARD3).pack(side="left", padx=(0, 6))
-            if status in {"converted_only", "converted_in_place"} and rec.get("path"):
-                self.small_button(btns, "Open converted file", lambda p=rec.get("path"): self.open_path_with_feedback(p, "converted file"), self.GREEN).pack(side="left", padx=(0, 6))
-            self.small_button(btns, "Remove", lambda i=idx: self.remove_history_entry(i), self.RED).pack(side="left")
-            self.history_widgets.append(outer)
+        visible_records = history_page(records, self.history_display_limit)
+        loading = tk.Label(
+            self.history_inner,
+            text=f"Loading history... 0 of {len(visible_records)}",
+            bg=self.BG,
+            fg=self.MUTED,
+            font=("Segoe UI", 10, "bold"),
+        )
+        loading.pack(anchor="w", pady=16)
+        self.history_loading_widget = loading
+        self.history_widgets.append(loading)
+        generation = self.history_render_generation
+        self.history_render_after_id = self.root.after_idle(
+            lambda: self.render_history_batch(generation, records, visible_records, 0)
+        )
+
+    def render_history_batch(
+        self,
+        generation: int,
+        all_records: List[Dict[str, Any]],
+        visible_records: List[Dict[str, Any]],
+        cursor: int,
+    ) -> None:
+        self.history_render_after_id = None
+        if generation != self.history_render_generation or self.current_tab != "history":
+            self.history_view_dirty = True
+            return
+        if cursor == 0 and self.history_loading_widget is not None:
+            try:
+                self.history_loading_widget.destroy()
+            except Exception:
+                pass
+            try:
+                self.history_widgets.remove(self.history_loading_widget)
+            except ValueError:
+                pass
+            self.history_loading_widget = None
+        stop = min(len(visible_records), cursor + HISTORY_RENDER_BATCH_SIZE)
+        for index in range(cursor, stop):
+            self.build_history_record_card(visible_records[index], index, generation)
+        if stop < len(visible_records):
+            self.history_render_after_id = self.root.after(
+                8,
+                lambda: self.render_history_batch(generation, all_records, visible_records, stop),
+            )
+            return
+        if len(all_records) > len(visible_records):
+            footer = tk.Frame(self.history_inner, bg=self.CARD, padx=12, pady=10)
+            footer.pack(fill="x", pady=(8, 4))
+            tk.Label(
+                footer,
+                text=f"Showing {len(visible_records)} of {len(all_records)} history items",
+                bg=self.CARD,
+                fg=self.MUTED,
+                font=("Segoe UI", 9, "bold"),
+            ).pack(side="left")
+            remaining = min(HISTORY_PAGE_SIZE, len(all_records) - len(visible_records))
+            self.small_button(footer, f"Show {remaining} more", self.show_more_history, self.CARD3).pack(side="right")
+            self.history_widgets.append(footer)
         self.update_total_converted_label()
+
+    def build_history_record_card(self, rec: Dict[str, Any], index: int, generation: int) -> None:
+        status = rec.get("status", "")
+        if status == "transferred":
+            bg = self.DARK_GREEN
+            headline = "Transferred to NAS"
+        elif status == "converted_only":
+            bg = self.HISTORY_YELLOW
+            headline = "Converted to output folder; not transferred"
+        elif status == "converted_in_place":
+            bg = self.HISTORY_YELLOW
+            headline = "Converted in place"
+        elif status == "skipped":
+            bg = self.CARD
+            headline = "Skipped"
+        else:
+            bg = self.CARD
+            headline = rec.get("detail", "")
+        outer = tk.Frame(self.history_inner, bg=self.BORDER)
+        outer.pack(fill="x", pady=7)
+        card = tk.Frame(outer, bg=bg, padx=12, pady=12)
+        card.pack(fill="x", padx=2, pady=2)
+        left = tk.Frame(card, bg=bg)
+        left.pack(side="left")
+        thumb_frame = tk.Frame(left, bg=self.CARD3, width=222, height=125, highlightthickness=2, highlightbackground=self.BORDER)
+        thumb_frame.pack()
+        thumb_frame.pack_propagate(False)
+        thumb = tk.Label(thumb_frame, text="Preview", bg=self.CARD3, fg=self.MUTED, width=222, height=125)
+        thumb.pack(fill="both", expand=True)
+        tpath = rec.get("thumbnail_path")
+        if tpath and Path(tpath).exists():
+            if self.thumbnail_images.has_source(tpath):
+                self.thumbnail_images.configure_label(thumb, tpath)
+            else:
+                token = f"history:{generation}:{index}"
+                thumb.configure(text="Loading preview...")
+                self.history_thumbnail_labels[token] = (thumb, tpath)
+                self.request_history_thumbnail_display(token, tpath)
+        right = tk.Frame(card, bg=bg)
+        right.pack(side="left", fill="both", expand=True, padx=(14, 0))
+        title = tk.Label(right, text=f"{rec.get('display_name', '')}  ->  {rec.get('final_name', '')}", bg=bg, fg=self.TEXT, font=("Segoe UI", 12, "bold"), anchor="w")
+        title.pack(fill="x")
+        path_value = rec.get("path")
+        if path_value:
+            title.bind("<Double-Button-1>", lambda e, p=path_value: self.open_path_with_feedback(p, "file"))
+        tk.Label(right, text=headline, bg=bg, fg=self.TEXT, font=("Segoe UI", 14, "bold") if status in {"converted_only", "converted_in_place"} else ("Segoe UI", 11, "bold"), anchor="w").pack(fill="x", pady=(8, 3))
+        if rec.get("space_savings"):
+            tk.Label(right, text=rec.get("space_savings"), bg=bg, fg=self.TEXT, font=("Segoe UI", 10, "bold"), anchor="w").pack(fill="x", pady=(0, 3))
+        times = f"Imported: {pretty_time(rec.get('imported_at'))}    Converted: {pretty_time(rec.get('converted_at'))}    Transferred: {pretty_time(rec.get('transferred_at'))}    Total: {format_duration(rec.get('total_duration'))}"
+        tk.Label(right, text=times, bg=bg, fg=self.MUTED, font=("Segoe UI", 9), anchor="w").pack(fill="x")
+        btns = tk.Frame(right, bg=bg)
+        btns.pack(fill="x", pady=(9, 0))
+        if status != "skipped" and rec.get("folder"):
+            self.small_button(btns, "Open folder", lambda p=rec.get("folder"): self.open_path_with_feedback(p, "folder"), self.CARD3).pack(side="left", padx=(0, 6))
+        if status in {"converted_only", "converted_in_place"} and rec.get("path"):
+            self.small_button(btns, "Open converted file", lambda p=rec.get("path"): self.open_path_with_feedback(p, "converted file"), self.GREEN).pack(side="left", padx=(0, 6))
+        if status == "skipped" and rec.get("original_delete_pending"):
+            tk.Label(btns, text="Deleting original...", bg=bg, fg=self.MUTED, font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 8))
+        elif status == "skipped" and rec.get("input_path"):
+            self.small_button(btns, "Delete original file", lambda i=index: self.delete_history_original_file(i), self.RED).pack(side="left", padx=(0, 6))
+        self.small_button(btns, "Remove", lambda i=index: self.remove_history_entry(i), self.RED).pack(side="left")
+        self.history_widgets.append(outer)
 
     def clear_history(self) -> None:
         if not messagebox.askyesno(APP_NAME, "Clear history?"):
@@ -5506,6 +6290,55 @@ class MesterSyncApp:
         if removed:
             self.cleanup_history_thumbnails(removed)
         self.refresh_history_view()
+
+    def history_original_file(self, record: Dict[str, Any]) -> Optional[Path]:
+        return recorded_input_file(record, str(self.get_config().get("input_folder", "")))
+
+    def delete_history_original_file(self, index: int) -> None:
+        with self.history_lock:
+            if not 0 <= index < len(self.history_records):
+                return
+            record = self.history_records[index]
+            candidate = self.history_original_file(record)
+        if not candidate:
+            self.show_notification("The original file is missing or is no longer inside the recorded import folder.", "warning")
+            self.refresh_history_view()
+            return
+        try:
+            size_text = format_size(candidate.stat().st_size)
+        except OSError:
+            size_text = "unknown size"
+        if not messagebox.askyesno(APP_NAME, f"Permanently delete this original import-folder file?\n\n{candidate}\n\nSize: {size_text}"):
+            return
+        with self.history_lock:
+            if 0 <= index < len(self.history_records) and self.history_records[index] is record:
+                record["original_delete_pending"] = True
+        self.refresh_history_view()
+        threading.Thread(
+            target=self.delete_history_original_worker,
+            args=(record, candidate),
+            daemon=True,
+            name="HistoryOriginalDelete",
+        ).start()
+
+    def delete_history_original_worker(self, record: Dict[str, Any], candidate: Path) -> None:
+        if not force_delete(candidate):
+            with self.history_lock:
+                record["original_delete_pending"] = False
+            self.emit_error_message(f"Could not delete the original file. It may still be in use:\n\n{candidate}")
+            self.gui_queue.put(("history", None))
+            return
+        try:
+            with self.history_lock:
+                record["input_path"] = ""
+                record["original_delete_pending"] = False
+                record["original_file_deleted_at"] = now_iso()
+                self.save_history(force=True)
+            self.emit_log(f"Deleted original import-folder file from History: {candidate.name}")
+        except Exception as exc:
+            self.emit_error_message(f"The original file was deleted, but History could not be updated:\n\n{exc}")
+        finally:
+            self.gui_queue.put(("history", None))
 
 
 def main() -> None:

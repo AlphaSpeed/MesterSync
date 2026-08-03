@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import threading
 from collections import deque
 from pathlib import Path
 from typing import Deque, Dict, Iterable, Optional
@@ -31,15 +33,44 @@ class ImageCache:
         self.max_items = max_items
         self.images: Dict[str, tk.PhotoImage] = {}
         self.order: Deque[str] = deque()
+        self.source_data: Dict[str, str] = {}
+        self.source_order: Deque[str] = deque()
+        self.lock = threading.RLock()
 
-    def remove(self, key: str) -> None:
-        matching = [cache_key for cache_key in self.images if cache_key == key or cache_key.startswith(f"{key}::")]
-        for cache_key in matching:
-            self.images.pop(cache_key, None)
+    def has_source(self, path: str) -> bool:
+        with self.lock:
+            return path in self.source_data or any(key.startswith(f"{path}::") for key in self.images)
+
+    def put_source_bytes(self, path: str, data: bytes) -> None:
+        if not data:
+            return
+        encoded = base64.b64encode(data).decode("ascii")
+        with self.lock:
+            self.source_data[path] = encoded
             try:
-                self.order.remove(cache_key)
+                self.source_order.remove(path)
             except ValueError:
                 pass
+            self.source_order.append(path)
+            while len(self.source_order) > self.max_items:
+                old_path = self.source_order.popleft()
+                self.source_data.pop(old_path, None)
+
+    def remove(self, key: str) -> None:
+        with self.lock:
+            matching = [cache_key for cache_key in self.images if cache_key == key or cache_key.startswith(f"{key}::")]
+            for cache_key in matching:
+                self.images.pop(cache_key, None)
+            self.source_data.pop(key, None)
+            try:
+                self.source_order.remove(key)
+            except ValueError:
+                pass
+            for cache_key in matching:
+                try:
+                    self.order.remove(cache_key)
+                except ValueError:
+                    pass
 
     def put(self, key: str, image: tk.PhotoImage) -> None:
         self.images[key] = image
@@ -53,12 +84,20 @@ class ImageCache:
             self.images.pop(old_key, None)
 
     def get_thumbnail(self, path: str, max_width: int = 222, max_height: int = 125) -> Optional[tk.PhotoImage]:
-        if not Path(path).exists():
-            return None
         cache_key = f"{path}::{max_width}x{max_height}"
         if cache_key not in self.images:
             try:
-                img = tk.PhotoImage(file=path)
+                with self.lock:
+                    encoded = self.source_data.get(path)
+                if encoded:
+                    try:
+                        img = tk.PhotoImage(data=encoded)
+                    except Exception:
+                        img = tk.PhotoImage(file=path)
+                else:
+                    if not Path(path).exists():
+                        return None
+                    img = tk.PhotoImage(file=path)
                 if img.width() > max_width or img.height() > max_height:
                     img = scale_photo(img, max_width, max_height)
                 elif img.width() < 200 and img.height() < 110:
