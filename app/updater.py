@@ -31,6 +31,10 @@ class UpdateError(RuntimeError):
     pass
 
 
+class NoPublishedRelease(UpdateError):
+    pass
+
+
 @dataclass(frozen=True)
 class ReleaseInfo:
     version: str
@@ -124,6 +128,10 @@ def fetch_latest_release(timeout: float = 8.0) -> ReleaseInfo:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise NoPublishedRelease("No published MesterSync releases are available yet.") from exc
+        raise UpdateError(f"Could not check GitHub for updates: HTTP Error {exc.code}: {exc.reason}") from exc
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
         raise UpdateError(f"Could not check GitHub for updates: {exc}") from exc
     return release_from_payload(payload)

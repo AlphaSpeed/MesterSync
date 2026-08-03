@@ -3,8 +3,12 @@ name: Build Windows installer
 on:
   workflow_dispatch:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+
+concurrency:
+  group: mestersync-windows-release
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -48,14 +52,16 @@ jobs:
             dist/installer/*.exe
             dist/installer/*.sha256
 
-      - name: Publish tagged release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish release when this version is new
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $version = (python -c "import sys; sys.path.insert(0, 'app'); from version import APP_VERSION; print(APP_VERSION)").Trim()
-          if ("v$version" -ne "${{ github.ref_name }}") {
-            throw "Tag ${{ github.ref_name }} does not match app version v$version"
+          $tag = "v$version"
+          gh release view $tag --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists. The installer artifact was built and tested, but the published release was left unchanged."
+            exit 0
           }
-          gh release create "${{ github.ref_name }}" dist/installer/* --generate-notes --title "MesterSync $version"
+          gh release create $tag dist/installer/* --target "${{ github.sha }}" --generate-notes --title "MesterSync $version"

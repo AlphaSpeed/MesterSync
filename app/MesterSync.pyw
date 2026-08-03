@@ -124,6 +124,7 @@ from ui_widgets import ChipSelector
 from ui_performance import bounded_log_count, compact_notification_text, inertial_scroll_step, virtual_row_window
 from worker_utils import wait_for_conversion_task, wait_for_transfer_task
 from updater import (
+    NoPublishedRelease,
     ReleaseInfo,
     download_installer,
     fetch_latest_release,
@@ -2690,13 +2691,19 @@ class MesterSyncApp:
                     record_update_check(release)
                 except Exception as exc:
                     self.emit_log(f"Could not save the update-check time: {exc}")
-                self.gui_queue.put(("update_check_complete", (release, manual, None)))
+                self.gui_queue.put(("update_check_complete", (release, manual, None, False)))
+            except NoPublishedRelease:
+                try:
+                    record_update_check(None)
+                except Exception as exc:
+                    self.emit_log(f"Could not save the update-check time: {exc}")
+                self.gui_queue.put(("update_check_complete", (None, manual, None, True)))
             except Exception as exc:
-                self.gui_queue.put(("update_check_complete", (None, manual, str(exc))))
+                self.gui_queue.put(("update_check_complete", (None, manual, str(exc), False)))
 
         threading.Thread(target=worker, daemon=True, name="UpdateCheck").start()
 
-    def finish_update_check(self, release: Optional[ReleaseInfo], manual: bool, error: Optional[str]) -> None:
+    def finish_update_check(self, release: Optional[ReleaseInfo], manual: bool, error: Optional[str], no_release: bool = False) -> None:
         self.update_check_running = False
         if error:
             self.refresh_update_ui(f"Update check could not finish: {error}")
@@ -2704,6 +2711,15 @@ class MesterSyncApp:
                 self.show_notification(error, "warning")
             else:
                 self.log(error)
+            return
+        if no_release:
+            message = f"No published updates are available yet. Installed version: {APP_VERSION}"
+            self.latest_release = None
+            self.refresh_update_ui(message)
+            if manual:
+                self.show_notification(message, "info")
+            else:
+                self.log(message)
             return
         self.latest_release = release
         if release and is_newer_version(release.version, APP_VERSION):
@@ -2907,8 +2923,8 @@ class MesterSyncApp:
                 elif event == "health_check_complete":
                     self.finish_health_check(dict(payload))
                 elif event == "update_check_complete":
-                    release, manual, error = payload
-                    self.finish_update_check(release, bool(manual), error)
+                    release, manual, error, no_release = payload
+                    self.finish_update_check(release, bool(manual), error, bool(no_release))
                 elif event == "update_download_progress":
                     version = self.latest_release.version if self.latest_release else ""
                     self.refresh_update_ui(f"Downloading MesterSync {version}... {int(payload)}%")

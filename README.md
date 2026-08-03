@@ -64,7 +64,9 @@ The legacy root `data` folder, generated installer output, user data, and genera
 
 ## Build the Windows installer
 
-Install Python 3.10 or newer, then double-click `Build Windows Installer.bat`. The build creates an isolated Python build environment and installs the signed Inno Setup 6 compiler for the current Windows user if it is not already available. It then creates:
+You do not need to build releases on your own computer. Every push to `main` runs the Windows tests and installer build on GitHub. The workflow automatically publishes a GitHub Release when the version in `app\version.py` does not already have one.
+
+For an optional local test build, install Python 3.10 or newer and double-click `Build Windows Installer.bat`. The script creates an isolated Python build environment and installs the signed Inno Setup 6 compiler for the current Windows user if it is not already available. It then creates:
 
 - `dist\installer\MesterSync-Setup-<version>.exe`
 - `dist\installer\MesterSync-Setup-<version>.exe.sha256`
@@ -74,10 +76,9 @@ The build uses PyInstaller's folder mode so the installed app does not need to u
 ## Publish an update
 
 1. Change `APP_VERSION` in `app\version.py`.
-2. Commit and push the finished changes.
-3. Create and push a matching tag, such as `v2.0.1`.
+2. Commit and push the finished changes to `main`.
 
-The `Build Windows installer` GitHub workflow runs all tests, builds the executable and installer on Windows, and publishes both files in a GitHub Release. It refuses to publish when the tag and app version do not match. Existing installations will find the newly published release during their next update check.
+The `Build Windows installer` GitHub workflow runs all tests, builds the executable and installer on Windows, creates the matching tag (for example `v2.0.1`), and publishes both files in a GitHub Release. If that version already exists, the release is left unchanged. Existing installations will find a newly published version during their next update check.
 
 ## File safety
 

@@ -55,6 +55,18 @@ class InstallerUpdateTests(unittest.TestCase):
         with self.assertRaises(updater.UpdateError):
             updater.release_from_payload(payload)
 
+    def test_missing_latest_release_is_a_normal_no_release_state(self):
+        missing = updater.urllib.error.HTTPError(
+            updater.LATEST_RELEASE_URL,
+            404,
+            "Not Found",
+            {},
+            None,
+        )
+        with mock.patch.object(updater.urllib.request, "urlopen", side_effect=missing):
+            with self.assertRaises(updater.NoPublishedRelease):
+                updater.fetch_latest_release()
+
     def test_verified_installer_download_is_promoted_atomically(self):
         payload = b"verified installer payload"
         digest = __import__("hashlib").sha256(payload).hexdigest()
