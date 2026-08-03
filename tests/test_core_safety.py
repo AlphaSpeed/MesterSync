@@ -18,6 +18,7 @@ sys.path.insert(0, str(APP_DIR))
 import duplicates
 import file_utils
 import history_utils
+import importer
 import media_validation
 import preset_testing
 import rename_utils
@@ -215,6 +216,37 @@ class CoreSafetyTests(unittest.TestCase):
                 self.assertEqual(call.kwargs, {"stage": app_module.STAGE_IMPORTED, "imported": True})
             app.queue_imported_batch_for_conversion.assert_called_once()
             self.assertCountEqual(app.queue_imported_batch_for_conversion.call_args.args[0], ["one", "two"])
+
+    def test_watchfolder_excludes_nested_output_and_nas_folders(self):
+        with tempfile.TemporaryDirectory() as value:
+            input_folder = Path(value) / "input"
+            output_folder = input_folder / "output"
+            nas_folder = input_folder / "nas"
+            input_folder.mkdir()
+            output_folder.mkdir()
+            nas_folder.mkdir()
+            source = input_folder / "source.mp4"
+            output = output_folder / "converted.mp4"
+            nas_copy = nas_folder / "transferred.mp4"
+            for path in (source, output, nas_copy):
+                path.write_bytes(path.name.encode("utf-8"))
+
+            found = importer.scan_watchfolder_candidates(
+                input_folder,
+                [".mp4"],
+                [output_folder, nas_folder],
+            )
+
+            self.assertEqual(found, [source])
+
+    def test_overlapping_media_folders_are_rejected(self):
+        with tempfile.TemporaryDirectory() as value:
+            input_folder = Path(value) / "input"
+            output_folder = input_folder / "output"
+            separate = Path(value) / "nas"
+            errors = file_utils.media_folder_overlap_errors(input_folder, output_folder, separate)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("Importfolder and Output folder", errors[0])
 
     def test_progress_only_task_updates_use_throttled_rendering(self):
         app = self.bare_app()
@@ -639,6 +671,7 @@ class CoreSafetyTests(unittest.TestCase):
         emitted = []
         app.render_task = rendered.append
         app.emit_task = emitted.append
+        app.save_pending_tasks = mock.Mock()
         app.remove_import_job = lambda *_args, **_kwargs: None
         app.log = lambda *_args: None
         task = app_module.TaskState(
@@ -656,6 +689,56 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertIsNotNone(task.skip_archive_due)
         self.assertEqual(rendered, [task.task_id])
         self.assertEqual(emitted, [task.task_id])
+        app.save_pending_tasks.assert_called_once()
+
+    def test_skip_undo_state_is_persisted_until_history_archive(self):
+        app = self.bare_app()
+        app.task_lock = threading.RLock()
+        app.tasks_save_pending = True
+        app.tasks_save_after_id = None
+        task = app_module.TaskState(
+            task_id="skipped",
+            original_path=Path("camera-card.mov"),
+            display_name="camera-card.mov",
+            stage=app_module.STAGE_SKIPPED,
+            skipped=True,
+            skip_archive_due=skip_undo.new_skip_deadline(now=100.0),
+        )
+        app.tasks = {task.task_id: task}
+
+        with mock.patch.object(app_module, "save_task_records") as save_records:
+            app.save_pending_tasks(force=True)
+
+        save_records.assert_called_once()
+        saved = save_records.call_args.args[0]
+        self.assertEqual(len(saved), 1)
+        self.assertTrue(saved[0]["skipped"])
+        self.assertEqual(saved[0]["skip_archive_due"], 160.0)
+
+    def test_restored_skip_undo_task_remains_excluded_from_folder_watch(self):
+        source = Path("C:/Import/keep-skipped.mov")
+        task = app_module.TaskState(
+            task_id="skipped",
+            original_path=source,
+            local_input_path=source,
+            display_name=source.name,
+            stage=app_module.STAGE_SKIPPED,
+            skipped=True,
+            skip_archive_due=160.0,
+        )
+        app = self.bare_app()
+        app.task_lock = threading.RLock()
+        app.tasks = {}
+        app.task_by_path = {}
+        app.skipped_path_keys = set()
+        app.emit_task = mock.Mock()
+        app.log = mock.Mock()
+
+        with mock.patch.object(app_module, "load_task_records", return_value=[storage.task_to_record(task)]):
+            app.load_pending_tasks()
+
+        self.assertIn(file_utils.path_key(source), app.skipped_path_keys)
+        self.assertTrue(app.tasks[task.task_id].skipped)
 
     def test_history_original_delete_is_limited_to_recorded_input_folder(self):
         with tempfile.TemporaryDirectory() as value:

@@ -23,6 +23,33 @@ def path_key(path: Path | str) -> str:
         return str(Path(path)).lower()
 
 
+def path_is_within(path: Path | str, folder: Path | str) -> bool:
+    try:
+        candidate = Path(path).resolve()
+        root = Path(folder).resolve()
+        return candidate == root or root in candidate.parents
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def media_folder_overlap_errors(input_folder: Path | str, output_folder: Path | str, nas_folder: Path | str = "") -> List[str]:
+    folders = [
+        ("Importfolder", str(input_folder).strip()),
+        ("Output folder", str(output_folder).strip()),
+        ("NAS folder", str(nas_folder).strip()),
+    ]
+    errors: List[str] = []
+    for index, (left_label, left_value) in enumerate(folders):
+        if not left_value:
+            continue
+        for right_label, right_value in folders[index + 1:]:
+            if not right_value:
+                continue
+            if path_is_within(left_value, right_value) or path_is_within(right_value, left_value):
+                errors.append(f"{left_label} and {right_label} must be separate and must not contain one another.")
+    return errors
+
+
 def parse_csv_list(value: str) -> List[str]:
     return [x.strip() for x in value.split(",") if x.strip()]
 

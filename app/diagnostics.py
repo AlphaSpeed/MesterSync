@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from file_utils import format_size, free_space_bytes, no_window_flags, validate_writable_folder
+from file_utils import format_size, free_space_bytes, media_folder_overlap_errors, no_window_flags, validate_writable_folder
 from media_validation import find_ffprobe
 
 
@@ -38,6 +38,14 @@ def check_folder_health(cfg: Dict[str, Any]) -> List[str]:
             continue
         lines.append(f"OK {label} exists and is writable: {folder}")
         lines.append(folder_space_message(label, folder))
+    lines.extend(
+        f"ERROR {error}"
+        for error in media_folder_overlap_errors(
+            cfg.get("input_folder", ""),
+            cfg.get("output_folder", ""),
+            cfg.get("nas_folder", ""),
+        )
+    )
     return lines
 
 

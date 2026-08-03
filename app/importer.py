@@ -28,11 +28,19 @@ def collect_import_candidates(paths: Iterable[Path], extensions: Iterable[str], 
     return candidates
 
 
-def scan_watchfolder_candidates(input_folder: Path, extensions: Iterable[str]) -> List[Path]:
+def scan_watchfolder_candidates(input_folder: Path, extensions: Iterable[str], excluded_folders: Iterable[Path] = ()) -> List[Path]:
     candidates: List[Path] = []
     if not input_folder.exists():
         return candidates
+    excluded = [Path(folder).resolve() for folder in excluded_folders if str(folder).strip()]
     for path in input_folder.rglob("*"):
+        if excluded:
+            try:
+                resolved = path.resolve()
+                if any(resolved == folder or folder in resolved.parents for folder in excluded):
+                    continue
+            except (OSError, RuntimeError, ValueError):
+                continue
         if not path.is_file() or path.suffix.lower() == ".part" or not is_video_file(path, extensions):
             continue
         candidates.append(path)

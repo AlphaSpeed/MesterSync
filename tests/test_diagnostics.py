@@ -28,6 +28,19 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("ERROR Output folder is not configured.", lines)
         self.assertIn("INFO NAS folder is optional and not configured.", lines)
 
+    def test_nested_media_folders_are_reported_as_unsafe(self):
+        with tempfile.TemporaryDirectory() as value:
+            input_folder = Path(value) / "input"
+            output_folder = input_folder / "output"
+            input_folder.mkdir()
+            output_folder.mkdir()
+            lines = diagnostics.check_folder_health({
+                "input_folder": str(input_folder),
+                "output_folder": str(output_folder),
+                "nas_folder": "",
+            })
+            self.assertTrue(any("must be separate" in line for line in lines))
+
     def test_ffmpeg_health_reports_configured_encoder_and_ffprobe(self):
         with tempfile.TemporaryDirectory() as value:
             folder = Path(value)

@@ -38,6 +38,7 @@ from file_utils import (
     free_space_bytes,
     list_candidate_drives,
     list_windows_drives,
+    media_folder_overlap_errors,
     no_window_flags,
     now_iso,
     now_text,
@@ -749,6 +750,11 @@ class MesterSyncApp:
                 validate_writable_folder(values["output_folder"].get().strip(), "Output folder"),
                 validate_writable_folder(values["nas_folder"].get().strip(), "NAS folder", required=False),
             ]
+            folder_errors.extend(media_folder_overlap_errors(
+                values["input_folder"].get(),
+                values["output_folder"].get(),
+                values["nas_folder"].get(),
+            ))
             folder_errors = [error for error in folder_errors if error]
             if folder_errors:
                 set_wizard_notice("MesterSync cannot safely use these folders:\n" + "\n".join(f"- {error}" for error in folder_errors))
@@ -983,7 +989,7 @@ class MesterSyncApp:
             records = [
                 task_to_record(task)
                 for task in self.tasks.values()
-                if task.stage not in {STAGE_COMPLETE, STAGE_CONVERTED_OUTPUT} and not task.skip_archive_due
+                if task.stage not in {STAGE_COMPLETE, STAGE_CONVERTED_OUTPUT}
             ]
         save_task_records(records)
 
@@ -1001,6 +1007,8 @@ class MesterSyncApp:
                 for p in [task.original_path, task.local_input_path, task.output_path, task.nas_path]:
                     if p:
                         self.task_by_path[path_key(p)] = task.task_id
+                        if task.skipped:
+                            self.skipped_path_keys.add(path_key(p))
                 restored += 1
         for task_id in list(self.tasks.keys()):
             self.emit_task(task_id)
@@ -3268,6 +3276,11 @@ class MesterSyncApp:
                 validate_writable_folder(str(cfg.get("output_folder", "")), "Output folder"),
                 validate_writable_folder(str(cfg.get("nas_folder", "")), "NAS folder", required=False),
             ]
+            folder_errors.extend(media_folder_overlap_errors(
+                cfg.get("input_folder", ""),
+                cfg.get("output_folder", ""),
+                cfg.get("nas_folder", ""),
+            ))
             folder_errors = [error for error in folder_errors if error]
             if folder_errors:
                 self.show_notification("MesterSync cannot safely start with these folders:\n" + "\n".join(f"- {error}" for error in folder_errors), "error")
@@ -5129,7 +5142,12 @@ class MesterSyncApp:
                 self.emit_log("Importfolder watch is waiting for a valid folder in Settings.")
                 return 0
             exts = cfg.get("conversion_extensions", COMMON_VIDEO_EXTENSIONS)
-            for path in scan_watchfolder_candidates(input_folder, exts):
+            excluded_folders = [
+                Path(value)
+                for value in (cfg.get("output_folder", ""), cfg.get("nas_folder", ""))
+                if str(value).strip()
+            ]
+            for path in scan_watchfolder_candidates(input_folder, exts, excluded_folders):
                 key = path_key(path)
                 if key in self.skipped_path_keys:
                     continue
@@ -5468,11 +5486,12 @@ class MesterSyncApp:
                     self.emit_log(f"Converted file kept for inspection, but source was not deleted: {output_path} | {validation_error}")
                     return
                 output_size = output_path.stat().st_size
+                saved_bytes = 0
                 if source_size > 0:
                     saved = max(0, source_size - output_size)
+                    saved_bytes = saved
                     saved_pct = (saved / source_size) * 100
                     space_savings = f"Reduced from {format_size(source_size)} to {format_size(output_size)} ({saved_pct:.1f}% saved)"
-                    self.record_session_saved_bytes(saved)
                 else:
                     space_savings = f"Converted size: {format_size(output_size)}"
                 if not self.ensure_task_source_fingerprint(task_id, source):
@@ -5481,11 +5500,14 @@ class MesterSyncApp:
                         stage=STAGE_ERROR,
                         detail="Conversion finished, but the source fingerprint could not be saved. Output and source were both kept.",
                         progress=100,
-                        output_path=output_path,
+                        output_path=None,
                         output_size=output_size,
+                        error_log=f"Source fingerprint failed. Converted output kept at: {output_path}",
                     )
                     self.emit_log(f"Source fingerprint failed; kept both source and converted output: {source}")
                     return
+                if saved_bytes:
+                    self.record_session_saved_bytes(saved_bytes)
                 self.record_session_stat("converted")
                 self.update_task(task_id, stage=STAGE_CONVERTED, converted_at=now_iso(), progress=100, detail=space_savings, output_path=output_path, output_size=output_size, imported_size=source_size, space_savings=space_savings, eta_seconds=0)
                 self.emit_log(f"Conversion complete: {output_path.name} | {space_savings}")
@@ -5816,6 +5838,7 @@ class MesterSyncApp:
         # the values above have already been assigned.
         if task_id in getattr(self, "row_widgets", {}):
             self.render_task(task_id)
+        self.save_pending_tasks()
         self.emit_task(task_id)
         with self.queue_condition:
             try:
