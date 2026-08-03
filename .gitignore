@@ -13,6 +13,10 @@
 **/mestersync_settings_backup*.json.bak
 **/.mestersync_thumbnails/
 **/preset_tests/
+/build/
+/dist/
+/.build-venv/
+/.build-tools/
 
 # Local development files
 /.agents/

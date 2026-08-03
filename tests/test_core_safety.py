@@ -13,6 +13,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = ROOT / "app"
+os.environ.setdefault("MESTERSYNC_DATA_DIR", str(Path(tempfile.gettempdir()) / f"MesterSyncTests-{os.getpid()}"))
 sys.path.insert(0, str(APP_DIR))
 
 import duplicates
@@ -278,8 +279,8 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertEqual(ui_performance.bounded_log_count(990, 25, 1000), (15, 1000))
         self.assertEqual(ui_performance.bounded_log_count(1000, 80, 1000), (80, 1000))
 
-    def test_version_is_1_9(self):
-        self.assertEqual(app_module.APP_VERSION, "1.9")
+    def test_version_is_2_0(self):
+        self.assertEqual(app_module.APP_VERSION, "2.0")
 
     def test_launcher_has_python_fallbacks_and_visible_failure_message(self):
         launcher = (APP_DIR / "MesterSync.vbs").read_text(encoding="utf-8-sig").lower()

@@ -83,6 +83,7 @@ from storage import (
     load_history_records,
     load_task_records,
     normalize_config_data,
+    install_dir,
     preset_dir,
     preset_test_dir,
     record_to_task,
@@ -122,9 +123,19 @@ from thumbnail_ui import ImageCache, ThumbnailPopup, scale_photo, scrub_index_fr
 from ui_widgets import ChipSelector
 from ui_performance import bounded_log_count, compact_notification_text, inertial_scroll_step, virtual_row_window
 from worker_utils import wait_for_conversion_task, wait_for_transfer_task
+from updater import (
+    ReleaseInfo,
+    download_installer,
+    fetch_latest_release,
+    is_newer_version,
+    record_update_check,
+    should_check_for_updates,
+    start_installer,
+    verify_installer,
+)
+from version import APP_VERSION
 
 APP_NAME = "MesterSync"
-APP_VERSION = "1.9"
 APP_USER_MODEL_ID = "MesterSync.VideoWorkflow.App"
 LOGO_FILENAME = "mestersync_logo.png"
 ICON_FILENAME = "mestersync_icon.ico"
@@ -269,6 +280,10 @@ class MesterSyncApp:
         self.notification_after_id: Optional[str] = None
         self.notification_active = False
         self.notification_queue: Deque[Tuple[str, str, int]] = deque(maxlen=6)
+        self.latest_release: Optional[ReleaseInfo] = None
+        self.downloaded_update: Optional[Path] = None
+        self.update_check_running = False
+        self.update_download_running = False
 
         self.shutdown_event = threading.Event()
         self.pause_event = threading.Event()
@@ -327,6 +342,7 @@ class MesterSyncApp:
         self.ensure_checksum_worker_running()
         self.root.after(100, self.process_gui_events)
         self.root.after(1000, self.tick)
+        self.root.after(3500, self.check_for_updates)
         self.root.after(
             1500,
             lambda: threading.Thread(
@@ -1309,33 +1325,36 @@ class MesterSyncApp:
 
     def build_header(self) -> None:
         header = tk.Frame(self.main, bg=self.BG)
-        header.pack(fill="x", padx=18, pady=(14, 10))
+        header.pack(fill="x", padx=18, pady=(8, 6))
+        self.header_frame = header
         left = tk.Frame(header, bg=self.BG)
         left.pack(side="left")
         logo = resource_path(LOGO_FILENAME)
         if logo.exists():
             try:
                 img = tk.PhotoImage(file=str(logo))
-                self.logo_img = scale_photo(img, 340, 80)
-                tk.Label(left, image=self.logo_img, bg=self.BG).pack(anchor="w")
+                self.logo_img = scale_photo(img, 230, 52)
+                self.logo_label = tk.Label(left, image=self.logo_img, bg=self.BG)
+                self.logo_label.pack(anchor="w")
             except Exception:
-                tk.Label(left, text=APP_NAME, bg=self.BG, fg=self.TEXT, font=("Segoe UI", 34, "bold")).pack(anchor="w")
+                self.logo_label = tk.Label(left, text=APP_NAME, bg=self.BG, fg=self.TEXT, font=("Segoe UI", 26, "bold"))
+                self.logo_label.pack(anchor="w")
         else:
-            tk.Label(left, text=APP_NAME, bg=self.BG, fg=self.TEXT, font=("Segoe UI", 34, "bold")).pack(anchor="w")
+            self.logo_label = tk.Label(left, text=APP_NAME, bg=self.BG, fg=self.TEXT, font=("Segoe UI", 26, "bold"))
+            self.logo_label.pack(anchor="w")
 
         status_outer = tk.Frame(header, bg=self.BORDER)
-        status_outer.pack(side="right")
-        status = tk.Frame(status_outer, bg=self.CARD, padx=16, pady=10)
+        status_outer.pack(side="right", pady=(7, 0))
+        self.header_status_outer = status_outer
+        status = tk.Frame(status_outer, bg=self.CARD, padx=10, pady=6)
         status.pack(padx=2, pady=2)
-        tk.Label(status, text="STATUS", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x")
-        row = tk.Frame(status, bg=self.CARD)
-        row.pack(fill="x", pady=(4, 0))
-        self.status_dot = tk.Canvas(row, width=16, height=16, bg=self.CARD, highlightthickness=0)
-        self.status_dot.pack(side="left", padx=(0, 8))
+        tk.Label(status, text="STATUS", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
+        self.status_dot = tk.Canvas(status, width=12, height=12, bg=self.CARD, highlightthickness=0)
+        self.status_dot.pack(side="left", padx=(8, 6))
         self.status_var = tk.StringVar(value="Stopped")
-        tk.Label(row, textvariable=self.status_var, bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 12, "bold")).pack(side="left")
+        tk.Label(status, textvariable=self.status_var, bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10, "bold")).pack(side="left")
         self.activity_var = tk.StringVar(value="")
-        tk.Label(row, textvariable=self.activity_var, bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 10)).pack(side="left", padx=(12, 0))
+        tk.Label(status, textvariable=self.activity_var, bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(8, 0))
 
     def build_top_bar(self) -> None:
         bar = self.card_frame(self.main, fill="x", padx=18, pady=(0, 10))
@@ -1879,6 +1898,7 @@ class MesterSyncApp:
             ("drives", "Drives & file types"),
             ("safety", "Safety & timing"),
             ("presets", "Presets & test"),
+            ("updates", "About & updates"),
         ]
         for key, label in categories:
             button = self.small_button(category_nav, label, lambda k=key: self.show_settings_category(k), self.CARD3)
@@ -1989,6 +2009,27 @@ class MesterSyncApp:
         self.ffmpeg_args_text.bind("<KeyRelease>", lambda e: self.on_ffmpeg_args_changed())
 
         self.build_preset_test(self.settings_categories["presets"])
+
+        updates = self.card_frame(self.settings_categories["updates"], fill="x", pady=(0, 10))
+        tk.Label(updates, text="About and updates", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 16, "bold")).pack(anchor="w")
+        tk.Label(
+            updates,
+            text="MesterSync checks GitHub Releases in the background at most once per day. Updates are downloaded only when you choose to install them, and the installer is verified before it can run.",
+            bg=self.CARD,
+            fg=self.MUTED,
+            font=("Segoe UI", 9),
+            justify="left",
+            wraplength=900,
+        ).pack(anchor="w", pady=(6, 12))
+        self.update_status_var = tk.StringVar(value=f"Installed version: {APP_VERSION}")
+        tk.Label(updates, textvariable=self.update_status_var, bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 11, "bold"), justify="left").pack(anchor="w")
+        update_actions = tk.Frame(updates, bg=self.CARD)
+        update_actions.pack(anchor="w", pady=(12, 0))
+        self.update_action_button = self.small_button(update_actions, "Check for updates", lambda: self.check_for_updates(manual=True), self.BLUE)
+        self.update_action_button.pack(side="left", padx=(0, 8))
+        self.update_check_button = self.small_button(update_actions, "Check again", lambda: self.check_for_updates(manual=True), self.CARD3)
+        self.update_check_button.pack(side="left")
+        self.refresh_update_ui()
 
         footer = tk.Frame(inner, bg=self.BG)
         footer.pack(fill="x", pady=(0, 20))
@@ -2590,6 +2631,152 @@ class MesterSyncApp:
             return
         self.open_path_with_feedback(self.preset_test_last_path, "preset test")
 
+    # ---------------- updates ----------------
+    def refresh_update_ui(self, status: Optional[str] = None) -> None:
+        if not hasattr(self, "update_status_var"):
+            return
+        if status:
+            self.update_status_var.set(status)
+        elif self.downloaded_update and self.downloaded_update.exists() and self.latest_release:
+            self.update_status_var.set(f"Version {self.latest_release.version} is downloaded and ready to install.")
+        elif self.latest_release and is_newer_version(self.latest_release.version, APP_VERSION):
+            self.update_status_var.set(f"Version {self.latest_release.version} is available. Installed: {APP_VERSION}")
+        else:
+            self.update_status_var.set(f"Installed version: {APP_VERSION}")
+
+        if self.update_download_running:
+            label = "Downloading..."
+            command = lambda: None
+            color = self.CARD3
+            state = "disabled"
+        elif self.update_check_running:
+            label = "Checking..."
+            command = lambda: None
+            color = self.CARD3
+            state = "disabled"
+        elif self.downloaded_update and self.downloaded_update.exists():
+            label = "Install downloaded update"
+            command = self.install_downloaded_update
+            color = self.GREEN
+            state = "normal"
+        elif self.latest_release and is_newer_version(self.latest_release.version, APP_VERSION):
+            label = f"Download update {self.latest_release.version}"
+            command = self.download_available_update
+            color = self.GREEN
+            state = "normal"
+        else:
+            label = "Check for updates"
+            command = lambda: self.check_for_updates(manual=True)
+            color = self.BLUE
+            state = "normal"
+        self.update_action_button.configure(text=label, command=command, bg=color, activebackground=color, state=state)
+
+    def check_for_updates(self, manual: bool = False) -> None:
+        if self.update_check_running or self.update_download_running or self.shutdown_event.is_set():
+            return
+        if not manual:
+            try:
+                if not should_check_for_updates():
+                    return
+            except Exception as exc:
+                self.log(f"Could not read the update-check cache: {exc}")
+        self.update_check_running = True
+        self.refresh_update_ui("Checking GitHub for updates...")
+
+        def worker() -> None:
+            try:
+                release = fetch_latest_release()
+                try:
+                    record_update_check(release)
+                except Exception as exc:
+                    self.emit_log(f"Could not save the update-check time: {exc}")
+                self.gui_queue.put(("update_check_complete", (release, manual, None)))
+            except Exception as exc:
+                self.gui_queue.put(("update_check_complete", (None, manual, str(exc))))
+
+        threading.Thread(target=worker, daemon=True, name="UpdateCheck").start()
+
+    def finish_update_check(self, release: Optional[ReleaseInfo], manual: bool, error: Optional[str]) -> None:
+        self.update_check_running = False
+        if error:
+            self.refresh_update_ui(f"Update check could not finish: {error}")
+            if manual:
+                self.show_notification(error, "warning")
+            else:
+                self.log(error)
+            return
+        self.latest_release = release
+        if release and is_newer_version(release.version, APP_VERSION):
+            self.refresh_update_ui()
+            self.show_notification(f"MesterSync {release.version} is available in Settings → About & updates.", "info", duration_ms=8000)
+        else:
+            self.refresh_update_ui(f"MesterSync {APP_VERSION} is up to date.")
+            if manual:
+                self.show_notification(f"MesterSync {APP_VERSION} is up to date.", "success")
+
+    def download_available_update(self) -> None:
+        release = self.latest_release
+        if not release or not is_newer_version(release.version, APP_VERSION) or self.update_download_running:
+            return
+        self.update_download_running = True
+        self.refresh_update_ui(f"Downloading MesterSync {release.version}... 0%")
+
+        def progress(downloaded: int, total: int) -> None:
+            percent = int(downloaded * 100 / max(1, total))
+            self.gui_queue.put(("update_download_progress", percent))
+
+        def worker() -> None:
+            try:
+                installer = download_installer(release, progress=progress)
+                self.gui_queue.put(("update_download_complete", (installer, None)))
+            except Exception as exc:
+                self.gui_queue.put(("update_download_complete", (None, str(exc))))
+
+        threading.Thread(target=worker, daemon=True, name="UpdateDownload").start()
+
+    def finish_update_download(self, installer: Optional[Path], error: Optional[str]) -> None:
+        self.update_download_running = False
+        if error or installer is None:
+            self.refresh_update_ui(f"Update download failed: {error or 'Unknown error'}")
+            self.show_notification(error or "The update download failed.", "error")
+            return
+        self.downloaded_update = installer
+        self.refresh_update_ui()
+        self.show_notification("The verified update is ready. Use Install downloaded update when current work is stopped.", "success", duration_ms=9000)
+
+    def install_downloaded_update(self) -> None:
+        installer = self.downloaded_update
+        if not installer or not installer.exists():
+            self.downloaded_update = None
+            self.refresh_update_ui("The downloaded installer is no longer available. Download it again.")
+            return
+        with self.preset_test_process_lock:
+            preset_test_running = self.preset_test_running
+        active_work = self.started and (self.import_enabled or self.conversion_enabled or self.transfer_enabled)
+        worker_active = any((self.current_import_id, self.current_conversion_id, self.current_transfer_id)) or self.importing_count > 0
+        if active_work or worker_active or preset_test_running or self.current_process is not None:
+            self.show_notification("Stop all imports, conversions, transfers, and preset tests before installing the update.", "warning", duration_ms=9000)
+            return
+        if self.config_save_after_id is not None:
+            self.root.after_cancel(self.config_save_after_id)
+            self.config_save_after_id = None
+        if not self.flush_config_autosave():
+            self.show_notification("The update was not started because Settings could not be saved.", "error")
+            return
+        try:
+            self.save_pending_tasks(force=True)
+            self.save_history(force=True)
+            if not self.latest_release:
+                raise RuntimeError("The downloaded update no longer has matching release information.")
+            verify_installer(installer, self.latest_release)
+            start_installer(installer, install_dir())
+        except Exception as exc:
+            self.show_notification(f"The update could not be started: {exc}", "error")
+            return
+        self.set_sleep_prevention(False)
+        self.shutdown_event.set()
+        self.root.destroy()
+
     # ---------------- UI events/status ----------------
     def emit_log(self, text: str) -> None:
         self.gui_queue.put(("log", text))
@@ -2719,6 +2906,15 @@ class MesterSyncApp:
                     self.show_notification(str(payload), "error")
                 elif event == "health_check_complete":
                     self.finish_health_check(dict(payload))
+                elif event == "update_check_complete":
+                    release, manual, error = payload
+                    self.finish_update_check(release, bool(manual), error)
+                elif event == "update_download_progress":
+                    version = self.latest_release.version if self.latest_release else ""
+                    self.refresh_update_ui(f"Downloading MesterSync {version}... {int(payload)}%")
+                elif event == "update_download_complete":
+                    installer, error = payload
+                    self.finish_update_download(installer, error)
                 elif event == "encoder_cache_ready":
                     key, encoders, error = payload
                     self.encoder_queries_pending.discard(str(key))
@@ -2954,7 +3150,8 @@ class MesterSyncApp:
 
     def draw_dot(self, canvas: tk.Canvas, color: str) -> None:
         canvas.delete("all")
-        canvas.create_oval(2, 2, 13, 13, fill=color, outline=color)
+        size = min(int(canvas.cget("width")), int(canvas.cget("height")))
+        canvas.create_oval(2, 2, size - 2, size - 2, fill=color, outline=color)
 
     def update_status(self) -> None:
         with self.preset_test_process_lock:

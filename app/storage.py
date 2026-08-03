@@ -32,10 +32,14 @@ CHECKSUM_DIRNAME = "checksums"
 CHECKSUM_FILENAME = "mestersync_checksums.json"
 PRESET_DIRNAME = "presets"
 PRESET_TEST_DIRNAME = "preset_tests"
+APP_DATA_DIRNAME = "MesterSync"
+UPDATE_DIRNAME = "updates"
 
 
 _json_write_locks_guard = threading.Lock()
 _json_write_locks: Dict[str, threading.RLock] = {}
+_storage_setup_lock = threading.RLock()
+_storage_setup_complete = False
 
 
 def json_write_lock(path: Path) -> threading.RLock:
@@ -61,8 +65,123 @@ def install_dir() -> Path:
     return app
 
 
+def user_storage_root() -> Path:
+    """Return the writable per-user home for installed and portable builds."""
+    override = os.environ.get("MESTERSYNC_DATA_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if local_app_data:
+            return Path(local_app_data) / APP_DATA_DIRNAME
+        return Path.home() / "AppData" / "Local" / APP_DATA_DIRNAME
+    return Path.home() / f".{APP_DATA_DIRNAME.lower()}"
+
+
+def _command_line_migration_root() -> Optional[Path]:
+    prefix = "--migrate-from="
+    for index, value in enumerate(sys.argv[1:]):
+        if value.lower().startswith(prefix):
+            candidate = value[len(prefix):].strip().strip('"')
+            return Path(candidate).expanduser() if candidate else None
+        if value.lower() == "--migrate-from" and index + 2 < len(sys.argv):
+            candidate = sys.argv[index + 2].strip().strip('"')
+            return Path(candidate).expanduser() if candidate else None
+    env_value = os.environ.get("MESTERSYNC_MIGRATE_FROM", "").strip()
+    return Path(env_value).expanduser() if env_value else None
+
+
+def _copy_missing_tree(source: Path, destination: Path) -> None:
+    if not source.is_dir():
+        return
+    for item in source.rglob("*"):
+        relative = item.relative_to(source)
+        target = destination / relative
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif item.is_file() and not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+
+
+def _legacy_storage_roots() -> list[Path]:
+    candidates: list[Path] = []
+    explicit = _command_line_migration_root()
+    if explicit is not None:
+        candidates.append(explicit)
+    candidates.append(install_dir())
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate.absolute()
+        key = os.path.normcase(str(resolved))
+        if key not in seen:
+            seen.add(key)
+            unique.append(resolved)
+    return unique
+
+
+def _write_setup_warning(destination_data: Path, message: str) -> None:
+    try:
+        destination_data.mkdir(parents=True, exist_ok=True)
+        with (destination_data / "storage_warnings.log").open("a", encoding="utf-8") as handle:
+            handle.write(message.rstrip() + "\n")
+    except OSError:
+        pass
+
+
+def ensure_user_storage() -> None:
+    """Seed writable app data without deleting or overwriting portable data."""
+    global _storage_setup_complete
+    with _storage_setup_lock:
+        if _storage_setup_complete:
+            return
+        root = user_storage_root()
+        destination_data = root / DATA_DIRNAME
+        destination_presets = root / PRESET_DIRNAME
+        destination_data.mkdir(parents=True, exist_ok=True)
+        destination_presets.mkdir(parents=True, exist_ok=True)
+
+        for legacy_root in _legacy_storage_roots():
+            if same_location(legacy_root, root):
+                continue
+            try:
+                # Support both the current portable layout and releases that
+                # kept JSON/cache files beside the launcher or in app/.
+                legacy_data_locations = [legacy_root / DATA_DIRNAME, legacy_root, legacy_root / "app"]
+                for legacy_data in legacy_data_locations:
+                    for filename in (CONFIG_FILENAME, HISTORY_FILENAME, TASKS_FILENAME):
+                        for suffix in ("", ".bak"):
+                            source = legacy_data / f"{filename}{suffix}"
+                            target = destination_data / source.name
+                            if source.is_file() and not target.exists():
+                                shutil.copy2(source, target)
+                    for dirname in (THUMBNAIL_DIRNAME, CHECKSUM_DIRNAME, PRESET_TEST_DIRNAME):
+                        _copy_missing_tree(legacy_data / dirname, destination_data / dirname)
+                for preset_source in (
+                    legacy_root / PRESET_DIRNAME,
+                    legacy_root / "ffmpeg_presets",
+                    legacy_root / "app" / "ffmpeg_presets",
+                ):
+                    _copy_missing_tree(preset_source, destination_presets)
+            except OSError as exc:
+                _write_setup_warning(destination_data, f"Could not migrate portable data from {legacy_root}: {exc}")
+
+        bundled_presets = resource_path(PRESET_DIRNAME) if getattr(sys, "frozen", False) else install_dir() / PRESET_DIRNAME
+        if not same_location(bundled_presets, destination_presets):
+            try:
+                _copy_missing_tree(bundled_presets, destination_presets)
+            except OSError as exc:
+                _write_setup_warning(destination_data, f"Could not seed bundled presets from {bundled_presets}: {exc}")
+        _storage_setup_complete = True
+
+
 def data_dir() -> Path:
-    path = install_dir() / DATA_DIRNAME
+    ensure_user_storage()
+    path = user_storage_root() / DATA_DIRNAME
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -120,7 +239,15 @@ def preset_test_dir() -> Path:
 
 
 def preset_dir() -> Path:
-    path = install_dir() / PRESET_DIRNAME
+    ensure_user_storage()
+    path = user_storage_root() / PRESET_DIRNAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def update_dir() -> Path:
+    ensure_user_storage()
+    path = user_storage_root() / UPDATE_DIRNAME
     path.mkdir(parents=True, exist_ok=True)
     return path
 

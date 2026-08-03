@@ -1,4 +1,4 @@
-# MesterSync 1.9
+# MesterSync 2.0
 
 MesterSync is a Windows desktop tool for safely importing, renaming, converting, and transferring video files. It uses FFmpeg for conversion and FFprobe to verify completed media before local working files are removed.
 
@@ -23,8 +23,17 @@ MesterSync is a Windows desktop tool for safely importing, renaming, converting,
 - Persistent queues, history, keyboard controls, and automatic settings saves
 - Background folder, free-space, FFmpeg, FFprobe, and encoder diagnostics
 - A Preset test section inside Settings that converts a 15-second middle sample and automatically removes prior test outputs after a successful replacement
+- A normal per-user Windows installer, Start menu shortcut, uninstaller, and verified in-app updates from GitHub Releases
 
-## Requirements
+## Install MesterSync
+
+Download `MesterSync-Setup-<version>.exe` from the latest GitHub Release and open it. The installer does not require administrator access. It installs MesterSync for the current Windows user and opens the app when installation completes.
+
+The installed application checks for an update at most once per day without blocking startup. When a newer release is available, open **Settings → About & updates** and choose **Download and install**. MesterSync verifies the installer against GitHub's SHA-256 digest before allowing it to run. Active imports, conversions, transfers, and preset tests must be stopped before installation.
+
+Settings and work data are stored separately in `%LOCALAPPDATA%\MesterSync`, so upgrading or uninstalling the program does not remove them. When upgrading from the portable/source layout, MesterSync copies existing data and presets into this location without changing or deleting the originals. Launching an update from the portable app supplies its current folder to the installer automatically.
+
+## Run from source
 
 - Windows 10 or 11
 - Python 3.10 or newer, including Tkinter
@@ -46,10 +55,29 @@ The first-run wizard asks for FFmpeg, working folders, the optional NAS destinat
 ## Folder layout
 
 - `app`: source code, launcher, and artwork
-- `presets`: shareable FFmpeg preset files
-- `data`: local settings, queues, history, checksums, thumbnails, and preset-test samples
+- `presets`: default/shareable FFmpeg preset files copied into the user's writable preset folder
+- `%LOCALAPPDATA%\MesterSync\data`: settings, queues, history, checksums, thumbnails, and preset-test samples
+- `%LOCALAPPDATA%\MesterSync\presets`: writable user presets
+- `packaging`: Windows executable and installer definitions
 
-`data` and the generated shortcut are intentionally excluded from Git. Publishing the repository therefore does not include local paths, file history, thumbnails, or checksum records.
+The legacy root `data` folder, generated installer output, user data, and generated shortcut are intentionally excluded from Git. Publishing the repository therefore does not include local paths, file history, thumbnails, or checksum records.
+
+## Build the Windows installer
+
+Install Python 3.10 or newer and [Inno Setup 6](https://jrsoftware.org/isdl.php), then double-click `Build Windows Installer.bat`. The build creates:
+
+- `dist\installer\MesterSync-Setup-<version>.exe`
+- `dist\installer\MesterSync-Setup-<version>.exe.sha256`
+
+The build uses PyInstaller's folder mode so the installed app does not need to unpack itself into a temporary directory every time it starts.
+
+## Publish an update
+
+1. Change `APP_VERSION` in `app\version.py`.
+2. Commit and push the finished changes.
+3. Create and push a matching tag, such as `v2.0.1`.
+
+The `Build Windows installer` GitHub workflow runs all tests, builds the executable and installer on Windows, and publishes both files in a GitHub Release. It refuses to publish when the tag and app version do not match. Existing installations will find the newly published release during their next update check.
 
 ## File safety
 
