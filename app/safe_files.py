@@ -8,11 +8,36 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
-from file_utils import force_delete, format_size, free_space_bytes, path_key
+from file_utils import force_delete, format_size, free_space_bytes, path_key, sha256_file
 
 
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int, int], None]
+
+
+def delete_file_if_checksum_matches(path: Path, expected_checksum: str, log: LogCallback) -> bool:
+    """Delete only when the file still has the exact content MesterSync expects.
+
+    This protects against deleting a different recording that was edited or put
+    at the same path after the app created its working copy.
+    """
+    if not path.exists():
+        return True
+    expected = str(expected_checksum or "").strip().lower()
+    if len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
+        log(f"Kept file because no trusted checksum was available before cleanup: {path}")
+        return False
+    actual = sha256_file(path)
+    if not actual:
+        log(f"Kept file because it changed or could not be checked before cleanup: {path}")
+        return False
+    if actual.lower() != expected:
+        log(f"Kept file because its content changed after MesterSync created it: {path}")
+        return False
+    if not force_delete(path):
+        log(f"Could not delete verified working file: {path}")
+        return False
+    return True
 
 
 def promote_temp_no_overwrite(temp: Path, destination: Path, log: LogCallback) -> bool:

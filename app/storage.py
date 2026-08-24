@@ -11,11 +11,14 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tasks import (
+    STAGE_CHECKING,
     STAGE_CONVERTING,
     STAGE_CONVERTING_IN_PLACE,
+    STAGE_DETECTED,
     STAGE_IMPORTING,
     STAGE_QUEUED,
     STAGE_STOPPED,
+    STAGE_STOPPING,
     STAGE_TRANSFERRING,
     STAGE_WAITING,
     STAGE_WAITING_TRANSFER,
@@ -446,6 +449,7 @@ def task_to_record(task: TaskState) -> Dict[str, Any]:
         "skip_archive_due": task.skip_archive_due,
         "duplicate": task.duplicate,
         "duplicate_reason": task.duplicate_reason,
+        "force_import": task.force_import,
         "error_log": task.error_log,
         "convert_in_place": task.convert_in_place,
     }
@@ -488,10 +492,22 @@ def record_to_task(record: Dict[str, Any]) -> Optional[TaskState]:
             skip_archive_due=record.get("skip_archive_due"),
             duplicate=bool(record.get("duplicate", False)),
             duplicate_reason=str(record.get("duplicate_reason") or ""),
+            force_import=bool(record.get("force_import", False)),
             error_log=str(record.get("error_log") or ""),
             convert_in_place=bool(record.get("convert_in_place", False)),
         )
-        if task.stage in {STAGE_IMPORTING, STAGE_QUEUED, STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE, STAGE_WAITING_TRANSFER, STAGE_TRANSFERRING, STAGE_WAITING}:
+        if task.stage in {
+            STAGE_CHECKING,
+            STAGE_DETECTED,
+            STAGE_IMPORTING,
+            STAGE_QUEUED,
+            STAGE_STOPPING,
+            STAGE_CONVERTING,
+            STAGE_CONVERTING_IN_PLACE,
+            STAGE_WAITING_TRANSFER,
+            STAGE_TRANSFERRING,
+            STAGE_WAITING,
+        }:
             task.stage = STAGE_STOPPED
             task.detail = "Restored after app restart. Press Restart/Resume to continue."
             task.progress = 0

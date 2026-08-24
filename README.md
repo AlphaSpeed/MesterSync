@@ -1,4 +1,4 @@
-# MesterSync 2.0.4
+# MesterSync 2.1
 
 MesterSync is a Windows desktop tool for safely importing, renaming, converting, and transferring video files. It uses FFmpeg for conversion and FFprobe to verify completed media before local working files are removed.
 
@@ -14,7 +14,17 @@ MesterSync is a Windows desktop tool for safely importing, renaming, converting,
 - Batched, bounded live logging that stays lightweight during long sessions
 - Coalesced progress updates and faster background preview generation
 - A collapsible Log box in the top control bar between the playback controls and preset selector
-- Non-blocking in-app notifications for routine information, warnings, and errors
+- Bottom-right, non-blocking notifications with compact X controls and a floating latest-three notification center
+- Notification controls shifted clear of the scrollbar, with Dismiss all for transient messages
+- Persistent disk-ready feedback that remains active until the corresponding recording drive is disconnected
+- A contextual selection bar that always shows how many files an action will affect and clears after batch actions
+- Safe rename scoping: inline fields rename one file only, while multi-file rename requires an explicit preview and confirmation
+- Separate commands for choosing files to convert in place and converting selected Dashboard rows
+- An actionable empty Dashboard plus visible start/completion feedback for manual Importfolder scans
+- Visible success, unsupported-file, and cancellation feedback for file-picker and drag-and-drop imports
+- A durable Import anyway override that bypasses duplicate detection until the requested import succeeds
+- Screen-aware main/setup windows, including a scrollable setup wizard for smaller laptop displays
+- Safer idle controls and history changes: Pause is disabled while stopped, and failed History saves roll back cleanly
 - Compact Settings categories for folders, drives, safety, and presets
 - Smaller stage and Active Files headers that leave more room for video rows
 - Ten-frame thumbnail scrubbing and a large preview
@@ -78,13 +88,13 @@ The build uses PyInstaller's folder mode so the installed app does not need to u
 1. Change `APP_VERSION` in `app\version.py`.
 2. Commit and push the finished changes to `main`.
 
-The `Build Windows installer` GitHub workflow runs all tests, builds the executable and installer on Windows, creates the matching tag (for example `v2.0.4`), and publishes both files in a GitHub Release. If that version already exists, the release is left unchanged. Existing installations will find a newly published version during their next update check.
+The `Build Windows installer` GitHub workflow runs all tests, builds the executable and installer on Windows, creates the matching tag (for example `v2.1`), and publishes both files in a GitHub Release. If that version already exists, the release is left unchanged. Existing installations will find a newly published version during their next update check.
 
 ## File safety
 
 MesterSync writes imports, conversions, and transfers to temporary files first. It verifies completed files and promotes them without replacing an existing destination. Final names are checked again immediately before each file is committed.
 
-Matching filenames are not treated as proof that two recordings are duplicates. When a same-name and same-size candidate is found, MesterSync compares full-file checksums. Different recordings are imported separately and receive unique names such as `recording.mov`, `recording_1.mov`, and `recording_2.mov`. Final converted names are reserved across both the output and NAS folders so simultaneous jobs cannot select the same name.
+Exact duplicate protection is always on. Matching filenames are not treated as proof that two recordings are duplicates. MesterSync uses file size plus cached samples from the beginning, middle, and end as a fast filter. A sample mismatch proves the recordings differ; a possible match is always confirmed with a SHA-256 checksum of every byte. The name is never part of the duplicate decision, so renamed identical recordings are still found while different camera recordings named `hyperdeck_02.mp4` remain separate. Different recordings receive unique names such as `recording.mov`, `recording_1.mov`, and `recording_2.mov`. Final converted names are reserved across both the output and NAS folders so simultaneous jobs cannot select the same name. Choosing **Import anyway** is the only duplicate override; it still uses a new unique name and never replaces an existing file. Legacy records without samples continue to receive the full check. If the checksum database cannot be saved, the import stops in an error state and keeps both the recording-disk file and its verified local copy.
 
 Run the core safety checks with:
 

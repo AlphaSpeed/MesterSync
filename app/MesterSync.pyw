@@ -28,7 +28,7 @@ except Exception:
 
 from config_defaults import COMMON_VIDEO_EXTENSIONS, DEFAULT_CONFIG, DEFAULT_FFMPEG_ARGS
 from diagnostics import query_video_encoders, run_diagnostics
-from duplicates import exact_duplicate_reason, remove_missing_checksum_entries
+from duplicates import exact_duplicate_reason, quick_fingerprint, remove_missing_checksum_entries
 from file_utils import (
     ensure_folder,
     file_is_ready,
@@ -69,6 +69,7 @@ from preset_testing import delete_previous_preset_tests, preset_sample_window, p
 from rename_utils import batch_rename_bases
 from safe_files import (
     copy_file_safely as copy_path_safely,
+    delete_file_if_checksum_matches as delete_path_if_checksum_matches,
     move_file_no_overwrite as move_path_no_overwrite,
     promote_temp_no_overwrite as promote_path_no_overwrite,
 )
@@ -176,8 +177,14 @@ class MesterSyncApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
-        self.root.geometry("1500x940")
-        self.root.minsize(1180, 760)
+        screen_width = max(800, int(self.root.winfo_screenwidth()))
+        screen_height = max(600, int(self.root.winfo_screenheight()))
+        window_width = min(1500, max(800, screen_width - 40))
+        window_height = min(940, max(600, screen_height - 80))
+        minimum_width = min(1180, max(760, screen_width - 100))
+        minimum_height = min(760, max(560, screen_height - 140))
+        self.root.geometry(f"{window_width}x{window_height}")
+        self.root.minsize(minimum_width, minimum_height)
         self.root.configure(bg=self.BG)
         icon = resource_path(ICON_FILENAME)
         if icon.exists():
@@ -210,6 +217,7 @@ class MesterSyncApp:
         self.history_records: List[Dict[str, Any]] = self.load_history()
         self.checksum_db: Dict[str, Any] = {}
         self.load_checksum_database()
+        self.duplicate_fingerprint_cache: Dict[str, Any] = {}
 
         self.gui_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
         self.import_queue: Deque[str] = deque()
@@ -272,6 +280,7 @@ class MesterSyncApp:
         self.config_save_after_id: Optional[str] = None
         self.settings_autosave_ready = False
         self.settings_ui_refreshing = False
+        self.settings_autosave_error_notified = False
         self.log_line_count = 0
         self.log_entries: Deque[str] = deque(maxlen=LOG_MAX_LINES)
         self.log_text: Optional[scrolledtext.ScrolledText] = None
@@ -281,6 +290,12 @@ class MesterSyncApp:
         self.notification_after_id: Optional[str] = None
         self.notification_active = False
         self.notification_queue: Deque[Tuple[str, str, int]] = deque(maxlen=6)
+        self.notification_history: Deque[Tuple[str, str, str]] = deque(maxlen=20)
+        self.notification_history_open = False
+        self.persistent_notifications: Dict[str, Dict[str, str]] = {}
+        self.persistent_notifications_collapsed = False
+        self.batch_rename_confirmation: Optional[Tuple[Any, ...]] = None
+        self.batch_rename_confirmation_after_id: Optional[str] = None
         self.latest_release: Optional[ReleaseInfo] = None
         self.downloaded_update: Optional[Path] = None
         self.update_check_running = False
@@ -425,8 +440,8 @@ class MesterSyncApp:
         self.max_wait_var = tk.StringVar(value=str(self.config["max_ready_wait_seconds"]))
         self.low_disk_warning_var = tk.StringVar(value=str(self.config.get("low_disk_warning_gb", 20)))
         self.checksum_path_var = tk.StringVar(value=self.config["checksum_database_path"])
-        self.duplicate_var = tk.BooleanVar(value=bool(self.config["enable_duplicate_detection"]))
-        self.check_input_var = tk.BooleanVar(value=bool(self.config["check_existing_in_input"]))
+        self.duplicate_var = tk.BooleanVar(value=True)
+        self.check_input_var = tk.BooleanVar(value=True)
         self.auto_underscore_var = tk.BooleanVar(value=bool(self.config.get("auto_underscore_renames", False)))
         self.prevent_sleep_var = tk.BooleanVar(value=bool(self.config.get("prevent_sleep_while_working", True)))
         self.preset_folder_var = tk.StringVar(value=self.config.get("preset_folder") or str(preset_dir()))
@@ -445,9 +460,9 @@ class MesterSyncApp:
             self.config["exclude_folders"] = parse_csv_list(self.exclude_folders_var.get())
             self.config["auto_import_delay_seconds"] = self.ui_int(self.auto_delay_var, 5)
             self.config["scan_interval_seconds"] = self.ui_int(self.scan_interval_var, 3, minimum=1)
-            self.config["enable_duplicate_detection"] = bool(self.duplicate_var.get())
+            self.config["enable_duplicate_detection"] = True
             self.config["checksum_database_path"] = self.checksum_path_var.get().strip()
-            self.config["check_existing_in_input"] = bool(self.check_input_var.get())
+            self.config["check_existing_in_input"] = True
             self.config["file_stable_seconds"] = self.ui_int(self.stable_seconds_var, 10, minimum=1)
             self.config["copy_chunk_mb"] = self.ui_int(self.copy_chunk_var, 4, minimum=1)
             self.config["max_ready_wait_seconds"] = self.ui_int(self.max_wait_var, 7200, minimum=60)
@@ -480,9 +495,9 @@ class MesterSyncApp:
                 "exclude_folders": parse_csv_list(self.exclude_folders_var.get()),
                 "auto_import_delay_seconds": self.ui_int(self.auto_delay_var, 5),
                 "scan_interval_seconds": self.ui_int(self.scan_interval_var, 3, minimum=1),
-                "enable_duplicate_detection": bool(self.duplicate_var.get()),
+                "enable_duplicate_detection": True,
                 "checksum_database_path": self.checksum_path_var.get().strip(),
-                "check_existing_in_input": bool(self.check_input_var.get()),
+                "check_existing_in_input": True,
                 "file_stable_seconds": self.ui_int(self.stable_seconds_var, 10, minimum=1),
                 "copy_chunk_mb": self.ui_int(self.copy_chunk_var, 4, minimum=1),
                 "max_ready_wait_seconds": self.ui_int(self.max_wait_var, 7200, minimum=60),
@@ -573,10 +588,18 @@ class MesterSyncApp:
             self.saved_settings_snapshot = self.current_settings_snapshot()
             self.update_unsaved_settings_warning()
             self.update_startup_warning()
+            self.settings_autosave_error_notified = False
             return True
         except Exception as exc:
             self.unsaved_settings_var.set("Settings could not be saved")
             self.log(f"Automatic settings save failed: {exc}")
+            if not getattr(self, "settings_autosave_error_notified", False):
+                self.settings_autosave_error_notified = True
+                self.show_notification(
+                    "Settings could not be saved automatically. Your latest changes may be lost when the app closes. Check the data folder and try again.",
+                    "error",
+                    9000,
+                )
             return False
 
     def refresh_settings_ui_from_config(self) -> None:
@@ -597,8 +620,8 @@ class MesterSyncApp:
             self.max_wait_var.set(str(self.config.get("max_ready_wait_seconds", 7200)))
             self.low_disk_warning_var.set(str(self.config.get("low_disk_warning_gb", 20)))
             self.checksum_path_var.set(self.config.get("checksum_database_path", str(default_checksum_path())))
-            self.duplicate_var.set(bool(self.config.get("enable_duplicate_detection", True)))
-            self.check_input_var.set(bool(self.config.get("check_existing_in_input", True)))
+            self.duplicate_var.set(True)
+            self.check_input_var.set(True)
             self.auto_underscore_var.set(bool(self.config.get("auto_underscore_renames", False)))
             self.prevent_sleep_var.set(bool(self.config.get("prevent_sleep_while_working", True)))
             self.compact_dashboard = bool(self.config.get("compact_dashboard", True))
@@ -672,8 +695,12 @@ class MesterSyncApp:
         wizard.configure(bg=self.BG)
         wizard.transient(self.root)
         wizard.grab_set()
-        wizard.geometry("1040x900")
-        wizard.minsize(920, 820)
+        screen_width = max(800, int(wizard.winfo_screenwidth()))
+        screen_height = max(600, int(wizard.winfo_screenheight()))
+        wizard_width = min(1040, max(760, screen_width - 60))
+        wizard_height = min(900, max(600, screen_height - 100))
+        wizard.geometry(f"{wizard_width}x{wizard_height}")
+        wizard.minsize(min(920, wizard_width), min(700, wizard_height))
 
         values = {
             "input_folder": tk.StringVar(value=str(self.config.get("input_folder", ""))),
@@ -687,8 +714,8 @@ class MesterSyncApp:
             drive_choices.insert(0, "C:")
         ignored_drive_vars = {drive: tk.BooleanVar(value=drive in configured_ignored) for drive in drive_choices}
 
-        wrap = tk.Frame(wizard, bg=self.BG, padx=18, pady=16)
-        wrap.pack(fill="both", expand=True)
+        _wizard_canvas, wrap = self.make_canvas_area(wizard)
+        wrap.configure(padx=18, pady=16)
         title_row = tk.Frame(wrap, bg=self.BG)
         title_row.pack(fill="x")
         tk.Label(title_row, text=f"Welcome to {APP_NAME}", bg=self.BG, fg=self.TEXT, font=("Segoe UI", 22, "bold")).pack(side="left")
@@ -735,7 +762,7 @@ class MesterSyncApp:
             textvariable=wizard_notice_var,
             bg="#421f27",
             fg="#ffb4bd",
-            font=("Segoe UI", 9, "bold"),
+            font=("Segoe UI", 10, "bold"),
             justify="left",
             anchor="w",
             padx=10,
@@ -1013,6 +1040,7 @@ class MesterSyncApp:
     def load_pending_tasks(self) -> None:
         records = load_task_records()
         restored = 0
+        restored_checksums = 0
         with self.task_lock:
             for record in records:
                 if not isinstance(record, dict):
@@ -1021,6 +1049,18 @@ class MesterSyncApp:
                 if not task:
                     continue
                 self.tasks[task.task_id] = task
+                if task.original_checksum:
+                    with self.checksum_lock:
+                        if task.original_checksum not in self.checksum_db:
+                            known_path = task.nas_path or task.output_path or task.local_input_path or task.original_path
+                            self.checksum_db[task.original_checksum] = {
+                                "original_name": task.display_name,
+                                "original_size": task.imported_size,
+                                "path": str(known_path),
+                                "final_path": str(known_path),
+                                "updated_at": now_iso(),
+                            }
+                            restored_checksums += 1
                 for p in [task.original_path, task.local_input_path, task.output_path, task.nas_path]:
                     if p:
                         self.task_by_path[path_key(p)] = task.task_id
@@ -1031,24 +1071,42 @@ class MesterSyncApp:
             self.emit_task(task_id)
         if restored:
             self.log(f"Restored {restored} pending task(s) from the previous session.")
+        if restored_checksums:
+            self.save_checksum_database()
 
     def load_checksum_database(self) -> None:
         cfg = self.get_config() if hasattr(self, "config_lock") else self.config
+        records = load_checksum_records(Path(cfg.get("checksum_database_path", "")))
+        for history in getattr(self, "history_records", []):
+            digest = str(history.get("original_checksum") or "").strip().lower()
+            if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+                continue
+            final_path = str(history.get("path") or history.get("input_path") or "")
+            records.setdefault(
+                digest,
+                {
+                    "original_name": str(history.get("display_name") or ""),
+                    "original_size": history.get("original_size"),
+                    "path": final_path,
+                    "final_path": final_path,
+                    "updated_at": now_iso(),
+                },
+            )
         with self.checksum_lock:
-            self.checksum_db = load_checksum_records(Path(cfg.get("checksum_database_path", "")))
+            self.checksum_db = records
 
-    def save_checksum_database(self) -> None:
+    def save_checksum_database(self) -> bool:
         try:
             path = Path(self.get_config().get("checksum_database_path", ""))
             with self.checksum_lock:
                 records = dict(self.checksum_db)
                 save_checksum_records(path, records)
+            return True
         except Exception as exc:
             self.emit_log(f"Warning: could not save checksum database: {exc}")
+            return False
 
     def duplicate_reason_for(self, path: Path, cfg: Dict[str, Any], task_id: Optional[str] = None) -> str:
-        if not bool(cfg.get("enable_duplicate_detection", True)):
-            return ""
         with self.checksum_lock:
             checksum_db = dict(self.checksum_db)
         progress_phase = ""
@@ -1069,11 +1127,24 @@ class MesterSyncApp:
                     eta_seconds=eta,
                 )
                 self.set_import_progress_snapshot(task_id, f"Import/watching: {phase.lower()} for {path.name}", percent, eta)
-        return exact_duplicate_reason(path, cfg, checksum_db, self.import_cancel_requested, on_progress)
+        return exact_duplicate_reason(
+            path,
+            cfg,
+            checksum_db,
+            self.import_cancel_requested,
+            on_progress,
+            getattr(self, "duplicate_fingerprint_cache", None),
+        )
+
+    def duplicate_reason_for_import_task(self, task: TaskState, cfg: Dict[str, Any]) -> str:
+        """Honor an explicit Import anyway choice until that import succeeds."""
+        if task.force_import:
+            self.emit_log(f"Import anyway override accepted; skipping duplicate detection: {task.display_name}")
+            return ""
+        return self.duplicate_reason_for(task.original_path, cfg, task.task_id)
 
     def remember_checksum(self, path: Path) -> None:
-        cfg = self.get_config()
-        if not bool(cfg.get("enable_duplicate_detection", True)) or not path.exists():
+        if not path.exists():
             return
         digest = sha256_file(path)
         if digest:
@@ -1083,9 +1154,10 @@ class MesterSyncApp:
                 size = None
             self.remember_original_checksum(digest, path.name, size, path)
 
-    def remember_original_checksum(self, digest: str, original_name: str, original_size: Optional[int], path: Path) -> None:
+    def remember_original_checksum(self, digest: str, original_name: str, original_size: Optional[int], path: Path) -> bool:
         if not digest:
-            return
+            return False
+        sampled_fingerprint = quick_fingerprint(path, getattr(self, "shutdown_event", None))
         with self.checksum_lock:
             old = self.checksum_db.get(digest)
             record = dict(old) if isinstance(old, dict) else {}
@@ -1098,8 +1170,10 @@ class MesterSyncApp:
                     "updated_at": now_iso(),
                 }
             )
+            if sampled_fingerprint:
+                record["quick_fingerprint"] = sampled_fingerprint
             self.checksum_db[digest] = record
-        self.save_checksum_database()
+        return self.save_checksum_database()
 
     def update_checksum_final_path(self, task: TaskState, final_path: Path) -> None:
         digest = task.original_checksum
@@ -1121,8 +1195,7 @@ class MesterSyncApp:
         self.save_checksum_database()
 
     def remember_checksum_async(self, path: Path) -> None:
-        cfg = self.get_config()
-        if not bool(cfg.get("enable_duplicate_detection", True)) or not path.exists():
+        if not path.exists():
             return
         key = path_key(path)
         if key in self.checksum_generation_requested:
@@ -1133,11 +1206,8 @@ class MesterSyncApp:
 
     def ensure_task_source_fingerprint(self, task_id: str, source: Path) -> bool:
         """Remember directly watched sources before their working copy is removed."""
-        cfg = self.get_config()
-        if not bool(cfg.get("enable_duplicate_detection", True)):
-            return True
         task = self.tasks.get(task_id)
-        if not task or task.convert_in_place or task.original_checksum:
+        if not task or task.convert_in_place:
             return True
         try:
             source_size = source.stat().st_size
@@ -1157,6 +1227,13 @@ class MesterSyncApp:
             )
             self.emit_progress("conversion", f"Remembering source: {source.name}", percent, eta)
 
+        if task.original_checksum:
+            with self.checksum_lock:
+                already_remembered = task.original_checksum in self.checksum_db
+            if already_remembered:
+                return self.save_checksum_database()
+            return self.remember_original_checksum(task.original_checksum, source.name, source_size, source)
+
         digest = sha256_file(source, task.import_stop_event, on_progress)
         if not digest:
             return False
@@ -1165,8 +1242,7 @@ class MesterSyncApp:
             if not current:
                 return False
             current.original_checksum = digest
-        self.remember_original_checksum(digest, source.name, source_size, source)
-        return True
+        return self.remember_original_checksum(digest, source.name, source_size, source)
 
     def ensure_checksum_worker_running(self) -> None:
         if self.checksum_worker_started:
@@ -1222,12 +1298,21 @@ class MesterSyncApp:
         style.configure("RowError.Horizontal.TProgressbar", troughcolor=self.CARD3, background=self.RED, lightcolor=self.RED, darkcolor=self.RED, bordercolor=self.CARD3, thickness=10)
         # Readable dropdowns. The rest of the UI is dark, but Tk's dropdown list
         # becomes hard to read with white text on a grey native listbox.
-        style.configure("TCombobox", fieldbackground="#ffffff", background="#ffffff", foreground="#000000", arrowcolor="#000000")
+        style.configure(
+            "TCombobox",
+            fieldbackground="#ffffff",
+            background="#ffffff",
+            foreground="#000000",
+            arrowcolor="#000000",
+            font=("Segoe UI", 10),
+            padding=5,
+        )
         style.map("TCombobox", fieldbackground=[("readonly", "#ffffff")], foreground=[("readonly", "#000000")], selectbackground=[("readonly", "#d7e8ff")], selectforeground=[("readonly", "#000000")])
         self.root.option_add("*TCombobox*Listbox.background", "#ffffff")
         self.root.option_add("*TCombobox*Listbox.foreground", "#000000")
         self.root.option_add("*TCombobox*Listbox.selectBackground", "#d7e8ff")
         self.root.option_add("*TCombobox*Listbox.selectForeground", "#000000")
+        self.root.option_add("*TCombobox*Listbox.font", ("Segoe UI", 10))
         style.configure("Vertical.TScrollbar", background=self.CARD3, troughcolor=self.CARD, bordercolor=self.BORDER, arrowcolor=self.TEXT)
 
     def build_notification_toast(self) -> None:
@@ -1240,20 +1325,171 @@ class MesterSyncApp:
             textvariable=self.notification_var,
             bg=self.CARD2,
             fg=self.TEXT,
-            font=("Segoe UI", 9, "bold"),
+            font=("Segoe UI", 10, "bold"),
             justify="left",
             anchor="w",
             wraplength=520,
         )
         self.notification_label.pack(side="left", fill="x", expand=True)
-        self.small_button(self.notification_inner, "Dismiss", self.hide_notification, self.CARD3).pack(side="right", padx=(12, 0))
+        self.close_button(self.notification_inner, self.hide_notification, self.CARD3).pack(side="right", padx=(12, 0), anchor="n")
+
+        self.persistent_notification_frame = tk.Frame(self.main, bg=self.GREEN, highlightthickness=0)
+        self.persistent_notification_inner = tk.Frame(self.persistent_notification_frame, bg=self.DARK_GREEN, padx=12, pady=10)
+        self.persistent_notification_inner.pack(fill="both", expand=True, padx=2, pady=2)
+        self.persistent_notification_var = tk.StringVar(value="")
+        tk.Label(
+            self.persistent_notification_inner,
+            textvariable=self.persistent_notification_var,
+            bg=self.DARK_GREEN,
+            fg="#a9f3c5",
+            font=("Segoe UI", 10, "bold"),
+            justify="left",
+            anchor="w",
+            wraplength=500,
+        ).pack(side="left", fill="x", expand=True)
+        self.close_button(
+            self.persistent_notification_inner,
+            self.collapse_persistent_notifications,
+            self.GREEN,
+        ).pack(side="right", padx=(12, 0), anchor="n")
+
+        self.notification_history_frame = tk.Frame(self.main, bg=self.BORDER, highlightthickness=0)
+        history_inner = tk.Frame(self.notification_history_frame, bg=self.CARD, padx=12, pady=10)
+        history_inner.pack(fill="both", expand=True, padx=2, pady=2)
+        history_header = tk.Frame(history_inner, bg=self.CARD)
+        history_header.pack(fill="x", pady=(0, 8))
+        tk.Label(history_header, text="Latest notifications", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 12, "bold")).pack(side="left")
+        self.close_button(history_header, self.toggle_notification_history, self.CARD3).pack(side="right")
+        self.notification_dismiss_all_button = self.small_button(
+            history_header,
+            "Dismiss all",
+            self.dismiss_all_notifications,
+            self.CARD3,
+        )
+        self.notification_dismiss_all_button.pack(side="right", padx=(0, 8))
+        self.notification_history_items = tk.Frame(history_inner, bg=self.CARD)
+        self.notification_history_items.pack(fill="both", expand=True)
+
+        self.notification_history_button = self.small_button(
+            self.main,
+            "Notifications",
+            self.toggle_notification_history,
+            self.CARD3,
+        )
+        self.notification_history_button.configure(font=("Segoe UI", 10, "bold"), padx=12, pady=7)
+        self.notification_history_button.place(relx=1.0, rely=1.0, x=-48, y=-22, anchor="se")
+        self.notification_history_button.lift()
+        self.refresh_notification_history_ui()
+
+    def close_button(self, parent: tk.Widget, command: Callable[[], None], bg: str) -> tk.Button:
+        return tk.Button(
+            parent,
+            text="X",
+            command=command,
+            bg=bg,
+            fg="white",
+            activebackground=bg,
+            activeforeground="white",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            padx=7,
+            pady=3,
+            font=("Segoe UI", 10, "bold"),
+            cursor="hand2",
+        )
+
+    def remember_notification(self, text: str, level: str) -> str:
+        compact = compact_notification_text(text)
+        if not compact:
+            return ""
+        if not hasattr(self, "notification_history"):
+            self.notification_history = deque(maxlen=20)
+        self.notification_history.appendleft((now_text(), compact, level))
+        self.refresh_notification_history_ui()
+        return compact
+
+    def refresh_notification_history_ui(self) -> None:
+        count = min(3, len(getattr(self, "notification_history", [])))
+        active_count = len(getattr(self, "persistent_notifications", {}))
+        active_texts = {notice.get("text", "") for notice in getattr(self, "persistent_notifications", {}).values()}
+        button = getattr(self, "notification_history_button", None)
+        if button:
+            label = f"Notifications ({count})" if count else "Notifications"
+            if active_count:
+                label += f" · {active_count} active"
+            bg = self.GREEN if active_count else self.CARD3
+            button.configure(text=label, bg=bg, activebackground=bg)
+        dismiss_button = getattr(self, "notification_dismiss_all_button", None)
+        if dismiss_button:
+            has_dismissible = (
+                any(text not in active_texts for _timestamp, text, _level in getattr(self, "notification_history", []))
+                or bool(getattr(self, "notification_queue", []))
+                or bool(getattr(self, "notification_active", False))
+            )
+            dismiss_button.configure(state="normal" if has_dismissible else "disabled")
+        holder = getattr(self, "notification_history_items", None)
+        if not holder:
+            return
+        for child in holder.winfo_children():
+            child.destroy()
+        latest = list(getattr(self, "notification_history", []))[:3]
+        if not latest:
+            tk.Label(holder, text="No notifications yet.", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 10), anchor="w").pack(fill="x", pady=6)
+            return
+        colors = {
+            "info": ("#102b46", "#b9dcff"),
+            "success": (self.DARK_GREEN, "#a9f3c5"),
+            "warning": ("#3a3114", "#ffd36a"),
+            "error": ("#421f27", "#ffb4bd"),
+        }
+        for timestamp, text, level in latest:
+            bg, fg = colors.get(level, colors["info"])
+            row = tk.Frame(holder, bg=bg, padx=10, pady=8)
+            row.pack(fill="x", pady=(0, 6))
+            status_text = f"ACTIVE · {timestamp}" if text in active_texts else timestamp
+            tk.Label(row, text=status_text, bg=bg, fg=fg, font=("Segoe UI", 8, "bold"), anchor="w").pack(anchor="w")
+            tk.Label(row, text=text, bg=bg, fg=fg, font=("Segoe UI", 9), justify="left", anchor="w", wraplength=510).pack(fill="x", pady=(2, 0))
+
+    def toggle_notification_history(self) -> None:
+        self.notification_history_open = not self.notification_history_open
+        if self.notification_history_open:
+            self.hide_notification()
+            self.persistent_notification_frame.place_forget()
+            self.refresh_notification_history_ui()
+            self.notification_history_frame.place(relx=1.0, rely=1.0, x=-48, y=-68, anchor="se", width=570)
+            self.notification_history_frame.lift()
+            return
+        self.notification_history_frame.place_forget()
+        self.refresh_persistent_notifications()
+        self.show_next_queued_notification()
+
+    def dismiss_all_notifications(self) -> None:
+        """Clear transient notices while preserving unresolved drive-ready status."""
+        self.notification_queue.clear()
+        if self.notification_after_id is not None:
+            try:
+                self.root.after_cancel(self.notification_after_id)
+            except Exception:
+                pass
+            self.notification_after_id = None
+        if hasattr(self, "notification_frame"):
+            self.notification_frame.place_forget()
+        self.notification_active = False
+        active_texts = {notice.get("text", "") for notice in self.persistent_notifications.values()}
+        kept = [item for item in self.notification_history if item[1] in active_texts]
+        self.notification_history = deque(kept, maxlen=20)
+        self.refresh_notification_history_ui()
 
     def show_notification(self, text: str, level: str = "info", duration_ms: Optional[int] = None) -> None:
+        compact = self.remember_notification(str(text), level)
         if not hasattr(self, "notification_frame"):
             self.log(str(text))
             return
         delay = duration_ms if duration_ms is not None else (9000 if level == "error" else 5500)
-        payload = (compact_notification_text(text), level, max(1000, int(delay)))
+        payload = (compact, level, max(1000, int(delay)))
+        if getattr(self, "notification_history_open", False):
+            return
         if self.notification_active:
             self.notification_queue.append(payload)
             return
@@ -1275,7 +1511,7 @@ class MesterSyncApp:
         for child in self.notification_inner.winfo_children():
             if child is not self.notification_label and isinstance(child, tk.Button):
                 child.configure(bg=self.CARD3, activebackground=self.CARD3)
-        self.notification_frame.place(relx=1.0, rely=1.0, x=-24, y=-24, anchor="se", width=570)
+        self.place_active_notification()
         self.notification_frame.lift()
         if self.notification_after_id is not None:
             try:
@@ -1283,6 +1519,13 @@ class MesterSyncApp:
             except Exception:
                 pass
         self.notification_after_id = self.root.after(delay, self.hide_notification)
+
+    def place_active_notification(self) -> None:
+        if not hasattr(self, "notification_frame"):
+            return
+        pinned_visible = bool(getattr(self, "persistent_notifications", {})) and not getattr(self, "persistent_notifications_collapsed", False) and not getattr(self, "notification_history_open", False)
+        y_offset = -160 if pinned_visible else -68
+        self.notification_frame.place(relx=1.0, rely=1.0, x=-48, y=y_offset, anchor="se", width=570)
 
     def hide_notification(self) -> None:
         if self.notification_after_id is not None:
@@ -1294,10 +1537,15 @@ class MesterSyncApp:
         if hasattr(self, "notification_frame"):
             self.notification_frame.place_forget()
         self.notification_active = False
-        if self.notification_queue:
-            payload = self.notification_queue.popleft()
-            self.notification_active = True
-            self.root.after(80, lambda p=payload: self.display_notification(p))
+        if not getattr(self, "notification_history_open", False):
+            self.show_next_queued_notification()
+
+    def show_next_queued_notification(self) -> None:
+        if self.notification_active or getattr(self, "notification_history_open", False) or not self.notification_queue:
+            return
+        payload = self.notification_queue.popleft()
+        self.notification_active = True
+        self.root.after(80, lambda p=payload: self.display_notification(p))
 
     def button(self, parent: tk.Widget, text: str, command: Callable[[], None], bg: str, fg: str = "white", padx: int = 12) -> tk.Button:
         return tk.Button(parent, text=text, command=command, bg=bg, fg=fg, activebackground=bg, activeforeground=fg, relief="flat", bd=0, highlightthickness=2, highlightbackground=self.BORDER, padx=padx, pady=8, font=("Segoe UI", 10, "bold"), cursor="hand2")
@@ -1319,9 +1567,11 @@ class MesterSyncApp:
         self.main.pack(fill="both", expand=True)
         self.build_header()
         self.build_top_bar()
-        self.build_notification_toast()
         self.build_stage_cards()
         self.build_body()
+        # Build overlays last so the floating notification controls stay above
+        # the Dashboard, History, and Settings surfaces.
+        self.build_notification_toast()
         self.update_status()
 
     def build_header(self) -> None:
@@ -1359,13 +1609,16 @@ class MesterSyncApp:
 
     def build_top_bar(self) -> None:
         bar = self.card_frame(self.main, fill="x", padx=18, pady=(0, 10))
+        bar.configure(padx=16, pady=14)
         self.start_btn = self.button(bar, "Start all", self.toggle_start_all, self.GREEN)
         self.start_btn.pack(side="left")
         self.pause_btn = self.button(bar, "Pause", self.toggle_pause, self.YELLOW)
         self.pause_btn.pack(side="left", padx=(10, 0))
         self.log_toggle = self.button(bar, "Log", self.toggle_log, self.CARD3)
         self.log_toggle.pack(side="left", padx=(10, 0))
-        self.top_log_outer = tk.Frame(bar, bg=self.BORDER, height=48)
+        for control in (self.start_btn, self.pause_btn, self.log_toggle):
+            control.configure(font=("Segoe UI", 11, "bold"), pady=10, padx=15)
+        self.top_log_outer = tk.Frame(bar, bg=self.BORDER, height=58)
         self.top_log_outer.pack_propagate(False)
         top_log_panel = tk.Frame(self.top_log_outer, bg="#07111e", padx=5, pady=4)
         top_log_panel.pack(fill="both", expand=True, padx=2, pady=2)
@@ -1376,7 +1629,7 @@ class MesterSyncApp:
             fg="#d7e8ff",
             insertbackground="#d7e8ff",
             relief="flat",
-            font=("Consolas", 8),
+            font=("Consolas", 9),
             state="disabled",
             wrap="word",
         )
@@ -1387,16 +1640,12 @@ class MesterSyncApp:
         self.small_button(self.startup_warning_frame, "Setup", self.run_setup_wizard, "#5c4517").pack(side="left", padx=(10, 0))
         self.thumbnail_queue_var = tk.StringVar(value="Previews: idle")
         self.thumbnail_queue_label = tk.Label(bar, textvariable=self.thumbnail_queue_var, bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 9, "bold"), anchor="w", padx=10, pady=6)
-        self.disk_ready_var = tk.StringVar(value="")
-        self.disk_ready_frame = tk.Frame(bar, bg=self.DARK_GREEN, padx=10, pady=6)
-        tk.Label(self.disk_ready_frame, textvariable=self.disk_ready_var, bg=self.DARK_GREEN, fg="#8ff0b8", font=("Segoe UI", 9, "bold"), anchor="w").pack(side="left")
-        self.small_button(self.disk_ready_frame, "Dismiss", self.hide_disk_ready, self.GREEN).pack(side="left", padx=(10, 0))
         self.unsaved_settings_var = tk.StringVar(value="")
         tk.Label(bar, textvariable=self.unsaved_settings_var, bg=self.CARD, fg=self.RED, font=("Segoe UI", 12, "bold")).pack(side="left", padx=(18, 0))
 
         preset_area = tk.Frame(bar, bg=self.CARD)
         preset_area.pack(side="right")
-        tk.Label(preset_area, text="Default preset", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 8))
+        tk.Label(preset_area, text="Default preset", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 8))
         top_preset_values = self.preset_menu_values()
         saved_top_preset = self.config.get("default_preset_name", "Current settings")
         if saved_top_preset not in top_preset_values:
@@ -1494,6 +1743,10 @@ class MesterSyncApp:
     def show_tab(self, key: str) -> None:
         if key not in self.tab_buttons:
             return
+        if self.current_tab == "dashboard" and key != "dashboard":
+            # Selection is a temporary Dashboard context, not a sticky app mode.
+            # Leaving the page dismisses it so a later action cannot use stale rows.
+            self.clear_task_selection()
         if self.current_tab == "history" and key != "history":
             self.cancel_history_render(mark_dirty=True)
         for k, b in self.tab_buttons.items():
@@ -1571,6 +1824,12 @@ class MesterSyncApp:
         if not hasattr(self, "dashboard_canvas"):
             return
         order = self.ordered_task_ids()
+        empty_state = getattr(self, "dashboard_empty_state", None)
+        if empty_state:
+            if order and empty_state.winfo_manager():
+                empty_state.pack_forget()
+            elif not order and not empty_state.winfo_manager():
+                empty_state.pack(fill="x", padx=8, pady=18, before=self.dashboard_bottom_spacer)
         extent = self.dashboard_row_extent()
         try:
             scroll_top = float(self.dashboard_canvas.canvasy(0))
@@ -1750,8 +2009,11 @@ class MesterSyncApp:
 
     def build_dashboard(self) -> None:
         header = self.card_frame(self.dashboard_frame, fill="x", pady=(0, 10))
-        header.configure(padx=10, pady=7)
-        left = tk.Frame(header, bg=self.CARD)
+        self.dashboard_header = header
+        header.configure(padx=12, pady=6)
+        header_top = tk.Frame(header, bg=self.CARD)
+        header_top.pack(fill="x")
+        left = tk.Frame(header_top, bg=self.CARD)
         left.pack(side="left", fill="both", expand=True)
         title_row = tk.Frame(left, bg=self.CARD)
         title_row.pack(fill="x")
@@ -1759,22 +2021,38 @@ class MesterSyncApp:
         self.session_summary_var = tk.StringVar(value="")
         self.session_summary_label = tk.Label(title_row, textvariable=self.session_summary_var, bg=self.CARD2, fg="#b9c7d8", font=("Segoe UI", 9, "bold"), anchor="w", padx=8, pady=3)
         self.update_session_summary()
-        right = tk.Frame(header, bg=self.CARD)
+        right = tk.Frame(header_top, bg=self.CARD)
         right.pack(side="right")
         self.add_files_button = self.button(right, "Add files", self.add_files_dialog, self.CARD3)
         self.add_files_button.pack(side="left", padx=(0, 8))
         self.scan_button = self.button(right, "Scan now", self.manual_scan, self.CARD3)
         self.scan_button.pack(side="left", padx=(0, 8))
-        self.convert_in_place_button = self.button(right, "Convert in place", self.convert_in_place_selected, self.CARD3)
+        self.convert_in_place_button = self.button(right, "Convert files in place...", self.choose_convert_in_place_files, self.CARD3)
         self.convert_in_place_button.pack(side="left")
-        self.batch_frame = tk.Frame(left, bg=self.CARD2, padx=10, pady=10)
+        for control in (self.add_files_button, self.scan_button, self.convert_in_place_button):
+            control.configure(pady=6)
+
+        # A contextual action bar keeps the current scope visible. Multi-file
+        # renaming exists only here; an inline filename editor always edits one row.
+        self.batch_frame = tk.Frame(header, bg="#102b46", padx=10, pady=10, highlightthickness=2, highlightbackground=self.BLUE)
+        selection_actions = tk.Frame(self.batch_frame, bg="#102b46")
+        selection_actions.pack(fill="x")
+        self.selection_summary_var = tk.StringVar(value="")
+        tk.Label(selection_actions, textvariable=self.selection_summary_var, bg="#102b46", fg="#d7e8ff", font=("Segoe UI", 10, "bold")).pack(side="left")
+        self.small_button(selection_actions, "Clear selection", self.clear_task_selection, self.CARD3).pack(side="right")
+        self.selection_convert_btn = self.small_button(selection_actions, "Convert selected in place", self.convert_in_place_selected, self.BLUE)
+        self.selection_convert_btn.pack(side="right", padx=(0, 8))
+        self.selection_skip_btn = self.small_button(selection_actions, "Skip selected", self.skip_selected_tasks, self.RED)
+        self.selection_skip_btn.pack(side="right", padx=(0, 8))
+
+        self.batch_rename_row = tk.Frame(self.batch_frame, bg="#102b46")
         self.batch_name_var = tk.StringVar()
         self.batch_prefix_var = tk.BooleanVar(value=False)
         self.batch_suffix_var = tk.BooleanVar(value=False)
-        tk.Label(self.batch_frame, text="Batch rename", bg=self.CARD2, fg=self.TEXT, font=("Segoe UI", 10, "bold")).pack(side="left")
-        tk.Entry(self.batch_frame, textvariable=self.batch_name_var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat", width=26).pack(side="left", padx=(10, 8), ipady=3)
+        tk.Label(self.batch_rename_row, text="Rename selected", bg="#102b46", fg=self.TEXT, font=("Segoe UI", 10, "bold")).pack(side="left")
+        tk.Entry(self.batch_rename_row, textvariable=self.batch_name_var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat", width=24, font=("Segoe UI", 10)).pack(side="left", padx=(10, 8), ipady=4)
         self.batch_prefix_btn = tk.Checkbutton(
-            self.batch_frame,
+            self.batch_rename_row,
             text="Prefix",
             variable=self.batch_prefix_var,
             command=lambda: self.on_batch_affix_toggle("prefix"),
@@ -1793,7 +2071,7 @@ class MesterSyncApp:
         )
         self.batch_prefix_btn.pack(side="left", padx=(0, 6))
         self.batch_suffix_btn = tk.Checkbutton(
-            self.batch_frame,
+            self.batch_rename_row,
             text="Suffix",
             variable=self.batch_suffix_var,
             command=lambda: self.on_batch_affix_toggle("suffix"),
@@ -1811,17 +2089,47 @@ class MesterSyncApp:
             cursor="hand2",
         )
         self.batch_suffix_btn.pack(side="left", padx=(0, 8))
-        self.small_button(self.batch_frame, "Apply", self.apply_batch_box_rename, self.GREEN).pack(side="left")
-        self.small_button(self.batch_frame, "Skip selected", self.skip_selected_tasks, self.RED).pack(side="left", padx=(8, 0))
+        self.batch_apply_btn = self.small_button(self.batch_rename_row, "Rename selected files", self.apply_batch_box_rename, self.GREEN)
+        self.batch_apply_btn.pack(side="left")
         self.batch_hint_var = tk.StringVar(value="")
-        tk.Label(self.batch_frame, textvariable=self.batch_hint_var, bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(10, 0))
+        tk.Label(self.batch_rename_row, textvariable=self.batch_hint_var, bg="#102b46", fg="#c2d8ef", font=("Segoe UI", 9)).pack(side="left", padx=(10, 0))
         self.dashboard_canvas, self.dashboard_inner = self.make_canvas_area(self.dashboard_frame)
+        self.dashboard_canvas.bind("<Button-1>", self.clear_task_selection, add="+")
         self.dashboard_top_spacer = tk.Frame(self.dashboard_inner, bg=self.BG, height=1)
         self.dashboard_top_spacer.pack(fill="x")
         self.dashboard_top_spacer.pack_propagate(False)
         self.dashboard_bottom_spacer = tk.Frame(self.dashboard_inner, bg=self.BG, height=1)
         self.dashboard_bottom_spacer.pack(fill="x")
         self.dashboard_bottom_spacer.pack_propagate(False)
+        self.dashboard_empty_state = tk.Frame(
+            self.dashboard_inner,
+            bg=self.CARD,
+            padx=28,
+            pady=26,
+            highlightthickness=2,
+            highlightbackground=self.BORDER,
+        )
+        tk.Label(
+            self.dashboard_empty_state,
+            text="No active files",
+            bg=self.CARD,
+            fg=self.TEXT,
+            font=("Segoe UI", 16, "bold"),
+        ).pack()
+        tk.Label(
+            self.dashboard_empty_state,
+            text="Drop videos here, add files from your computer, or scan the configured Importfolder.",
+            bg=self.CARD,
+            fg=self.MUTED,
+            font=("Segoe UI", 10),
+            justify="center",
+            wraplength=650,
+        ).pack(pady=(7, 14))
+        empty_actions = tk.Frame(self.dashboard_empty_state, bg=self.CARD)
+        empty_actions.pack()
+        self.button(empty_actions, "Add files", self.add_files_dialog, self.BLUE).pack(side="left", padx=(0, 8))
+        self.button(empty_actions, "Scan Importfolder", self.manual_scan, self.CARD3).pack(side="left")
+        self.dashboard_empty_state.pack(fill="x", padx=8, pady=18, before=self.dashboard_bottom_spacer)
         self.dashboard_canvas._view_changed_callback = self.schedule_dashboard_virtual_refresh  # type: ignore[attr-defined]
         self.enable_dashboard_drop_targets(header, left, right, self.dashboard_frame, self.dashboard_canvas, self.dashboard_inner)
     def build_history(self) -> None:
@@ -1972,8 +2280,15 @@ class MesterSyncApp:
         )
         checkrow = tk.Frame(misc, bg=self.CARD)
         checkrow.pack(fill="x", pady=(10, 0))
-        self.add_checkbox(checkrow, "Enable duplicate detection", self.duplicate_var)
-        self.add_checkbox(checkrow, "Check same-name watchfolder files by exact content", self.check_input_var)
+        tk.Label(
+            checkrow,
+            text="Exact duplicate protection is always on. Only Import anyway can override a confirmed match.",
+            bg=self.CARD,
+            fg=self.GREEN,
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+            justify="left",
+        ).pack(side="left")
         self.add_checkbox(checkrow, "Change spaces to underscores in renamed files", self.auto_underscore_var)
         self.add_checkbox(checkrow, "Prevent sleep while working", self.prevent_sleep_var)
         self.small_button(checkrow, "Clean thumbnails", self.cleanup_thumbnail_cache, self.CARD3).pack(side="left", padx=(12, 0))
@@ -1983,7 +2298,7 @@ class MesterSyncApp:
         folder_row = tk.Frame(ff, bg=self.CARD2, padx=10, pady=10, highlightthickness=2, highlightbackground=self.BORDER)
         folder_row.pack(fill="x", pady=(10, 8))
         tk.Label(folder_row, text="FFmpeg preset folder", bg=self.CARD2, fg=self.TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        tk.Label(folder_row, text="Choose the folder that contains .txt preset files. Press Refresh list after adding new presets to this folder.", bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 8), wraplength=780, justify="left").pack(anchor="w", pady=(2, 8))
+        tk.Label(folder_row, text="Choose the folder that contains .txt preset files. Press Refresh list after adding new presets to this folder.", bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 9), wraplength=780, justify="left").pack(anchor="w", pady=(2, 8))
         folder_controls = tk.Frame(folder_row, bg=self.CARD2)
         folder_controls.pack(fill="x")
         tk.Entry(folder_controls, textvariable=self.preset_folder_var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat").pack(side="left", fill="x", expand=True, ipady=5)
@@ -2198,7 +2513,7 @@ class MesterSyncApp:
         box = tk.Frame(parent, bg=self.CARD2, padx=10, pady=10, highlightthickness=2, highlightbackground=self.BORDER)
         box.grid(row=row, column=col, sticky="nsew", padx=7, pady=7)
         tk.Label(box, text=label, bg=self.CARD2, fg=self.TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        tk.Label(box, text=help_text, bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 8), wraplength=240, justify="left").pack(anchor="w", pady=(2, 8))
+        tk.Label(box, text=help_text, bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 9), wraplength=240, justify="left").pack(anchor="w", pady=(2, 8))
         tk.Entry(box, textvariable=var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat").pack(fill="x", ipady=5)
 
     def add_browse_field(
@@ -2216,7 +2531,7 @@ class MesterSyncApp:
         box = tk.Frame(parent, bg=self.CARD2, padx=10, pady=10, highlightthickness=2, highlightbackground=self.BORDER)
         box.grid(row=row, column=col, sticky="nsew", padx=7, pady=7)
         tk.Label(box, text=label, bg=self.CARD2, fg=self.TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        tk.Label(box, text=help_text, bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 8), wraplength=240, justify="left").pack(anchor="w", pady=(2, 8))
+        tk.Label(box, text=help_text, bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 9), wraplength=240, justify="left").pack(anchor="w", pady=(2, 8))
         row_frame = tk.Frame(box, bg=self.CARD2)
         row_frame.pack(fill="x")
         tk.Entry(row_frame, textvariable=var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat").pack(side="left", fill="x", expand=True, ipady=5)
@@ -2242,23 +2557,89 @@ class MesterSyncApp:
         self.update_preset_status()
         self.on_setting_changed()
 
-    def show_disk_ready(self, text: str) -> None:
-        if not text:
-            self.hide_disk_ready()
+    def show_disk_ready(self, payload: Any) -> None:
+        if not payload:
             return
-        self.disk_ready_var.set(text)
-        if not self.disk_ready_frame.winfo_ismapped():
-            self.disk_ready_frame.pack(side="left", padx=(12, 0))
+        if not hasattr(self, "persistent_notifications"):
+            self.persistent_notifications = {}
+        if not hasattr(self, "persistent_notifications_collapsed"):
+            self.persistent_notifications_collapsed = False
+        if isinstance(payload, dict):
+            text = compact_notification_text(payload.get("text", ""))
+            drive_id = str(payload.get("drive_id") or payload.get("root") or text)
+            root = str(payload.get("root") or "")
+        else:
+            text = compact_notification_text(payload)
+            drive_id = text
+            root = ""
+        if not text:
+            return
+        self.persistent_notifications[drive_id] = {"text": text, "root": root}
+        self.persistent_notifications_collapsed = False
+        self.remember_notification(text, "success")
+        self.refresh_persistent_notifications()
         try:
             self.root.bell()
         except tk.TclError:
             pass
 
-    def hide_disk_ready(self) -> None:
-        if hasattr(self, "disk_ready_frame") and self.disk_ready_frame.winfo_ismapped():
-            self.disk_ready_frame.pack_forget()
-        if hasattr(self, "disk_ready_var"):
-            self.disk_ready_var.set("")
+    def refresh_persistent_notifications(self) -> None:
+        frame = getattr(self, "persistent_notification_frame", None)
+        if not frame:
+            return
+        if not self.persistent_notifications or self.persistent_notifications_collapsed or self.notification_history_open:
+            frame.place_forget()
+            if self.notification_active:
+                self.place_active_notification()
+            self.refresh_notification_history_ui()
+            return
+        notices = list(self.persistent_notifications.values())
+        if len(notices) == 1:
+            text = f"{notices[0]['text']}\nThis stays active until the drive is disconnected."
+        else:
+            roots = [notice.get("root") or notice.get("text", "Drive") for notice in notices]
+            text = f"{len(notices)} drives are ready to remove: {' · '.join(roots)}\nThis stays active until the drives are disconnected."
+        self.persistent_notification_var.set(text)
+        frame.place(relx=1.0, rely=1.0, x=-48, y=-68, anchor="se", width=570)
+        frame.lift()
+        if self.notification_active:
+            self.place_active_notification()
+            self.notification_frame.lift()
+        history_button = getattr(self, "notification_history_button", None)
+        if history_button:
+            history_button.lift()
+        self.refresh_notification_history_ui()
+
+    def collapse_persistent_notifications(self) -> None:
+        self.persistent_notifications_collapsed = True
+        self.refresh_persistent_notifications()
+
+    def hide_disk_ready(self, drive_id: Optional[str] = None) -> None:
+        if drive_id is None:
+            self.persistent_notifications.clear()
+        else:
+            self.persistent_notifications.pop(str(drive_id), None)
+        if not self.persistent_notifications:
+            self.persistent_notifications_collapsed = False
+        self.refresh_persistent_notifications()
+
+    def prune_removed_drive_notifications(self) -> None:
+        removed: List[str] = []
+        for drive_id, notice in list(self.persistent_notifications.items()):
+            root = str(notice.get("root") or "").strip()
+            if not root:
+                continue
+            try:
+                if not Path(root).exists():
+                    removed.append(drive_id)
+            except OSError:
+                removed.append(drive_id)
+        for drive_id in removed:
+            self.persistent_notifications.pop(drive_id, None)
+        if removed:
+            if not self.persistent_notifications:
+                self.persistent_notifications_collapsed = False
+            self.refresh_persistent_notifications()
 
     def browse_folder(self, var: tk.StringVar) -> None:
         path = filedialog.askdirectory(initialdir=var.get() or str(Path.home()))
@@ -2398,6 +2779,7 @@ class MesterSyncApp:
             self.log(f"Default preset saved: {name}")
         except Exception as exc:
             self.log(f"Warning: could not auto-save default preset: {exc}")
+            self.show_notification("The default preset could not be saved. Your selection may be lost when the app closes.", "error")
 
     def ensure_default_preset(self) -> None:
         default = self.get_preset_folder() / "Default_HEVC_NVENC.txt"
@@ -2414,17 +2796,27 @@ class MesterSyncApp:
 
     def import_preset(self) -> None:
         src = filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
-        if src:
+        if not src:
+            return
+        try:
             dst = unique_path(self.get_preset_folder() / Path(src).name)
             shutil.copy2(src, dst)
             self.refresh_preset_menus()
             self.preset_var.set(dst.stem)
             self.load_selected_preset()
+            self.show_notification(f"Imported preset: {dst.stem}", "success")
+        except Exception as exc:
+            self.show_notification(f"The preset could not be imported:\n{exc}", "error")
 
     def export_preset(self) -> None:
         dst = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files", "*.txt")])
-        if dst:
+        if not dst:
+            return
+        try:
             Path(dst).write_text(self.ffmpeg_args_text.get("1.0", "end").strip() + "\n", encoding="utf-8")
+            self.show_notification("Preset exported.", "success")
+        except Exception as exc:
+            self.show_notification(f"The preset could not be exported:\n{exc}", "error")
 
     def save_current_preset_default(self) -> None:
         self.ensure_default_preset()
@@ -2918,6 +3310,9 @@ class MesterSyncApp:
                     pending_session_update = True
                 elif event == "message_error":
                     self.show_notification(str(payload), "error")
+                elif event == "notification":
+                    text, level, duration_ms = payload
+                    self.show_notification(str(text), str(level), int(duration_ms))
                 elif event == "health_check_complete":
                     self.finish_health_check(dict(payload))
                 elif event == "update_check_complete":
@@ -2940,7 +3335,7 @@ class MesterSyncApp:
                 elif event == "archive_ui":
                     self.remove_archived_task_ui(str(payload))
                 elif event == "disk_ready":
-                    self.show_disk_ready(str(payload))
+                    self.show_disk_ready(payload)
                 elif event == "preset_test_ui":
                     self.update_preset_test_ui(**dict(payload))
                 elif event == "safe_names_ready":
@@ -3062,6 +3457,7 @@ class MesterSyncApp:
             self.refresh_session_summary_idle_timer()
             self.refresh_sleep_prevention()
             self.refresh_import_priority()
+            self.prune_removed_drive_notifications()
             # Safety net: a settings/tab focus change must not make a live task vanish
             # from the Dashboard. If a row widget is missing but the task still exists,
             # rebuild it without touching conversion/transfer state.
@@ -3155,7 +3551,7 @@ class MesterSyncApp:
         self.log_visible = not self.log_visible
         if self.log_visible:
             self.top_log_outer.pack(side="left", fill="x", expand=True, padx=(10, 10), after=self.log_toggle)
-            self.log_toggle.configure(text="Log", bg=self.BLUE)
+            self.log_toggle.configure(text="Hide log", bg=self.BLUE)
             if self.log_text is not None:
                 self.log_text.see("end")
         else:
@@ -3181,7 +3577,7 @@ class MesterSyncApp:
             color = self.GREEN
         else:
             text = "Stopped"
-            color = self.RED
+            color = self.MUTED
         with self.task_lock:
             importing_now = self.importing_count > 0
         activity = "File importing..." if importing_now else ("Testing preset..." if preset_test_running else "")
@@ -3203,7 +3599,10 @@ class MesterSyncApp:
         self.activity_var.set(activity)
         self.draw_dot(self.status_dot, color)
         self.start_btn.configure(text="Stop all" if running_any else "Start all", bg=self.RED if running_any else self.GREEN)
-        self.pause_btn.configure(text="Resume" if self.pause_event.is_set() else "Pause")
+        self.pause_btn.configure(
+            text="Resume" if self.pause_event.is_set() else "Pause",
+            state="normal" if running_any or self.pause_event.is_set() else "disabled",
+        )
         self.update_stage_enabled_buttons()
 
     def update_stage_card(self, stage: str, label: str, value: int, eta: Optional[float] = None) -> None:
@@ -3239,7 +3638,7 @@ class MesterSyncApp:
             enabled = getattr(self, f"{key}_enabled")
             card = self.stage_cards[key]
             card["button"].configure(text="Stop" if enabled else "Start", bg=self.RED if enabled else self.GREEN)
-            self.draw_dot(card["dot"], active_colors[key] if enabled else self.RED)
+            self.draw_dot(card["dot"], active_colors[key] if enabled else self.MUTED)
             bg = active_backgrounds[key] if enabled else self.INACTIVE_STAGE_BG
             card["card"].configure(bg=bg)
             for child in card["card"].winfo_children():
@@ -3419,50 +3818,91 @@ class MesterSyncApp:
         self.generate_thumbnail_async(task_id, source)
         return task_id
 
+    def video_file_dialog_types(self) -> List[Tuple[str, str]]:
+        patterns = " ".join(f"*{ext}" for ext in COMMON_VIDEO_EXTENSIONS)
+        return [("Video files", patterns), ("All files", "*.*")]
+
+    def choose_convert_in_place_files(self) -> None:
+        """Choose independent files; Dashboard selection never changes this command."""
+        self.clear_task_selection()
+        if not self.validate_ffmpeg_for_conversion():
+            return
+        files = filedialog.askopenfilenames(
+            title="Choose videos to convert in their current folder",
+            filetypes=self.video_file_dialog_types(),
+        )
+        task_ids: List[str] = []
+        for file_name in files:
+            task_id = self.create_convert_in_place_task(Path(file_name))
+            if task_id:
+                task_ids.append(task_id)
+        self.queue_convert_in_place_tasks(task_ids)
+
     def convert_in_place_selected(self) -> None:
+        """Explicit contextual action for the rows visible in selection mode."""
+        selected = [tid for tid in self.selected_ids if tid in self.tasks]
+        if not selected:
+            self.show_notification("No active files are selected. Select rows first, or use 'Convert files in place...' to choose files.", "warning")
+            return
         if not self.validate_ffmpeg_for_conversion():
             return
         task_ids: List[str] = []
-        selected = [tid for tid in self.selected_ids if tid in self.tasks]
-        if selected:
-            for task_id in selected:
-                task = self.tasks.get(task_id)
-                if not task:
-                    continue
-                planned_name = self.sync_task_rename_from_row(task_id)
-                if task_id == self.current_conversion_id or task.stage in {STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE, STAGE_TRANSFERRING}:
-                    self.log(f"Already busy, not queued for in-place conversion: {task.display_name}")
-                    continue
-                source = self.find_existing_task_media(task)
-                if not source:
-                    self.update_task(task_id, stage=STAGE_ERROR, detail="In-place conversion failed: source file is missing", progress=0)
-                    continue
-                folder_error = validate_writable_folder(source.parent, "Source folder")
-                if folder_error:
-                    self.update_task(task_id, stage=STAGE_ERROR, detail=f"In-place conversion failed: {folder_error}", progress=0)
-                    continue
-                preset_name, ffmpeg_args = self.default_task_preset_snapshot()
-                self.update_task(
-                    task_id,
-                    local_input_path=source,
-                    rename_base=planned_name or source.stem,
-                    output_ext=detect_output_extension(ffmpeg_args),
-                    preset_name=preset_name,
-                    ffmpeg_args=ffmpeg_args,
-                    convert_in_place=True,
-                    skipped=False,
-                    stage=STAGE_QUEUED,
-                    detail="Waiting for in-place conversion",
-                    progress=0,
-                )
-                task_ids.append(task_id)
-        else:
-            files = filedialog.askopenfilenames(title="Convert in place", filetypes=[("Video files", "*.*")])
-            for file_name in files:
-                task_id = self.create_convert_in_place_task(Path(file_name))
-                if task_id:
-                    task_ids.append(task_id)
+        blocked = 0
+        for task_id in selected:
+            task = self.tasks.get(task_id)
+            if not task:
+                continue
+            busy = (
+                task_id in {getattr(self, "current_import_id", None), getattr(self, "current_conversion_id", None), getattr(self, "current_transfer_id", None)}
+                or task_id in getattr(self, "queued_import_ids", set())
+                or task_id in getattr(self, "queued_transfer_ids", set())
+                or task.copy_thread_active
+                or task.stage in {STAGE_CHECKING, STAGE_IMPORTING, STAGE_STOPPING, STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE, STAGE_WAITING_TRANSFER, STAGE_TRANSFERRING}
+                or (task.convert_in_place and task_id in getattr(self, "queued_conversion_ids", set()))
+            )
+            if busy:
+                blocked += 1
+                self.log(f"Still busy, not changed to in-place conversion: {task.display_name}")
+                continue
+            source = self.find_convert_in_place_source(task)
+            # A row still waiting to import must never make this command operate
+            # directly on its recording disk merely because that disk is attached.
+            if not source or (not task.local_input_path and task.stage in {STAGE_DETECTED, STAGE_DUPLICATE_REVIEW}):
+                blocked += 1
+                self.log(f"Not ready for in-place conversion: {task.display_name}")
+                continue
+            planned_name = self.sync_task_rename_from_row(task_id)
+            folder_error = validate_writable_folder(source.parent, "Source folder")
+            if folder_error:
+                blocked += 1
+                self.log(f"Cannot convert in place ({task.display_name}): {folder_error}")
+                continue
+            preset_name, ffmpeg_args = self.default_task_preset_snapshot()
+            self.update_task(
+                task_id,
+                local_input_path=source,
+                rename_base=planned_name or source.stem,
+                output_path=None,
+                output_ext=detect_output_extension(ffmpeg_args),
+                preset_name=preset_name,
+                ffmpeg_args=ffmpeg_args,
+                conversion_started=False,
+                convert_in_place=True,
+                skipped=False,
+                error_log="",
+                stage=STAGE_QUEUED,
+                detail="Waiting for in-place conversion",
+                progress=0,
+            )
+            task_ids.append(task_id)
+        if task_ids:
+            self.clear_task_selection()
+        self.queue_convert_in_place_tasks(task_ids, blocked=blocked)
+
+    def queue_convert_in_place_tasks(self, task_ids: List[str], blocked: int = 0) -> None:
         if not task_ids:
+            if blocked:
+                self.show_notification(f"{blocked} selected file(s) were not ready. Finish or stop their current step before converting in place.", "warning")
             return
         self.ensure_workers_running()
         for task_id in task_ids:
@@ -3471,6 +3911,12 @@ class MesterSyncApp:
             self.queue_condition.notify_all()
         self.emit_status()
         self.log(f"Queued {len(task_ids)} file(s) for in-place conversion.")
+        suffix = f" {blocked} busy file(s) were left unchanged." if blocked else ""
+        self.show_notification(
+            f"Queued {len(task_ids)} file(s) for in-place conversion. Conversion starts after a 10-second safety delay; Skip cancels it. Originals are kept.{suffix}",
+            "success" if not blocked else "warning",
+            duration_ms=9000,
+        )
 
     def toggle_start_all(self) -> None:
         if self.started and (self.import_enabled or self.conversion_enabled or self.transfer_enabled):
@@ -3551,6 +3997,11 @@ class MesterSyncApp:
         self.emit_status()
 
     def toggle_pause(self) -> None:
+        running_any = self.started and (self.import_enabled or self.conversion_enabled or self.transfer_enabled)
+        if not running_any and not self.pause_event.is_set():
+            self.show_notification("Nothing is running yet. Use Start all or start an individual stage first.", "info")
+            self.emit_status()
+            return
         if self.pause_event.is_set():
             self.pause_event.clear()
             self.resume_current_process()
@@ -3599,6 +4050,8 @@ class MesterSyncApp:
             self.finalize_waiting_transfers_as_converted_only()
         if key == "transfer" and not current:
             self.requeue_waiting_transfers()
+        if not (self.import_enabled or self.conversion_enabled or self.transfer_enabled):
+            self.pause_event.clear()
         with self.import_condition:
             self.import_condition.notify_all()
         with self.queue_condition:
@@ -3978,6 +4431,10 @@ class MesterSyncApp:
     def move_file_no_overwrite(self, source: Path, destination: Path) -> bool:
         return move_path_no_overwrite(source, destination, self.emit_log)
 
+    def delete_verified_working_file(self, path: Path, expected_checksum: str) -> bool:
+        """Remove a managed copy only after proving it is still the same file."""
+        return delete_path_if_checksum_matches(path, expected_checksum, self.emit_log)
+
     def update_task(self, task_id: str, **kwargs: Any) -> None:
         should_save = False
         with self.task_lock:
@@ -4071,10 +4528,16 @@ class MesterSyncApp:
         skipped_bg = "#221b1e" if view.skipped else None
         error_bg = "#3a1018" if is_error else None
         card_bg = error_bg or (self.DARK_GREEN if active_green else (skipped_bg or self.CARD))
-        border = "#ffffff" if selected else self.BORDER
+        border = self.BLUE if selected else self.BORDER
         if cache.get("border") != border:
             row["outer"].configure(bg=border)
             cache["border"] = border
+        badge = row.get("selection_badge")
+        if badge:
+            if selected and not badge.winfo_ismapped():
+                badge.pack(side="left", before=row["src"], padx=(0, 8))
+            elif not selected and badge.winfo_ismapped():
+                badge.pack_forget()
         if cache.get("card_bg") != card_bg:
             row["card"].configure(bg=card_bg)
             for widget_key in ["right", "top", "safe_name", "preset_badges", "times", "detail", "src", "ext", "buttons", "preset_holder"]:
@@ -4167,6 +4630,7 @@ class MesterSyncApp:
         right.pack(side="left", fill="both", expand=True, padx=(14, 0))
         top = tk.Frame(right, bg=self.CARD)
         top.pack(fill="x")
+        selection_badge = tk.Label(top, text="✓ SELECTED", bg=self.BLUE, fg="white", font=("Segoe UI", 9, "bold"), padx=8, pady=3)
         src = tk.Label(top, text=f"{task.display_name}  ->  ", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 11, "bold"), anchor="w")
         src.pack(side="left")
         rename_var = tk.StringVar(value=task.rename_base)
@@ -4196,7 +4660,7 @@ class MesterSyncApp:
         skip_btn = self.small_button(buttons, "Skip", lambda tid=task.task_id: self.skip_task(tid), self.CARD3)
         skip_btn.pack(side="left", padx=(0, 6))
         resume_btn = self.small_button(buttons, "Resume", lambda tid=task.task_id: self.resume_task(tid), self.GREEN)
-        remove_btn = self.small_button(buttons, "Remove", lambda tid=task.task_id: self.remove_skipped_task(tid), self.RED)
+        remove_btn = self.small_button(buttons, "Remove from list", lambda tid=task.task_id: self.remove_skipped_task(tid), self.RED)
         top_btn = self.small_button(buttons, "Move to top", lambda tid=task.task_id: self.move_to_top(tid), self.CARD3)
         top_btn.pack(side="left", padx=(0, 6))
         up_btn = self.small_button(buttons, "Up", lambda tid=task.task_id: self.move_task_priority(tid, -1), self.CARD3)
@@ -4214,7 +4678,7 @@ class MesterSyncApp:
         preset_combo.bind("<<ComboboxSelected>>", lambda e, tid=task.task_id: self.set_task_preset(tid))
         self.row_widgets[task.task_id] = {
             "outer": outer, "card": card, "thumb_frame": thumb_frame, "thumb": thumb,
-            "right": right, "top": top, "src": src, "rename_var": rename_var, "rename_entry": rename_entry, "ext": ext,
+            "right": right, "top": top, "selection_badge": selection_badge, "src": src, "rename_var": rename_var, "rename_entry": rename_entry, "ext": ext,
             "stage": stage, "safe_name": safe_name, "preset_badges": preset_badges_frame, "times": times, "progress_wrap": pwrap, "progress_var": pvar, "progressbar": pbar, "progress_text": ptxt, "detail": detail,
             "buttons": buttons, "skip_btn": skip_btn, "resume_btn": resume_btn, "remove_btn": remove_btn, "top_btn": top_btn, "up_btn": up_btn, "down_btn": down_btn, "import_anyway_btn": import_anyway_btn, "retry_btn": retry_btn, "restart_btn": restart_btn, "copy_error_btn": copy_error_btn,
             "preset_holder": preset_holder, "preset_var": preset_var, "preset_combo": preset_combo, "preset_dirty": False,
@@ -4222,7 +4686,7 @@ class MesterSyncApp:
             "button_layout": None, "preset_values_key": None,
             "render_cache": {},
         }
-        row_drop_widgets = [outer, card, thumb_frame, thumb, right, top, src, ext, safe_name, preset_badges_frame, times, detail, pwrap, ptxt, buttons, stage]
+        row_drop_widgets = [outer, card, thumb_frame, thumb, right, top, selection_badge, src, ext, safe_name, preset_badges_frame, times, detail, pwrap, ptxt, buttons, stage]
         for w in row_drop_widgets:
             w.bind("<Button-1>", lambda e, tid=task.task_id: (self.root.focus_set(), self.select_task(tid, ctrl=bool(e.state & 0x0004), shift=bool(e.state & 0x0001))))
             w.bind("<Double-Button-1>", lambda e, tid=task.task_id: self.open_task_source(tid))
@@ -4235,7 +4699,7 @@ class MesterSyncApp:
         # Rows sit above the canvas, so they must also be drop targets.
         for w in row_drop_widgets + [rename_entry, preset_holder, preset_combo]:
             self.enable_drop_target(w)
-        rename_entry.bind("<FocusIn>", lambda e, tid=task.task_id: self.mark_dirty(tid))
+        rename_entry.bind("<FocusIn>", lambda e, tid=task.task_id: self.begin_single_rename(tid))
         rename_entry.bind("<Return>", lambda e, tid=task.task_id: self.commit_rename_and_exit(tid))
         rename_entry.bind("<Escape>", lambda e, tid=task.task_id: self.cancel_rename(tid))
         rename_entry.bind("<FocusOut>", lambda e, tid=task.task_id: self.commit_rename(tid))
@@ -4288,16 +4752,29 @@ class MesterSyncApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.log(f"Copied error details for {task.display_name}.")
+        self.show_notification("Error details copied to the clipboard.", "success")
 
     def import_duplicate_task(self, task_id: str) -> None:
         task = self.tasks.get(task_id)
         if not task:
             return
-        task.duplicate = False
-        task.duplicate_reason = ""
+        self.import_cancel_requested.clear()
         task.import_stop_event = threading.Event()
+        self.update_task(
+            task_id,
+            duplicate=False,
+            duplicate_reason="",
+            force_import=True,
+            stage=STAGE_DETECTED,
+            detail="Import anyway selected; duplicate detection will be skipped",
+            progress=0,
+        )
         self.requeue_duplicate_import(task_id)
         self.ensure_workers_running()
+        self.show_notification(
+            f"Import anyway accepted for {task.display_name}. A new unique filename will be used; no existing file will be replaced.",
+            "success",
+        )
 
     def set_task_preset(self, task_id: str) -> None:
         row = self.row_widgets.get(task_id)
@@ -4307,6 +4784,7 @@ class MesterSyncApp:
         if self.task_preset_locked(task):
             row["preset_var"].set(task.preset_name)
             self.log(f"Preset is locked because conversion has already started: {task.display_name}")
+            self.show_notification(f"The preset for {task.display_name} cannot be changed after conversion has started.", "warning")
             return
         name = row["preset_var"].get() or "Current settings"
         args = self.read_preset_args(name) or self.current_ffmpeg_args_from_ui()
@@ -4321,14 +4799,24 @@ class MesterSyncApp:
         if task_id in self.row_widgets:
             self.row_widgets[task_id]["dirty"] = True
 
+    def begin_single_rename(self, task_id: str) -> None:
+        """Inline name editing is deliberately scoped to one row."""
+        if self.selected_ids != [task_id]:
+            self.selected_ids = [task_id]
+            self.selection_anchor_id = task_id
+            self.update_selection_visuals()
+            self.update_batch_box_visibility()
+        self.mark_dirty(task_id)
+
     def skip_selected_tasks(self) -> None:
         selected = [tid for tid in self.selected_ids if tid in self.tasks]
         if not selected:
             return
         for task_id in list(selected):
             self.skip_task(task_id)
-        self.update_batch_box_visibility()
+        self.clear_task_selection()
         self.log(f"Skipped {len(selected)} selected file(s).")
+        self.show_notification(f"Skipped {len(selected)} selected file(s). Use Undo skip on a row within 60 seconds to restore it.", "info")
 
     def selected_editing_text(self) -> bool:
         widget = self.root.focus_get()
@@ -4340,14 +4828,27 @@ class MesterSyncApp:
         selected = [tid for tid in self.selected_ids if tid in self.tasks]
         if not selected:
             return "break"
+        skipped_count = 0
+        removed_count = 0
         for task_id in list(selected):
             task = self.tasks.get(task_id)
             if not task:
                 continue
             if task.skipped or task.stage == STAGE_DUPLICATE_REVIEW:
-                self.remove_skipped_task(task_id)
+                if self.remove_skipped_task(task_id):
+                    removed_count += 1
             else:
                 self.skip_task(task_id)
+                skipped_count += 1
+        self.clear_task_selection()
+        if skipped_count:
+            suffix = f" {removed_count} already-skipped item(s) were removed from the list." if removed_count else ""
+            self.show_notification(
+                f"Skipped {skipped_count} file{'s' if skipped_count != 1 else ''}. Use Undo skip within 60 seconds to restore them.{suffix}",
+                "info",
+            )
+        elif removed_count:
+            self.show_notification(f"Removed {removed_count} item{'s' if removed_count != 1 else ''} from the active list.", "info")
         return "break"
 
     def select_all_tasks(self, event: Optional[tk.Event] = None) -> str:
@@ -4414,9 +4915,24 @@ class MesterSyncApp:
     def update_selection_visuals(self) -> None:
         for tid, row in self.row_widgets.items():
             try:
-                row["outer"].configure(bg="#ffffff" if tid in self.selected_ids else self.BORDER)
+                selected = tid in self.selected_ids
+                row["outer"].configure(bg=self.BLUE if selected else self.BORDER)
+                badge = row.get("selection_badge")
+                if badge:
+                    if selected and not badge.winfo_ismapped():
+                        badge.pack(side="left", before=row["src"], padx=(0, 8))
+                    elif not selected and badge.winfo_ismapped():
+                        badge.pack_forget()
+                row.get("render_cache", {}).pop("border", None)
             except Exception:
                 pass
+
+    def clear_task_selection(self, event: Optional[tk.Event] = None) -> str:
+        self.selected_ids = []
+        self.selection_anchor_id = None
+        self.update_selection_visuals()
+        self.update_batch_box_visibility()
+        return "break" if event is not None else ""
 
     def select_index(self, index: int, extend: bool = False) -> str:
         if self.selected_editing_text():
@@ -4525,26 +5041,110 @@ class MesterSyncApp:
         current_bases = [task.rename_base or Path(task.display_name).stem for task in ordered]
         new_bases = batch_rename_bases(current_bases, self.batch_name_var.get(), auto, prefix, suffix)
         if not new_bases:
+            self.show_notification("Enter a name, prefix, or suffix before renaming the selected files.", "warning")
             return
+        confirmation = (
+            tuple(task.task_id for task in ordered),
+            self.batch_name_var.get(),
+            prefix,
+            suffix,
+            tuple(new_bases),
+        )
+        if getattr(self, "batch_rename_confirmation", None) != confirmation:
+            self.reset_batch_rename_confirmation()
+            self.batch_rename_confirmation = confirmation
+            preview_items = [
+                f"{current} → {new}"
+                for current, new in list(zip(current_bases, new_bases))[:2]
+            ]
+            if len(new_bases) > 2:
+                preview_items.append(f"and {len(new_bases) - 2} more")
+            preview = " · ".join(preview_items)
+            self.batch_hint_var.set(f"Review: {preview}")
+            self.batch_apply_btn.configure(
+                text=f"Confirm rename {len(ordered)} files",
+                bg=self.ORANGE,
+                activebackground=self.ORANGE,
+            )
+            self.show_notification(
+                f"Review the bulk rename: {preview}. Click Confirm rename to apply it.",
+                "warning",
+                9000,
+            )
+            self.batch_rename_confirmation_after_id = self.root.after(10000, self.reset_batch_rename_confirmation)
+            return
+
+        self.reset_batch_rename_confirmation()
         for task, new_base in zip(ordered, new_bases):
             self.update_task(task.task_id, rename_base=new_base)
         self.log(f"Batch rename applied to {len(ordered)} selected files.")
+        self.batch_name_var.set("")
+        self.batch_prefix_var.set(False)
+        self.batch_suffix_var.set(False)
+        self.update_batch_affix_buttons()
+        self.clear_task_selection()
+        self.show_notification(f"Updated the planned names for {len(ordered)} files. Selection was cleared.", "success")
+
+    def reset_batch_rename_confirmation(self) -> None:
+        after_id = getattr(self, "batch_rename_confirmation_after_id", None)
+        self.batch_rename_confirmation_after_id = None
+        if after_id:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self.batch_rename_confirmation = None
+        button = getattr(self, "batch_apply_btn", None)
+        if button:
+            count = len([tid for tid in self.selected_ids if tid in self.tasks])
+            button.configure(
+                text=f"Rename {count} files" if count > 1 else "Rename selected files",
+                bg=self.GREEN,
+                activebackground=self.GREEN,
+            )
+        if hasattr(self, "batch_hint_var"):
+            self.update_batch_box_visibility()
 
     def update_batch_box_visibility(self) -> None:
         if not hasattr(self, "batch_frame"):
             return
-        selected_count = len([tid for tid in self.selected_ids if tid in self.tasks])
-        if selected_count > 1:
+        selected = [tid for tid in self.selected_ids if tid in self.tasks]
+        confirmation = getattr(self, "batch_rename_confirmation", None)
+        if confirmation and set(confirmation[0]) != set(selected):
+            after_id = getattr(self, "batch_rename_confirmation_after_id", None)
+            if after_id:
+                try:
+                    self.root.after_cancel(after_id)
+                except Exception:
+                    pass
+            self.batch_rename_confirmation = None
+            self.batch_rename_confirmation_after_id = None
+        selected_count = len(selected)
+        if selected_count:
+            noun = "file" if selected_count == 1 else "files"
+            if hasattr(self, "selection_summary_var"):
+                self.selection_summary_var.set(f"{selected_count} {noun} selected · Actions here affect the selection")
+            if hasattr(self, "selection_convert_btn"):
+                self.selection_convert_btn.configure(text=f"Convert {selected_count} in place")
+            if hasattr(self, "selection_skip_btn"):
+                self.selection_skip_btn.configure(text=f"Skip {selected_count}")
+            if hasattr(self, "batch_apply_btn"):
+                self.batch_apply_btn.configure(text=f"Rename {selected_count} files")
             if hasattr(self, "batch_hint_var"):
                 if getattr(self, "batch_prefix_var", None) and self.batch_prefix_var.get():
-                    hint = f"{selected_count} selected. Prefix is added before each current name."
+                    hint = "Preview: the text is added before every current name."
                 elif getattr(self, "batch_suffix_var", None) and self.batch_suffix_var.get():
-                    hint = f"{selected_count} selected. Suffix is added after each current name."
+                    hint = "Preview: the text is added after every current name."
                 else:
-                    hint = f"{selected_count} selected. Output: name_01, name_02..."
+                    hint = "Result: name_01, name_02... Inline fields rename one file only."
                 self.batch_hint_var.set(hint)
             if not self.batch_frame.winfo_ismapped():
-                self.batch_frame.pack(anchor="w", pady=(10, 0))
+                self.batch_frame.pack(fill="x", pady=(10, 0))
+            if hasattr(self, "batch_rename_row"):
+                if selected_count > 1 and not self.batch_rename_row.winfo_ismapped():
+                    self.batch_rename_row.pack(fill="x", pady=(9, 0))
+                elif selected_count <= 1 and self.batch_rename_row.winfo_ismapped():
+                    self.batch_rename_row.pack_forget()
         else:
             if self.batch_frame.winfo_ismapped():
                 self.batch_frame.pack_forget()
@@ -4557,27 +5157,18 @@ class MesterSyncApp:
         task = self.tasks.get(task_id)
         if not task:
             return
-        selected = [tid for tid in self.selected_ids if tid in self.tasks]
         # Switching tabs or clicking a settings checkbox can fire FocusOut from
         # a rename box. If the text did not really change, do nothing; do not
         # re-render active conversion rows just because focus moved.
-        if not row.get("dirty") and not (len(selected) > 1 and task_id in selected):
+        if not row.get("dirty"):
             return
-        if len(selected) <= 1 and raw_base == task.rename_base:
+        if raw_base == task.rename_base:
             row["dirty"] = False
             return
         auto = bool(self.auto_underscore_var.get()) if hasattr(self, "auto_underscore_var") else bool(self.get_config().get("auto_underscore_renames", False))
-        if len(selected) > 1 and task_id in selected:
-            base = sanitize_base_name(raw_base or "renamed_video", auto)
-            with self.task_lock:
-                ordered = sorted([self.tasks[tid] for tid in selected], key=lambda t: t.created_at)
-            for i, task in enumerate(ordered, start=1):
-                self.update_task(task.task_id, rename_base=f"{base}_{i:02d}")
-            self.log(f"Batch rename applied to {len(ordered)} selected files.")
-        else:
-            base = sanitize_base_name(raw_base or Path(self.tasks[task_id].display_name).stem, auto)
-            self.update_task(task_id, rename_base=base)
-            self.log(f"Updated planned name: {base}{self.tasks[task_id].output_ext}")
+        base = sanitize_base_name(raw_base or Path(self.tasks[task_id].display_name).stem, auto)
+        self.update_task(task_id, rename_base=base)
+        self.log(f"Updated planned name: {base}{self.tasks[task_id].output_ext}")
         row["dirty"] = False
         self.root.focus_set()
 
@@ -4703,6 +5294,15 @@ class MesterSyncApp:
                         return path
                 except Exception:
                     continue
+        return None
+
+    def find_convert_in_place_source(self, task: TaskState) -> Optional[Path]:
+        """Prefer the verified local copy over an attached recording disk."""
+        candidates = [task.local_input_path, task.output_path, task.original_path, task.nas_path]
+        for candidate in candidates:
+            resolved = self.resolve_existing_media_path(candidate)
+            if resolved:
+                return resolved
         return None
 
     def apply_thumbnail(self, task_id: str) -> None:
@@ -4914,12 +5514,22 @@ class MesterSyncApp:
     # ---------------- add/import/scan ----------------
     def handle_drop(self, event: Any) -> None:
         paths = [Path(x) for x in self.root.tk.splitlist(event.data)]
-        threading.Thread(target=self.add_paths_to_import, args=(paths,), daemon=True).start()
+        if not paths:
+            return
+        self.show_notification(f"Checking {len(paths)} dropped item{'s' if len(paths) != 1 else ''} for videos...", "info", 2500)
+        threading.Thread(target=self.add_paths_to_import, args=(paths,), daemon=True, name="DroppedFileImport").start()
 
     def add_files_dialog(self) -> None:
-        files = filedialog.askopenfilenames(title="Add video files", filetypes=[("Video files", "*.*")])
+        self.clear_task_selection()
+        files = filedialog.askopenfilenames(title="Add video files", filetypes=self.video_file_dialog_types())
         if files:
-            threading.Thread(target=self.add_paths_to_import, args=([Path(x) for x in files],), daemon=True).start()
+            self.show_notification(f"Checking {len(files)} selected file{'s' if len(files) != 1 else ''}...", "info", 2500)
+            threading.Thread(
+                target=self.add_paths_to_import,
+                args=([Path(x) for x in files],),
+                daemon=True,
+                name="SelectedFileImport",
+            ).start()
 
     def queue_import_batch(
         self,
@@ -4927,6 +5537,7 @@ class MesterSyncApp:
         require_import_enabled: bool,
         source_label: str,
         disk_batch: bool = False,
+        source_id: str = "",
     ) -> str:
         if not items:
             return ""
@@ -4951,6 +5562,7 @@ class MesterSyncApp:
                 "cancelled": False,
                 "disk_batch": disk_batch,
                 "source_label": source_label,
+                "source_id": source_id,
                 "ready_notified": False,
                 "total": len(accepted),
             }
@@ -4993,9 +5605,13 @@ class MesterSyncApp:
             try:
                 cfg = self.get_config()
                 source = task.original_path
-                self.update_task(task_id, stage=STAGE_CHECKING, detail="Checking for an exact duplicate before import...", progress=0)
-                self.set_import_progress_snapshot(task_id, f"Import/watching: checking duplicate for {source.name}", 0, None)
-                duplicate_reason = self.duplicate_reason_for(source, cfg, task_id)
+                if task.force_import:
+                    self.update_task(task_id, stage=STAGE_CHECKING, detail="Import anyway accepted; preparing import...", progress=0)
+                    self.set_import_progress_snapshot(task_id, f"Import/watching: preparing forced import for {source.name}", 0, None)
+                else:
+                    self.update_task(task_id, stage=STAGE_CHECKING, detail="Checking for an exact duplicate before import...", progress=0)
+                    self.set_import_progress_snapshot(task_id, f"Import/watching: checking duplicate for {source.name}", 0, None)
+                duplicate_reason = self.duplicate_reason_for_import_task(task, cfg)
                 self.clear_import_progress_snapshot(task_id)
                 if task_id not in self.tasks or task.skipped:
                     self.complete_import_job(task_id, success=False, blocked=False)
@@ -5004,13 +5620,9 @@ class MesterSyncApp:
                     with self.import_condition:
                         batch = self.import_batches.get(self.import_job_batch.get(task_id, ""))
                         automatic_disk_duplicate = bool(batch and batch.get("disk_batch"))
-                    if automatic_disk_duplicate:
-                        self.emit_log(f"Already imported; skipped exact duplicate from disk: {source.name}")
-                        self.discard_detected_task(task_id)
-                        self.complete_import_job(task_id, success=False, blocked=False)
-                        continue
                     self.update_task(task_id, stage=STAGE_DUPLICATE_REVIEW, duplicate=True, duplicate_reason=duplicate_reason, detail=duplicate_reason, progress=0)
-                    self.emit_log(f"Duplicate needs review: {source.name}")
+                    source_kind = "connected disk" if automatic_disk_duplicate else "added files"
+                    self.emit_log(f"Exact duplicate from {source_kind} needs review: {source.name}")
                     self.complete_import_job(task_id, success=False, blocked=True)
                     continue
                 self.update_task(task_id, stage=STAGE_IMPORTING, detail="Starting import...", progress=0)
@@ -5047,15 +5659,15 @@ class MesterSyncApp:
             raise
         self.gui_queue.put(("archive_ui", task_id))
 
-    def import_batch_actions_locked(self, batch_id: str) -> Tuple[List[str], str]:
+    def import_batch_actions_locked(self, batch_id: str) -> Tuple[List[str], Optional[Dict[str, str]]]:
         batch = self.import_batches.get(batch_id)
         if not batch:
-            return [], ""
+            return [], None
         conversions: List[str] = []
         if not batch["pending"] and not batch["conversion_released"]:
             batch["conversion_released"] = True
             conversions = list(batch["imported"])
-        ready_message = ""
+        ready_notice: Optional[Dict[str, str]] = None
         if (
             batch["disk_batch"]
             and not batch["pending"]
@@ -5064,14 +5676,18 @@ class MesterSyncApp:
             and not batch["ready_notified"]
         ):
             batch["ready_notified"] = True
-            ready_message = f"Disk {batch['source_label']} ready to remove ({batch['total']} video(s))."
+            ready_notice = {
+                "drive_id": str(batch.get("source_id") or batch["source_label"]),
+                "root": str(batch["source_label"]),
+                "text": f"Disk {batch['source_label']} ready to remove ({batch['total']} video(s)).",
+            }
         if not batch["pending"] and not batch["blocked"] and batch["conversion_released"]:
             self.import_batches.pop(batch_id, None)
-        return conversions, ready_message
+        return conversions, ready_notice
 
     def complete_import_job(self, task_id: str, success: bool, blocked: bool) -> None:
         conversions: List[str] = []
-        ready_message = ""
+        ready_notice: Optional[Dict[str, str]] = None
         enqueue_now = False
         with self.import_condition:
             batch_id = self.import_job_batch.get(task_id, "")
@@ -5088,7 +5704,7 @@ class MesterSyncApp:
                 else:
                     batch["blocked"].discard(task_id)
                     self.import_job_batch.pop(task_id, None)
-                conversions, ready_message = self.import_batch_actions_locked(batch_id)
+                conversions, ready_notice = self.import_batch_actions_locked(batch_id)
             else:
                 self.import_job_batch.pop(task_id, None)
         if success or blocked:
@@ -5099,9 +5715,9 @@ class MesterSyncApp:
             self.queue_imported_batch_for_conversion(conversions)
         elif enqueue_now and success:
             self.queue_imported_batch_for_conversion([task_id])
-        if ready_message:
-            self.emit_log(ready_message)
-            self.gui_queue.put(("disk_ready", ready_message))
+        if ready_notice:
+            self.emit_log(ready_notice["text"])
+            self.gui_queue.put(("disk_ready", ready_notice))
 
     def requeue_duplicate_import(self, task_id: str) -> None:
         with self.import_condition:
@@ -5123,7 +5739,7 @@ class MesterSyncApp:
 
     def remove_import_job(self, task_id: str, resolve_batch: bool = False) -> None:
         conversions: List[str] = []
-        ready_message = ""
+        ready_notice: Optional[Dict[str, str]] = None
         with self.import_condition:
             if task_id == self.current_import_id and not resolve_batch:
                 self.import_condition.notify_all()
@@ -5140,13 +5756,13 @@ class MesterSyncApp:
             if batch and resolve_batch:
                 batch["pending"].discard(task_id)
                 batch["blocked"].discard(task_id)
-                conversions, ready_message = self.import_batch_actions_locked(batch_id)
+                conversions, ready_notice = self.import_batch_actions_locked(batch_id)
             self.import_condition.notify_all()
         if conversions:
             self.queue_imported_batch_for_conversion(conversions)
-        if ready_message:
-            self.emit_log(ready_message)
-            self.gui_queue.put(("disk_ready", ready_message))
+        if ready_notice:
+            self.emit_log(ready_notice["text"])
+            self.gui_queue.put(("disk_ready", ready_notice))
 
     def add_paths_to_import(self, paths: List[Path]) -> None:
         self.import_cancel_requested.clear()
@@ -5174,8 +5790,16 @@ class MesterSyncApp:
         if started:
             self.queue_import_batch(queued_items, False, "Added files")
             self.emit_log(f"Added {started} file(s). Import queue will process them one at a time.")
-        if candidates and self.import_cancel_requested.is_set():
+            self.gui_queue.put((
+                "notification",
+                (f"Added {started} video{'s' if started != 1 else ''} to the import queue.", "success", 5500),
+            ))
+        if self.import_cancel_requested.is_set():
             self.emit_log("Add files was cancelled before import started.")
+            self.gui_queue.put(("notification", ("Adding files was cancelled.", "warning", 5500)))
+        elif not candidates:
+            self.emit_log("No supported video files were found in the selected items.")
+            self.gui_queue.put(("notification", ("No supported video files were found.", "warning", 5500)))
 
     def task_ready_for_conversion_queue(self, task_id: str) -> bool:
         task = self.tasks.get(task_id)
@@ -5287,7 +5911,11 @@ class MesterSyncApp:
                     self.update_task(task_id, stage=STAGE_ERROR, detail=error, progress=0, error_log=f"Checksum verification failed for imported copy: {target}")
                     self.emit_log(f"{error} Source: {src}")
                     return
-                self.remember_original_checksum(copied_digest, src.name, source_size, target)
+                if not self.remember_original_checksum(copied_digest, src.name, source_size, target):
+                    error = "Imported copy was verified, but duplicate protection could not be saved. Both the recording-disk file and local copy were kept."
+                    self.update_task(task_id, stage=STAGE_ERROR, detail=error, progress=100, error_log=f"Checksum database could not be saved for: {target}")
+                    self.emit_log(error)
+                    return
             else:
                 force_delete(target)
                 self.update_task(task_id, local_input_path=None, original_checksum=None)
@@ -5297,7 +5925,7 @@ class MesterSyncApp:
                 return
             self.generate_thumbnail_async(task_id, target)
             self.record_session_stat("imported")
-            self.update_task(task_id, stage=STAGE_IMPORTED, progress=100, detail="Imported to watchfolder", eta_seconds=0)
+            self.update_task(task_id, stage=STAGE_IMPORTED, progress=100, detail="Imported to watchfolder", eta_seconds=0, force_import=False)
             current_task = self.tasks.get(task_id)
             if enqueue_after and self.conversion_enabled and current_task and not current_task.skipped:
                 self.ensure_workers_running()
@@ -5337,8 +5965,34 @@ class MesterSyncApp:
         )
 
     def manual_scan(self) -> None:
-        threading.Thread(target=self.scan_existing_input_as_detected, daemon=True).start()
+        self.clear_task_selection()
+        cfg = self.get_config()
+        input_value = str(cfg.get("input_folder", "")).strip()
+        if not input_value or not Path(input_value).is_dir():
+            self.show_notification("Choose a valid Importfolder in Settings before scanning.", "warning")
+            return
+        if self.watchfolder_scan_lock.locked():
+            self.show_notification("The Importfolder is already being scanned.", "info")
+            return
+
+        self.show_notification("Scanning Importfolder for new videos...", "info", 2500)
         self.log("Scan now started. New videos in Importfolder will be queued when Conversion is on.")
+
+        def scan_worker() -> None:
+            try:
+                count = self.scan_existing_input_as_detected()
+                if count:
+                    text = f"Scan complete. Added {count} new video{'s' if count != 1 else ''}."
+                    level = "success"
+                else:
+                    text = "Scan complete. No new videos were found."
+                    level = "info"
+                self.gui_queue.put(("notification", (text, level, 5500)))
+            except Exception as exc:
+                self.emit_log(f"Importfolder scan failed: {exc}")
+                self.gui_queue.put(("notification", ("The Importfolder scan could not be completed. Check the log for details.", "error", 9000)))
+
+        threading.Thread(target=scan_worker, daemon=True, name="ManualImportfolderScan").start()
 
     def scan_existing_input_as_detected(self) -> int:
         if not self.watchfolder_scan_lock.acquire(blocking=False):
@@ -5393,15 +6047,14 @@ class MesterSyncApp:
                     if drive_id in self.processed_drive_ids:
                         continue
                     self.processed_drive_ids.add(drive_id)
-                    self.import_drive(Path(root))
+                    self.import_drive(Path(root), drive_id)
             except Exception as exc:
                 self.emit_log(f"Drive monitor error: {exc}")
             self.shutdown_event.wait(max(1, int(cfg.get("scan_interval_seconds", 3))))
 
-    def import_drive(self, root: Path) -> None:
+    def import_drive(self, root: Path, drive_id: str = "") -> None:
         self.import_cancel_requested.clear()
         cfg = self.get_config()
-        self.gui_queue.put(("disk_ready", ""))
         self.emit_log(f"New drive detected: {root}")
         scan_progress_id = f"drive_scan_{path_key(root)}"
         self.set_import_progress_snapshot(scan_progress_id, f"Import/watching: scanning {root}", 0, None)
@@ -5435,7 +6088,7 @@ class MesterSyncApp:
                 task_id = self.create_task(src, stage=STAGE_DETECTED, imported=False, generate_thumbnail=False)
                 self.update_task(task_id, detail="Waiting for import check...", progress=0)
                 queued_items.append((src, task_id))
-            self.queue_import_batch(queued_items, True, str(root), disk_batch=True)
+            self.queue_import_batch(queued_items, True, str(root), disk_batch=True, source_id=drive_id)
             self.emit_log(f"Queued {total} video(s) from {root}. Imports will run one at a time.")
         finally:
             self.clear_import_progress_snapshot(scan_progress_id)
@@ -5788,10 +6441,10 @@ class MesterSyncApp:
             # Persist the completed record before cleanup. A crash can then only
             # leave an extra local source, never an unrecorded converted result.
             if task.local_input_path and task.local_input_path.exists():
-                if force_delete(task.local_input_path):
+                if self.delete_verified_working_file(task.local_input_path, task.original_checksum):
                     self.emit_log(f"Deleted local imported source after output conversion: {task.local_input_path.name}")
                 else:
-                    self.emit_log(f"Could not delete local imported source: {task.local_input_path}")
+                    self.emit_log(f"Kept local imported source because safe cleanup could not prove it was unchanged: {task.local_input_path}")
         finally:
             self.release_output_target(target)
 
@@ -5926,15 +6579,15 @@ class MesterSyncApp:
             self.archive_task(task_id, status="transferred")
             # History/checksum state is durable before local cleanup. If cleanup
             # is interrupted, the verified NAS file remains the source of truth.
-            if force_delete(source):
+            if self.delete_verified_working_file(source, copied_digest):
                 self.emit_log(f"Deleted local converted file: {source.name}")
             else:
-                self.emit_log(f"Could not delete local converted file: {source}")
+                self.emit_log(f"Kept local converted file because safe cleanup could not prove it was unchanged: {source}")
             if task.local_input_path and task.local_input_path.exists():
-                if force_delete(task.local_input_path):
+                if self.delete_verified_working_file(task.local_input_path, task.original_checksum):
                     self.emit_log(f"Deleted local imported source after NAS verification: {task.local_input_path.name}")
                 else:
-                    self.emit_log(f"Could not delete local imported source: {task.local_input_path}")
+                    self.emit_log(f"Kept local imported source because safe cleanup could not prove it was unchanged: {task.local_input_path}")
         finally:
             self.release_nas_target(dest)
             self.emit_progress("transfer", "Transfer: idle", 0, None)
@@ -6149,30 +6802,31 @@ class MesterSyncApp:
             return
         self.queue_import_batch([(source, task_id)], False, "Resumed import")
 
-    def remove_skipped_task(self, task_id: str) -> None:
+    def remove_skipped_task(self, task_id: str) -> bool:
         task = self.tasks.get(task_id)
         if not task:
-            return
+            return False
         if task.stage == STAGE_DUPLICATE_REVIEW:
             self.remove_task(task_id)
             self.log(f"Removed from list: {task.display_name}")
-            return
+            return True
         if not task.skipped:
-            return
+            return False
         task.import_stop_event.set()
         task.transfer_stop_event.set()
         if task.copy_thread_active:
             self.update_task(task_id, stage=STAGE_STOPPING, detail="Waiting for the active import copy to stop before removal")
             self.log(f"Waiting for import to stop safely before removing: {task.display_name}")
-            return
+            return False
         delete_local = False
         if task.local_input_path and task.local_input_path.exists() and not task.convert_in_place:
             delete_local = messagebox.askyesno(APP_NAME, f"Delete the imported file from the importfolder too?\n\n{task.local_input_path}")
         local_to_delete = task.local_input_path if delete_local else None
         self.remove_task(task_id)
-        if local_to_delete:
-            force_delete(local_to_delete)
+        if local_to_delete and not self.delete_verified_working_file(local_to_delete, task.original_checksum):
+            self.show_notification("The imported file was kept because MesterSync could not prove it was unchanged.", "warning")
         self.log(f"Removed skipped file from list: {task.display_name}")
+        return True
 
     def remove_task(self, task_id: str) -> None:
         self.remove_import_job(task_id, resolve_batch=True)
@@ -6307,6 +6961,7 @@ class MesterSyncApp:
             "thumbnail_path": task.thumbnail_path,
             "thumbnail_preview_paths": task.thumbnail_preview_paths,
             "original_checksum": task.original_checksum,
+            "original_size": task.imported_size,
             "input_path": str(task.local_input_path) if status == "skipped" and task.local_input_path else "",
             "input_folder": str(self.get_config().get("input_folder", "")) if status == "skipped" and task.local_input_path else "",
         }
@@ -6501,28 +7156,47 @@ class MesterSyncApp:
             tk.Label(btns, text="Deleting original...", bg=bg, fg=self.MUTED, font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 8))
         elif status == "skipped" and rec.get("input_path"):
             self.small_button(btns, "Delete original file", lambda i=index: self.delete_history_original_file(i), self.RED).pack(side="left", padx=(0, 6))
-        self.small_button(btns, "Remove", lambda i=index: self.remove_history_entry(i), self.RED).pack(side="left")
+        self.small_button(btns, "Remove from history", lambda i=index: self.remove_history_entry(i), self.RED).pack(side="left")
         self.history_widgets.append(outer)
 
     def clear_history(self) -> None:
-        if not messagebox.askyesno(APP_NAME, "Clear history?"):
+        count = len(self.history_records)
+        if not count:
+            self.show_notification("History is already empty.", "info")
+            return
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Remove all {count} history entries?\n\nThis clears MesterSync's history only. It does not delete any video files.",
+        ):
             return
         with self.history_lock:
             records = list(self.history_records)
             self.history_records.clear()
-            self.save_history(force=True)
+            try:
+                self.save_history(force=True)
+            except Exception as exc:
+                self.history_records[:] = records
+                self.show_notification(f"History could not be cleared because it could not be saved:\n{exc}", "error")
+                return
         for rec in records:
             self.cleanup_history_thumbnails(rec)
         self.refresh_history_view()
+        self.show_notification(f"Removed {count} history entr{'y' if count == 1 else 'ies'}. No video files were deleted.", "success")
 
     def remove_history_entry(self, index: int) -> None:
         removed: Optional[Dict[str, Any]] = None
         with self.history_lock:
             if 0 <= index < len(self.history_records):
                 removed = self.history_records.pop(index)
-                self.save_history(force=True)
+                try:
+                    self.save_history(force=True)
+                except Exception as exc:
+                    self.history_records.insert(index, removed)
+                    self.show_notification(f"The history entry could not be removed because History could not be saved:\n{exc}", "error")
+                    return
         if removed:
             self.cleanup_history_thumbnails(removed)
+            self.show_notification("Removed one entry from History. No video files were deleted.", "success")
         self.refresh_history_view()
 
     def history_original_file(self, record: Dict[str, Any]) -> Optional[Path]:
@@ -6556,10 +7230,10 @@ class MesterSyncApp:
         ).start()
 
     def delete_history_original_worker(self, record: Dict[str, Any], candidate: Path) -> None:
-        if not force_delete(candidate):
+        if not self.delete_verified_working_file(candidate, str(record.get("original_checksum") or "")):
             with self.history_lock:
                 record["original_delete_pending"] = False
-            self.emit_error_message(f"Could not delete the original file. It may still be in use:\n\n{candidate}")
+            self.emit_error_message(f"The file was kept because MesterSync could not prove it was the same unchanged import-folder copy:\n\n{candidate}")
             self.gui_queue.put(("history", None))
             return
         try:

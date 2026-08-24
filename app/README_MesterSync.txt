@@ -1,4 +1,4 @@
-MesterSync 2.0.4
+MesterSync 2.1
 
 Installed use:
 - Open MesterSync from the Start menu or desktop shortcut.
@@ -23,7 +23,7 @@ Notes:
 - Keyboard shortcuts: Delete skips/removes selected rows, Ctrl+A selects all rows, Up/Down moves selection, Shift+Up/Down extends selection, Alt+Up/Down changes the selected row's priority, Space pauses/resumes, Enter opens the selected file, R retries stopped/error rows, Ctrl+Up moves a queued row to the top.
 - In a rename box, Enter saves and exits the box. Esc cancels the text change and exits the box.
 - Pending dashboard work is restored from mestersync_tasks.json after restarting the app.
-- Duplicate review rows appear when checksum or same-name checks find a likely duplicate; use Import anyway when that is intentional.
+- Exact duplicate protection is always on. Confirmed checksum matches wait for review; use Import anyway only when the extra copy is intentional.
 - Preset safety warnings appear in Settings when FFmpeg args look risky, such as missing audio handling, unsupported encoders, or large-output settings.
 - Preset test is inside Settings and converts a 15-second sample from the middle of a selected video. Test files are stored in the user-data folder and never replace or modify the selected source. A successful new test automatically deletes previous test videos.
 - History cards appear progressively, and the live log stays bounded so long sessions remain responsive.
@@ -33,7 +33,7 @@ Notes:
 - Routine information, warnings, and errors appear as non-blocking notifications. Confirmation questions remain explicit.
 - Settings are split into compact Folders, Drives, Safety, Presets, and About & updates categories.
 - Dashboard rows show the safe final name MesterSync would choose right now. Final output/NAS filenames are checked again at the moment files are finalized so videos cannot overwrite each other.
-- Matching filenames alone do not mean two videos are duplicates. MesterSync confirms duplicates by checksum; different recordings with the same name are kept separately using numbered filenames.
+- Matching filenames alone do not mean two videos are duplicates. MesterSync uses size plus cached beginning/middle/end samples as a fast filter, then confirms possible matches by hashing every byte. Names are never part of the decision, so renamed identical videos are found while different recordings with the same camera filename are kept separately using numbered filenames. Legacy records still get the full check. Import anyway also uses a new unique name and never replaces an existing file.
 - Imports run one at a time. Use the row Up/Down controls or Alt+Up/Down to change which waiting video goes next.
 - A green Disk ready to remove notice appears after every video from a detected recording disk has been copied and checksum-verified. Conversion and NAS transfer may continue afterward.
 - Settings save automatically after a short pause.

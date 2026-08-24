@@ -228,7 +228,8 @@ def sha256_file(
 ) -> Optional[str]:
     try:
         h = hashlib.sha256()
-        total = path.stat().st_size
+        initial_stat = path.stat()
+        total = initial_stat.st_size
         processed = 0
         last_percent = -1
         with path.open("rb") as fh:
@@ -241,6 +242,13 @@ def sha256_file(
                 if progress_callback and percent != last_percent:
                     last_percent = percent
                     progress_callback(percent, processed, total)
+        final_stat = path.stat()
+        if (
+            processed != total
+            or final_stat.st_size != initial_stat.st_size
+            or final_stat.st_mtime_ns != initial_stat.st_mtime_ns
+        ):
+            return None
         if progress_callback:
             progress_callback(100, processed, total)
         return h.hexdigest()

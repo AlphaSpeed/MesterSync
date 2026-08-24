@@ -279,8 +279,11 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertEqual(ui_performance.bounded_log_count(990, 25, 1000), (15, 1000))
         self.assertEqual(ui_performance.bounded_log_count(1000, 80, 1000), (80, 1000))
 
-    def test_version_is_2_0_4(self):
-        self.assertEqual(app_module.APP_VERSION, "2.0.4")
+    def test_version_is_2_1(self):
+        self.assertEqual(app_module.APP_VERSION, "2.1")
+        self.assertIn('MyAppVersion "2.1"', (ROOT / "packaging" / "MesterSync.iss").read_text(encoding="utf-8"))
+        self.assertTrue((ROOT / "README.md").read_text(encoding="utf-8").startswith("# MesterSync 2.1"))
+        self.assertTrue((APP_DIR / "README_MesterSync.txt").read_text(encoding="utf-8").startswith("MesterSync 2.1"))
 
     def test_launcher_has_python_fallbacks_and_visible_failure_message(self):
         launcher = (APP_DIR / "MesterSync.vbs").read_text(encoding="utf-8-sig").lower()
@@ -318,7 +321,7 @@ class CoreSafetyTests(unittest.TestCase):
         app.show_notification("Conversion finished", "success", duration_ms=1200)
 
         app.notification_var.set.assert_called_once_with("Conversion finished")
-        app.notification_frame.place.assert_called_once()
+        app.notification_frame.place.assert_called_once_with(relx=1.0, rely=1.0, x=-48, y=-68, anchor="se", width=570)
         app.notification_frame.lift.assert_called_once()
         app.root.after.assert_called_once_with(1200, app.hide_notification)
 
@@ -339,6 +342,174 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertEqual(compact.count("\n"), 2)
         self.assertTrue(compact.endswith("…"))
         self.assertNotIn("line 3", compact)
+
+    def test_notification_history_keeps_the_three_latest_in_newest_first_order(self):
+        app = self.bare_app()
+        app.notification_history = app_module.deque(maxlen=20)
+
+        for text in ("First", "Second", "Third", "Fourth"):
+            app.remember_notification(text, "info")
+
+        latest = [text for _timestamp, text, _level in list(app.notification_history)[:3]]
+        self.assertEqual(latest, ["Fourth", "Third", "Second"])
+
+    def test_dismiss_all_notifications_keeps_unresolved_drive_status(self):
+        app = self.bare_app()
+        app.notification_history = app_module.deque([
+            ("12:01", "Drive ready.", "success"),
+            ("12:00", "Old transient message", "info"),
+        ], maxlen=20)
+        app.notification_queue = app_module.deque([("Queued", "info", 2000)], maxlen=6)
+        app.persistent_notifications = {"drive": {"text": "Drive ready.", "root": "E:\\"}}
+        app.notification_active = True
+        app.notification_after_id = None
+        app.notification_frame = mock.Mock()
+
+        app.dismiss_all_notifications()
+
+        self.assertEqual(list(app.notification_queue), [])
+        self.assertEqual(list(app.notification_history), [("12:01", "Drive ready.", "success")])
+        self.assertFalse(app.notification_active)
+        app.notification_frame.place_forget.assert_called_once()
+
+    def test_popup_close_control_is_an_x_not_a_dismiss_button(self):
+        source = (APP_DIR / "MesterSync.pyw").read_text(encoding="utf-8")
+        notification_section = source[source.index("def build_notification_toast"):source.index("def button", source.index("def build_notification_toast"))]
+        self.assertIn('text="X"', notification_section)
+        self.assertNotIn('"Dismiss"', notification_section)
+        self.assertIn('"Dismiss all"', notification_section)
+
+    def test_disk_ready_notification_stays_until_drive_path_disappears(self):
+        with tempfile.TemporaryDirectory() as value:
+            drive_root = Path(value) / "camera-card"
+            drive_root.mkdir()
+            app = self.bare_app()
+            app.root = mock.Mock()
+            app.notification_history = app_module.deque(maxlen=20)
+            app.persistent_notifications = {}
+            app.persistent_notifications_collapsed = False
+
+            app.show_disk_ready({
+                "drive_id": "camera-123",
+                "root": str(drive_root),
+                "text": "Disk ready to remove.",
+            })
+            app.prune_removed_drive_notifications()
+            self.assertIn("camera-123", app.persistent_notifications)
+
+            drive_root.rmdir()
+            app.prune_removed_drive_notifications()
+            self.assertNotIn("camera-123", app.persistent_notifications)
+
+    def test_disk_batch_ready_notice_carries_drive_identity_and_root(self):
+        app = self.bare_app()
+        app.import_batches = {
+            "batch": {
+                "pending": set(),
+                "imported": ["one"],
+                "blocked": set(),
+                "conversion_released": False,
+                "cancelled": False,
+                "disk_batch": True,
+                "source_label": "E:\\",
+                "source_id": "E::1234",
+                "ready_notified": False,
+                "total": 1,
+            }
+        }
+
+        conversions, notice = app.import_batch_actions_locked("batch")
+
+        self.assertEqual(conversions, ["one"])
+        self.assertEqual(notice["drive_id"], "E::1234")
+        self.assertEqual(notice["root"], "E:\\")
+
+    def test_manual_scan_reports_start_and_completion_outside_the_log(self):
+        with tempfile.TemporaryDirectory() as value:
+            app = self.bare_app()
+            app.get_config = lambda: {"input_folder": value}
+            app.watchfolder_scan_lock = threading.Lock()
+            app.gui_queue = queue.Queue()
+            app.clear_task_selection = lambda: None
+            app.log = app.test_logs.append
+            visible = []
+            app.show_notification = lambda text, level="info", duration_ms=None: visible.append((text, level, duration_ms))
+            app.scan_existing_input_as_detected = lambda: 2
+
+            app.manual_scan()
+            event, payload = app.gui_queue.get(timeout=2)
+
+            self.assertEqual(visible[0], ("Scanning Importfolder for new videos...", "info", 2500))
+            self.assertEqual(event, "notification")
+            self.assertEqual(payload, ("Scan complete. Added 2 new videos.", "success", 5500))
+
+    def test_unsupported_added_files_receive_visible_feedback(self):
+        with tempfile.TemporaryDirectory() as value:
+            folder = Path(value)
+            unsupported = folder / "notes.txt"
+            unsupported.write_text("not a video", encoding="utf-8")
+            app = self.bare_app()
+            app.import_cancel_requested = threading.Event()
+            app.gui_queue = queue.Queue()
+            app.get_config = lambda: {
+                "input_folder": str(folder),
+                "conversion_extensions": [".mov"],
+            }
+
+            app.add_paths_to_import([unsupported])
+            event, payload = app.gui_queue.get(timeout=2)
+
+            self.assertEqual(event, "notification")
+            self.assertEqual(payload, ("No supported video files were found.", "warning", 5500))
+
+    def test_pause_does_not_activate_when_nothing_is_running(self):
+        app = self.bare_app()
+        app.started = False
+        app.import_enabled = False
+        app.conversion_enabled = False
+        app.transfer_enabled = False
+        app.show_notification = mock.Mock()
+        app.emit_status = mock.Mock()
+
+        app.toggle_pause()
+
+        self.assertFalse(app.pause_event.is_set())
+        app.show_notification.assert_called_once()
+
+    def test_automatic_settings_save_failure_notifies_only_once(self):
+        app = self.bare_app()
+        app.config = {"checksum_database_path": ""}
+        app.config_save_after_id = None
+        app.settings_autosave_error_notified = False
+        app.unsaved_settings_var = mock.Mock()
+        app.set_config_from_ui = lambda: None
+        app.log = mock.Mock()
+        app.show_notification = mock.Mock()
+
+        with mock.patch.object(app_module, "write_json_file", side_effect=OSError("read only")):
+            self.assertFalse(app.flush_config_autosave())
+            self.assertFalse(app.flush_config_autosave())
+
+        app.show_notification.assert_called_once()
+
+    def test_dashboard_empty_state_offers_add_and_scan_actions(self):
+        source = (APP_DIR / "MesterSync.pyw").read_text(encoding="utf-8")
+        dashboard_section = source[source.index("def build_dashboard"):source.index("def build_history")]
+        self.assertIn('text="No active files"', dashboard_section)
+        self.assertIn('"Add files", self.add_files_dialog', dashboard_section)
+        self.assertIn('"Scan Importfolder", self.manual_scan', dashboard_section)
+
+    def test_active_files_header_is_compact_without_selection_tutorial(self):
+        source = (APP_DIR / "MesterSync.pyw").read_text(encoding="utf-8")
+        dashboard_section = source[source.index("def build_dashboard"):source.index("def build_history")]
+        self.assertIn('header.configure(padx=12, pady=6)', dashboard_section)
+        self.assertNotIn("Click a row to select it", dashboard_section)
+
+    def test_setup_wizard_uses_a_scrollable_screen_aware_layout(self):
+        source = (APP_DIR / "MesterSync.pyw").read_text(encoding="utf-8")
+        wizard_section = source[source.index("def run_setup_wizard"):source.index("def available_video_encoders")]
+        self.assertIn("wizard.winfo_screenheight()", wizard_section)
+        self.assertIn("self.make_canvas_area(wizard)", wizard_section)
 
     def test_settings_categories_show_only_the_selected_section(self):
         app = self.bare_app()
@@ -416,6 +587,152 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertEqual(prefixed, ["Summer_first_clip"])
         self.assertEqual(suffixed, ["first_clip_final"])
 
+    def test_batch_rename_requires_a_matching_second_confirmation_click(self):
+        app = self.bare_app()
+        app.root = mock.Mock()
+        app.root.after.return_value = "batch-confirm-timeout"
+        first = app_module.TaskState(task_id="first", original_path=Path("first.mov"), display_name="first.mov", rename_base="first")
+        second = app_module.TaskState(task_id="second", original_path=Path("second.mov"), display_name="second.mov", rename_base="second")
+        app.tasks = {"first": first, "second": second}
+        app.task_lock = threading.RLock()
+        app.selected_ids = ["first", "second"]
+        app.batch_name_var = mock.Mock(get=lambda: "concert", set=lambda _value: None)
+        app.batch_prefix_var = mock.Mock(get=lambda: False, set=lambda _value: None)
+        app.batch_suffix_var = mock.Mock(get=lambda: False, set=lambda _value: None)
+        app.batch_hint_var = mock.Mock()
+        app.batch_apply_btn = mock.Mock()
+        app.batch_frame = mock.Mock()
+        app.batch_frame.winfo_ismapped.return_value = True
+        app.batch_rename_row = mock.Mock()
+        app.batch_rename_row.winfo_ismapped.return_value = True
+        app.get_config = lambda: {"auto_underscore_renames": False}
+        app.show_notification = mock.Mock()
+        app.log = mock.Mock()
+        app.update_batch_affix_buttons = mock.Mock()
+        app.clear_task_selection = mock.Mock()
+        app.batch_rename_confirmation = None
+        app.batch_rename_confirmation_after_id = None
+
+        def update_task(task_id, **changes):
+            for key, value in changes.items():
+                setattr(app.tasks[task_id], key, value)
+
+        app.update_task = update_task
+        app.apply_batch_box_rename()
+
+        self.assertEqual(first.rename_base, "first")
+        self.assertEqual(second.rename_base, "second")
+        app.batch_apply_btn.configure.assert_any_call(
+            text="Confirm rename 2 files",
+            bg=app_module.MesterSyncApp.ORANGE,
+            activebackground=app_module.MesterSyncApp.ORANGE,
+        )
+
+        app.apply_batch_box_rename()
+
+        self.assertEqual(first.rename_base, "concert_01")
+        self.assertEqual(second.rename_base, "concert_02")
+        app.clear_task_selection.assert_called_once()
+
+    def test_inline_rename_never_changes_other_selected_rows(self):
+        app = self.bare_app()
+        app.root = mock.Mock()
+        first = app_module.TaskState(task_id="first", original_path=Path("first.mov"), display_name="first.mov", rename_base="first")
+        second = app_module.TaskState(task_id="second", original_path=Path("second.mov"), display_name="second.mov", rename_base="second")
+        app.tasks = {"first": first, "second": second}
+        app.selected_ids = ["first", "second"]
+        app.row_widgets = {
+            "first": {"dirty": True, "rename_var": mock.Mock(get=lambda: "only this one")},
+            "second": {"dirty": False, "rename_var": mock.Mock(get=lambda: "second")},
+        }
+        app.get_config = lambda: {"auto_underscore_renames": False}
+        app.log = mock.Mock()
+
+        def update_task(task_id, **changes):
+            for key, value in changes.items():
+                setattr(app.tasks[task_id], key, value)
+
+        app.update_task = update_task
+        app.commit_rename("first")
+
+        self.assertEqual(first.rename_base, "only this one")
+        self.assertEqual(second.rename_base, "second")
+
+    def test_focusing_inline_name_exits_multi_selection(self):
+        app = self.bare_app()
+        app.selected_ids = ["first", "second"]
+        app.selection_anchor_id = "first"
+        app.row_widgets = {"second": {"dirty": False}}
+        app.update_selection_visuals = mock.Mock()
+        app.update_batch_box_visibility = mock.Mock()
+
+        app.begin_single_rename("second")
+
+        self.assertEqual(app.selected_ids, ["second"])
+        self.assertEqual(app.selection_anchor_id, "second")
+        self.assertTrue(app.row_widgets["second"]["dirty"])
+
+    def test_convert_in_place_prefers_verified_local_copy_over_recording_disk(self):
+        with tempfile.TemporaryDirectory() as value:
+            folder = Path(value)
+            recording_disk = folder / "disk" / "clip.mov"
+            local_copy = folder / "import" / "clip.mov"
+            recording_disk.parent.mkdir()
+            local_copy.parent.mkdir()
+            recording_disk.write_bytes(b"disk")
+            local_copy.write_bytes(b"local")
+            app = self.bare_app()
+            task = app_module.TaskState(
+                task_id="source-order",
+                original_path=recording_disk,
+                local_input_path=local_copy,
+                display_name="clip.mov",
+            )
+
+            self.assertEqual(app.find_convert_in_place_source(task), local_copy)
+
+    def test_convert_file_picker_does_not_repurpose_stale_dashboard_selection(self):
+        with tempfile.TemporaryDirectory() as value:
+            chosen = Path(value) / "chosen.mov"
+            chosen.write_bytes(b"video")
+            app = self.bare_app()
+            app.selected_ids = ["stale-row"]
+            app.clear_task_selection = mock.Mock()
+            app.validate_ffmpeg_for_conversion = lambda: chosen
+            app.create_convert_in_place_task = mock.Mock(return_value="new-task")
+            app.queue_convert_in_place_tasks = mock.Mock()
+
+            with mock.patch.object(app_module.filedialog, "askopenfilenames", return_value=[str(chosen)]):
+                app.choose_convert_in_place_files()
+
+            app.clear_task_selection.assert_called_once_with()
+            app.create_convert_in_place_task.assert_called_once_with(chosen)
+            app.queue_convert_in_place_tasks.assert_called_once_with(["new-task"])
+
+    def test_detected_recording_disk_row_cannot_be_repurposed_for_in_place_conversion(self):
+        with tempfile.TemporaryDirectory() as value:
+            source = Path(value) / "recording.mov"
+            source.write_bytes(b"video")
+            app = self.bare_app()
+            task = app_module.TaskState(
+                task_id="waiting-import",
+                original_path=source,
+                display_name=source.name,
+                stage=app_module.STAGE_DETECTED,
+            )
+            app.tasks = {task.task_id: task}
+            app.selected_ids = [task.task_id]
+            app.row_widgets = {}
+            app.validate_ffmpeg_for_conversion = lambda: source
+            app.log = mock.Mock()
+            app.queue_convert_in_place_tasks = mock.Mock()
+
+            app.convert_in_place_selected()
+
+            self.assertFalse(task.convert_in_place)
+            self.assertEqual(task.stage, app_module.STAGE_DETECTED)
+            app.queue_convert_in_place_tasks.assert_called_once_with([], blocked=1)
+
     def test_preset_test_keeps_only_the_new_validated_output(self):
         with tempfile.TemporaryDirectory() as value:
             folder = Path(value)
@@ -488,6 +805,214 @@ class CoreSafetyTests(unittest.TestCase):
             )
             self.assertIn("Checksum already imported", reason)
 
+    def test_renamed_identical_video_is_detected_by_content(self):
+        with tempfile.TemporaryDirectory() as value:
+            folder = Path(value)
+            source = folder / "camera_b_take_17.mov"
+            source.write_bytes(os.urandom(64 * 1024))
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            database = {
+                digest: {
+                    "original_name": "hyperdeck_02.mp4",
+                    "original_size": source.stat().st_size,
+                    "quick_fingerprint": duplicates.quick_fingerprint(source),
+                    "final_path": "remembered NAS file",
+                }
+            }
+
+            reason = duplicates.exact_duplicate_reason(
+                source,
+                {"check_existing_in_input": False},
+                database,
+                threading.Event(),
+            )
+
+            self.assertIn("Checksum already imported", reason)
+
+    def test_quick_fingerprint_skips_full_hash_for_different_same_size_recordings(self):
+        with tempfile.TemporaryDirectory() as value:
+            folder = Path(value)
+            source = folder / "camera_a.mov"
+            remembered = folder / "camera_b.mov"
+            source.write_bytes(b"A" * (8 * 1024 * 1024))
+            remembered.write_bytes(b"B" * (8 * 1024 * 1024))
+            database = {
+                hashlib.sha256(remembered.read_bytes()).hexdigest(): {
+                    "original_name": remembered.name,
+                    "original_size": remembered.stat().st_size,
+                    "quick_fingerprint": duplicates.quick_fingerprint(remembered),
+                    "final_path": "remembered NAS file",
+                }
+            }
+
+            with mock.patch.object(duplicates, "sha256_file", side_effect=AssertionError("full hash should not run")):
+                reason = duplicates.exact_duplicate_reason(
+                    source,
+                    {},
+                    database,
+                    threading.Event(),
+                    fingerprint_cache={},
+                )
+
+            self.assertEqual(reason, "")
+
+    def test_quick_fingerprint_match_still_requires_full_hash(self):
+        with tempfile.TemporaryDirectory() as value:
+            source = Path(value) / "possible_match.mov"
+            source.write_bytes(os.urandom(8 * 1024 * 1024))
+            database = {
+                "b" * 64: {
+                    "original_name": "other_name.mov",
+                    "original_size": source.stat().st_size,
+                    "quick_fingerprint": duplicates.quick_fingerprint(source),
+                    "final_path": "remembered NAS file",
+                }
+            }
+
+            with mock.patch.object(duplicates, "sha256_file", wraps=file_utils.sha256_file) as full_hash:
+                reason = duplicates.exact_duplicate_reason(
+                    source,
+                    {},
+                    database,
+                    threading.Event(),
+                    fingerprint_cache={},
+                )
+
+            self.assertEqual(reason, "")
+            full_hash.assert_called_once()
+
+    def test_quick_fingerprint_cache_avoids_rechecking_importfolder_files(self):
+        with tempfile.TemporaryDirectory() as value:
+            folder = Path(value)
+            import_folder = folder / "imports"
+            card = folder / "card"
+            import_folder.mkdir()
+            card.mkdir()
+            incoming = card / "hyperdeck_02.mov"
+            existing = import_folder / "hyperdeck_01.mov"
+            incoming.write_bytes(b"A" * (8 * 1024 * 1024))
+            existing.write_bytes(b"B" * (8 * 1024 * 1024))
+            cache = {}
+
+            with mock.patch.object(duplicates, "quick_fingerprint", wraps=duplicates.quick_fingerprint) as sampled, mock.patch.object(
+                duplicates,
+                "sha256_file",
+                side_effect=AssertionError("different samples should not need full hashing"),
+            ):
+                for _ in range(2):
+                    reason = duplicates.exact_duplicate_reason(
+                        incoming,
+                        {"input_folder": str(import_folder)},
+                        {},
+                        threading.Event(),
+                        fingerprint_cache=cache,
+                    )
+                    self.assertEqual(reason, "")
+
+            self.assertEqual(sampled.call_count, 2)
+
+    def test_duplicate_protection_cannot_be_disabled_by_old_config(self):
+        with tempfile.TemporaryDirectory() as value:
+            source = Path(value) / "renamed_camera_file.mov"
+            source.write_bytes(os.urandom(64 * 1024))
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            app = self.bare_app()
+            app.checksum_lock = threading.RLock()
+            app.checksum_db = {
+                digest: {
+                    "original_name": "hyperdeck_02.mp4",
+                    "original_size": source.stat().st_size,
+                    "final_path": "remembered NAS file",
+                }
+            }
+            app.import_cancel_requested = threading.Event()
+
+            reason = app.duplicate_reason_for(
+                source,
+                {
+                    "enable_duplicate_detection": False,
+                    "check_existing_in_input": False,
+                },
+            )
+
+            self.assertIn("Checksum already imported", reason)
+
+    def test_checksum_database_save_failure_is_reported_as_unsafe(self):
+        with tempfile.TemporaryDirectory() as value:
+            source = Path(value) / "camera.mov"
+            source.write_bytes(b"concert video")
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            app = self.bare_app()
+            app.checksum_lock = threading.RLock()
+            app.checksum_db = {}
+            app.get_config = lambda: {"checksum_database_path": str(Path(value) / "checksums.json")}
+
+            with mock.patch.object(app_module, "save_checksum_records", side_effect=OSError("disk unavailable")):
+                saved = app.remember_original_checksum(digest, source.name, source.stat().st_size, source)
+
+            self.assertFalse(saved)
+            self.assertIn(digest, app.checksum_db)
+            self.assertEqual(app.checksum_db[digest]["quick_fingerprint"], duplicates.quick_fingerprint(source))
+            self.assertTrue(any("could not save checksum database" in line.lower() for line in app.test_logs))
+
+    def test_history_recovers_a_missing_duplicate_fingerprint_database(self):
+        digest = "a" * 64
+        app = self.bare_app()
+        app.config_lock = threading.RLock()
+        app.checksum_lock = threading.RLock()
+        app.get_config = lambda: {"checksum_database_path": "missing-checksums.json"}
+        app.history_records = [{
+            "display_name": "hyperdeck_02.mp4",
+            "path": "D:/Concert archive/hyperdeck_02.mp4",
+            "original_checksum": digest,
+            "original_size": 123456,
+        }]
+
+        with mock.patch.object(app_module, "load_checksum_records", return_value={}):
+            app.load_checksum_database()
+
+        self.assertIn(digest, app.checksum_db)
+        self.assertEqual(app.checksum_db[digest]["original_name"], "hyperdeck_02.mp4")
+        self.assertEqual(app.checksum_db[digest]["original_size"], 123456)
+
+    def test_renamed_identical_video_already_in_importfolder_is_detected(self):
+        with tempfile.TemporaryDirectory() as value:
+            folder = Path(value)
+            import_folder = folder / "imports"
+            card = folder / "card"
+            import_folder.mkdir()
+            card.mkdir()
+            payload = os.urandom(64 * 1024)
+            existing = import_folder / "concert_master.mov"
+            incoming = card / "hyperdeck_02.mp4"
+            existing.write_bytes(payload)
+            incoming.write_bytes(payload)
+
+            reason = duplicates.exact_duplicate_reason(
+                incoming,
+                {"check_existing_in_input": False, "input_folder": str(import_folder)},
+                {},
+                threading.Event(),
+            )
+
+            self.assertIn("Exact same video already exists", reason)
+
+    def test_hash_rejects_a_file_that_changes_while_being_read(self):
+        with tempfile.TemporaryDirectory() as value:
+            source = Path(value) / "still_recording.mov"
+            source.write_bytes(os.urandom(8 * 1024 * 1024))
+            changed = False
+
+            def change_timestamp(_percent, _processed, _total):
+                nonlocal changed
+                if changed:
+                    return
+                changed = True
+                stat = source.stat()
+                os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+
+            self.assertIsNone(file_utils.sha256_file(source, progress_callback=change_timestamp))
+
     def test_directly_watched_source_gets_a_durable_duplicate_fingerprint(self):
         with tempfile.TemporaryDirectory() as value:
             source = Path(value) / "camera_01.mov"
@@ -519,7 +1044,7 @@ class CoreSafetyTests(unittest.TestCase):
                 source,
             )
 
-    def test_exact_duplicate_from_connected_drive_is_skipped_without_copying(self):
+    def test_exact_duplicate_from_connected_drive_waits_for_import_anyway_review(self):
         with tempfile.TemporaryDirectory() as value:
             source = Path(value) / "camera_01.mov"
             source.write_bytes(b"already imported")
@@ -539,7 +1064,6 @@ class CoreSafetyTests(unittest.TestCase):
             app.set_import_progress_snapshot = mock.Mock()
             app.clear_import_progress_snapshot = mock.Mock()
             app.duplicate_reason_for = mock.Mock(return_value="Checksum already imported")
-            app.discard_detected_task = mock.Mock()
             app.import_single_file = mock.Mock()
             app.emit_status = mock.Mock()
 
@@ -549,9 +1073,117 @@ class CoreSafetyTests(unittest.TestCase):
             app.complete_import_job = mock.Mock(side_effect=finish_once)
             app.import_worker()
 
-            app.discard_detected_task.assert_called_once_with(task.task_id)
             app.import_single_file.assert_not_called()
-            self.assertTrue(any("skipped exact duplicate from disk" in line for line in app.test_logs))
+            app.update_task.assert_any_call(
+                task.task_id,
+                stage=app_module.STAGE_DUPLICATE_REVIEW,
+                duplicate=True,
+                duplicate_reason="Checksum already imported",
+                detail="Checksum already imported",
+                progress=0,
+            )
+            app.complete_import_job.assert_called_once_with(task.task_id, success=False, blocked=True)
+            self.assertTrue(any("needs review" in line.lower() for line in app.test_logs))
+
+    def test_import_anyway_bypasses_duplicate_detection_and_is_persisted(self):
+        task = app_module.TaskState(
+            task_id="force-import",
+            original_path=Path("duplicate.mov"),
+            display_name="duplicate.mov",
+            stage=app_module.STAGE_DUPLICATE_REVIEW,
+            duplicate=True,
+            duplicate_reason="Already imported",
+            force_import=True,
+        )
+        app = self.bare_app()
+        app.duplicate_reason_for = mock.Mock(return_value="should not be returned")
+
+        self.assertEqual(app.duplicate_reason_for_import_task(task, {}), "")
+        app.duplicate_reason_for.assert_not_called()
+
+        restored = storage.record_to_task(storage.task_to_record(task))
+        self.assertIsNotNone(restored)
+        self.assertTrue(restored.force_import)
+
+    def test_import_worker_never_rechecks_a_forced_import(self):
+        task = app_module.TaskState(
+            task_id="forced-worker",
+            original_path=Path("duplicate.mov"),
+            display_name="duplicate.mov",
+            force_import=True,
+        )
+        app = self.bare_app()
+        app.task_lock = threading.RLock()
+        app.tasks = {task.task_id: task}
+        app.import_condition = threading.Condition()
+        app.import_queue = app_module.deque([task.task_id])
+        app.queued_import_ids = {task.task_id}
+        app.import_job_requires_enabled = {task.task_id: False}
+        app.import_job_batch = {}
+        app.import_batches = {}
+        app.import_enabled = False
+        app.current_import_id = None
+        app.update_task = mock.Mock()
+        app.set_import_progress_snapshot = mock.Mock()
+        app.clear_import_progress_snapshot = mock.Mock()
+        app.duplicate_reason_for = mock.Mock(return_value="duplicate")
+        app.complete_import_job = mock.Mock()
+        app.emit_status = mock.Mock()
+
+        def import_once(*_args, **_kwargs):
+            app.shutdown_event.set()
+
+        app.import_single_file = mock.Mock(side_effect=import_once)
+        app.import_worker()
+
+        app.duplicate_reason_for.assert_not_called()
+        app.import_single_file.assert_called_once_with(task.original_path, task.task_id, False)
+
+    def test_import_anyway_sets_override_and_requeues_while_import_is_stopped(self):
+        task = app_module.TaskState(
+            task_id="force-import-click",
+            original_path=Path("duplicate.mov"),
+            display_name="duplicate.mov",
+            stage=app_module.STAGE_DUPLICATE_REVIEW,
+            duplicate=True,
+            duplicate_reason="Already imported",
+        )
+        app = self.bare_app()
+        app.tasks = {task.task_id: task}
+        app.import_cancel_requested = threading.Event()
+        app.import_cancel_requested.set()
+        app.requeue_duplicate_import = mock.Mock()
+        app.ensure_workers_running = mock.Mock()
+        app.show_notification = mock.Mock()
+
+        def update_task(task_id, **changes):
+            for key, value in changes.items():
+                setattr(app.tasks[task_id], key, value)
+
+        app.update_task = update_task
+        app.import_duplicate_task(task.task_id)
+
+        self.assertFalse(app.import_cancel_requested.is_set())
+        self.assertTrue(task.force_import)
+        self.assertFalse(task.duplicate)
+        self.assertEqual(task.stage, app_module.STAGE_DETECTED)
+        app.requeue_duplicate_import.assert_called_once_with(task.task_id)
+        app.ensure_workers_running.assert_called_once()
+
+    def test_interrupted_preimport_states_restore_with_a_restart_action(self):
+        for stage in (app_module.STAGE_DETECTED, app_module.STAGE_CHECKING, app_module.STAGE_STOPPING):
+            restored = storage.record_to_task({
+                "task_id": f"restore-{stage}",
+                "original_path": "camera.mov",
+                "display_name": "camera.mov",
+                "stage": stage,
+                "force_import": True,
+            })
+
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.stage, app_module.STAGE_STOPPED)
+            self.assertTrue(restored.force_import)
+            self.assertIn("Restart/Resume", restored.detail)
 
     def test_atomic_json_write_keeps_previous_backup(self):
         with tempfile.TemporaryDirectory() as value:
@@ -657,6 +1289,27 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertIs(app.tasks[task.task_id], task)
         self.assertEqual(task.stage, app_module.STAGE_ERROR)
         self.assertEqual(pending_snapshots, [set(), {task.task_id}])
+
+    def test_history_clear_and_single_remove_roll_back_when_save_fails(self):
+        original = [{"display_name": "one"}, {"display_name": "two"}]
+        app = self.bare_app()
+        app.history_lock = threading.RLock()
+        app.history_records = list(original)
+        app.show_notification = mock.Mock()
+        app.cleanup_history_thumbnails = mock.Mock()
+        app.refresh_history_view = mock.Mock()
+        app.save_history = mock.Mock(side_effect=OSError("history unavailable"))
+
+        with mock.patch.object(app_module.messagebox, "askyesno", return_value=True):
+            app.clear_history()
+
+        self.assertEqual(app.history_records, original)
+        app.cleanup_history_thumbnails.assert_not_called()
+
+        app.remove_history_entry(0)
+
+        self.assertEqual(app.history_records, original)
+        app.cleanup_history_thumbnails.assert_not_called()
 
     def test_skip_before_import_redraws_immediately_and_stays_for_history(self):
         app = self.bare_app()
@@ -765,6 +1418,7 @@ class CoreSafetyTests(unittest.TestCase):
                 "status": "skipped",
                 "input_path": str(original),
                 "input_folder": str(input_folder),
+                "original_checksum": hashlib.sha256(original.read_bytes()).hexdigest(),
             }
             app.history_records = [record]
             app.save_history = lambda force=False: None
@@ -792,8 +1446,10 @@ class CoreSafetyTests(unittest.TestCase):
             task = app_module.TaskState(
                 task_id="in-place-name",
                 original_path=source,
+                local_input_path=source,
                 display_name=source.name,
                 rename_base=source.stem,
+                stage=app_module.STAGE_IMPORTED,
             )
             app.tasks = {task.task_id: task}
             app.selected_ids = [task.task_id]
@@ -913,6 +1569,23 @@ class CoreSafetyTests(unittest.TestCase):
             self.assertTrue(safe_files.move_file_no_overwrite(source, moved, logs.append))
             self.assertFalse(source.exists())
             self.assertEqual(moved.read_bytes(), b"source")
+
+    def test_cleanup_deletes_only_the_exact_verified_working_copy(self):
+        with tempfile.TemporaryDirectory() as value:
+            folder = Path(value)
+            working = folder / "working.mov"
+            original = b"MesterSync managed copy"
+            expected = hashlib.sha256(original).hexdigest()
+            logs = []
+
+            working.write_bytes(b"different recording now at this path")
+            self.assertFalse(safe_files.delete_file_if_checksum_matches(working, expected, logs.append))
+            self.assertTrue(working.exists())
+            self.assertEqual(working.read_bytes(), b"different recording now at this path")
+
+            working.write_bytes(original)
+            self.assertTrue(safe_files.delete_file_if_checksum_matches(working, expected, logs.append))
+            self.assertFalse(working.exists())
 
     def test_media_validation_rejects_incomplete_conversions(self):
         source_info = {

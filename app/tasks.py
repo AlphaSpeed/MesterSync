@@ -61,6 +61,7 @@ class TaskState:
     skip_archive_due: Optional[float] = None
     duplicate: bool = False
     duplicate_reason: str = ""
+    force_import: bool = False
     error_log: str = ""
     convert_in_place: bool = False
     import_stop_event: threading.Event = field(default_factory=threading.Event, repr=False)

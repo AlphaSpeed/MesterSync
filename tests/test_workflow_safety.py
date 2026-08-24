@@ -59,6 +59,30 @@ class WorkflowSafetyTests(unittest.TestCase):
             self.assertEqual(second_target.name, "recording_1.mov")
             self.assertNotEqual(first_target, second_target)
 
+    def test_identical_recording_with_a_different_filename_is_blocked(self):
+        with tempfile.TemporaryDirectory() as value:
+            folder = Path(value)
+            source = folder / "camera_2_renamed.mov"
+            source.write_bytes(os.urandom(256 * 1024))
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            database = {
+                digest: {
+                    "original_name": "hyperdeck_02.mp4",
+                    "original_size": source.stat().st_size,
+                    "quick_fingerprint": duplicates.quick_fingerprint(source),
+                    "final_path": "D:/Concert archive/hyperdeck_02.mp4",
+                }
+            }
+
+            reason = duplicates.exact_duplicate_reason(
+                source,
+                {"check_existing_in_input": False},
+                database,
+                threading.Event(),
+            )
+
+            self.assertIn("Checksum already imported", reason)
+
     def test_final_names_are_unique_across_output_nas_and_active_jobs(self):
         with tempfile.TemporaryDirectory() as value:
             folder = Path(value)
