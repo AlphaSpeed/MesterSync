@@ -5,7 +5,12 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Tuple
 
-from file_utils import is_video_file, should_exclude_file
+from file_utils import (
+    is_system_metadata_directory,
+    is_video_file,
+    path_contains_system_metadata,
+    should_exclude_file,
+)
 
 
 StopCheck = Callable[[], bool]
@@ -21,9 +26,14 @@ def collect_import_candidates(paths: Iterable[Path], extensions: Iterable[str], 
             for sub in path.rglob("*"):
                 if should_stop():
                     break
-                if sub.is_file() and is_video_file(sub, extensions):
+                if (
+                    sub.is_file()
+                    and not path_contains_system_metadata(sub)
+                    and not should_exclude_file(sub.name, ())
+                    and is_video_file(sub, extensions)
+                ):
                     candidates.append(sub)
-        elif path.is_file() and is_video_file(path, extensions):
+        elif path.is_file() and not should_exclude_file(path.name, ()) and is_video_file(path, extensions):
             candidates.append(path)
     return candidates
 
@@ -41,7 +51,13 @@ def scan_watchfolder_candidates(input_folder: Path, extensions: Iterable[str], e
                     continue
             except (OSError, RuntimeError, ValueError):
                 continue
-        if not path.is_file() or path.suffix.lower() == ".part" or not is_video_file(path, extensions):
+        if (
+            not path.is_file()
+            or path.suffix.lower() == ".part"
+            or path_contains_system_metadata(path)
+            or should_exclude_file(path.name, ())
+            or not is_video_file(path, extensions)
+        ):
             continue
         candidates.append(path)
     return candidates
@@ -58,7 +74,11 @@ def scan_drive_importable_videos(
     scanned = 0
     last_scan_update = 0.0
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d.lower() not in exclude_folders]
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d.lower() not in exclude_folders and not is_system_metadata_directory(d)
+        ]
         for filename in filenames:
             if should_stop():
                 return found, scanned

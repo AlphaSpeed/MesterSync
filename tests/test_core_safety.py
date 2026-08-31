@@ -17,6 +17,7 @@ os.environ.setdefault("MESTERSYNC_DATA_DIR", str(Path(tempfile.gettempdir()) / f
 sys.path.insert(0, str(APP_DIR))
 
 import duplicates
+import duplicate_ledger
 import file_utils
 import history_utils
 import importer
@@ -50,6 +51,379 @@ class CoreSafetyTests(unittest.TestCase):
     def test_missing_source_task_record_is_rejected(self):
         self.assertIsNone(storage.record_to_task({}))
         self.assertIsNone(storage.record_to_task({"original_path": "  "}))
+
+    def test_camera_disk_metadata_sidecars_are_never_imported(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            real = root / "HyperDeck_0001.mp4"
+            sidecar = root / "._HyperDeck_0001.mp4"
+            private = root / ".BlamOS-Private-Items"
+            private.mkdir()
+            hidden_video = private / "HyperDeck_hidden.mp4"
+            real.write_bytes(b"real recording")
+            sidecar.write_bytes(b"metadata")
+            hidden_video.write_bytes(b"private metadata")
+
+            found, _scanned = importer.scan_drive_importable_videos(
+                root,
+                {
+                    "exclude_files": [],
+                    "exclude_folders": [],
+                    "import_extensions": [".mp4"],
+                },
+                lambda: False,
+                lambda *_args: None,
+            )
+            manually_added = importer.collect_import_candidates(
+                [root],
+                [".mp4"],
+                lambda: False,
+            )
+
+            self.assertEqual(found, [real])
+            self.assertEqual(manually_added, [real])
+
+    def test_reinserted_drive_only_returns_files_not_previously_imported_from_it(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            drive = root / "camera-disk"
+            imports = root / "imports"
+            drive.mkdir()
+            imports.mkdir()
+            old_source = drive / "HyperDeck_0001.mp4"
+            new_source = drive / "HyperDeck_0002.mp4"
+            imported_copy = imports / old_source.name
+            old_source.write_bytes(os.urandom(128 * 1024))
+            imported_copy.write_bytes(old_source.read_bytes())
+            new_source.write_bytes(os.urandom(128 * 1024))
+            digest = hashlib.sha256(old_source.read_bytes()).hexdigest()
+
+            app = self.bare_app()
+            app.checksum_lock = threading.RLock()
+            app.checksum_db = {}
+            app.import_cancel_requested = threading.Event()
+            app.task_lock = threading.RLock()
+            app.tasks = {}
+            app.task_by_path = {}
+            app.get_config = lambda: {"checksum_database_path": str(root / "checksums.json")}
+
+            saved = app.remember_original_checksum(
+                digest,
+                old_source.name,
+                old_source.stat().st_size,
+                imported_copy,
+                source_path=old_source,
+                source_root=drive,
+                source_id="volume:12345678",
+            )
+            fresh, active_count, remembered_count = app.filter_new_drive_sources(
+                drive,
+                "volume:12345678",
+                [old_source, new_source],
+            )
+
+            self.assertTrue(saved)
+            self.assertEqual(fresh, [new_source])
+            self.assertEqual(active_count, 0)
+            self.assertEqual(remembered_count, 1)
+            self.assertEqual(
+                app.checksum_db[digest]["drive_sources"][0]["relative_path"],
+                "hyperdeck_0001.mp4",
+            )
+
+    def test_changed_file_at_a_remembered_drive_path_is_checked_as_new(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            drive = root / "camera-disk"
+            drive.mkdir()
+            source = drive / "HyperDeck_0001.mp4"
+            imported_copy = root / "imported.mp4"
+            source.write_bytes(b"first recording")
+            imported_copy.write_bytes(source.read_bytes())
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+
+            app = self.bare_app()
+            app.checksum_lock = threading.RLock()
+            app.checksum_db = {}
+            app.import_cancel_requested = threading.Event()
+            app.task_lock = threading.RLock()
+            app.tasks = {}
+            app.task_by_path = {}
+            app.get_config = lambda: {"checksum_database_path": str(root / "checksums.json")}
+            self.assertTrue(app.remember_original_checksum(
+                digest,
+                source.name,
+                source.stat().st_size,
+                imported_copy,
+                source_path=source,
+                source_root=drive,
+                source_id="volume:12345678",
+            ))
+
+            source.write_bytes(b"second and different recording")
+            fresh, _active_count, remembered_count = app.filter_new_drive_sources(
+                drive,
+                "volume:12345678",
+                [source],
+            )
+
+            self.assertEqual(fresh, [source])
+            self.assertEqual(remembered_count, 0)
+
+    def test_drive_rescan_never_requeues_a_source_with_an_active_task(self):
+        source = Path("E:/HyperDeck_0013.mp4")
+        task = app_module.TaskState(
+            task_id="currently-converting",
+            original_path=source,
+            display_name=source.name,
+            stage=app_module.STAGE_CONVERTING,
+        )
+        app = self.bare_app()
+        app.task_lock = threading.RLock()
+        app.tasks = {task.task_id: task}
+        app.task_by_path = {file_utils.path_key(source): task.task_id}
+        app.drive_source_was_imported = mock.Mock(return_value=False)
+
+        fresh, active_count, remembered_count = app.filter_new_drive_sources(
+            Path("E:/"),
+            "volume:12345678",
+            [source],
+        )
+
+        self.assertEqual(fresh, [])
+        self.assertEqual(active_count, 1)
+        self.assertEqual(remembered_count, 0)
+        app.drive_source_was_imported.assert_not_called()
+        self.assertEqual(task.stage, app_module.STAGE_CONVERTING)
+
+    def test_one_missed_windows_drive_scan_does_not_trigger_a_fresh_import(self):
+        app = self.bare_app()
+        app.processed_drive_ids = {"volume:12345678"}
+        app.drive_missing_scan_counts = {}
+
+        app.update_connected_drive_memory([])
+        self.assertIn("volume:12345678", app.processed_drive_ids)
+        app.update_connected_drive_memory(["volume:12345678"])
+        self.assertIn("volume:12345678", app.processed_drive_ids)
+        self.assertEqual(app.drive_missing_scan_counts, {})
+
+        app.update_connected_drive_memory([])
+        app.update_connected_drive_memory([])
+        self.assertNotIn("volume:12345678", app.processed_drive_ids)
+
+    def test_shared_nas_ledger_blocks_an_identical_original_on_another_computer(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            nas = root / "nas"
+            nas.mkdir()
+            final = nas / "Concert_Master.mp4"
+            final.write_bytes(b"converted output")
+            source = root / "HyperDeck_0001.mp4"
+            source.write_bytes(os.urandom(512 * 1024))
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            first_pc_records = {
+                digest: {
+                    "original_name": source.name,
+                    "original_size": source.stat().st_size,
+                    "quick_fingerprint": duplicates.quick_fingerprint(source),
+                    "final_path": str(final),
+                }
+            }
+
+            exported = duplicate_ledger.sync_shared_checksum_ledger(nas, first_pc_records, [final])
+            renamed_source = root / "camera_copy_with_new_name.mp4"
+            renamed_source.write_bytes(source.read_bytes())
+            cfg = {
+                "nas_folder": str(nas),
+                "input_folder": "",
+                "checksum_database_path": str(root / "second-pc-checksums.json"),
+            }
+            second_pc = self.bare_app()
+            second_pc.config_lock = threading.RLock()
+            second_pc.checksum_lock = threading.RLock()
+            second_pc.history_lock = threading.RLock()
+            second_pc.checksum_db = {}
+            second_pc.history_records = []
+            second_pc.import_cancel_requested = threading.Event()
+            second_pc.get_config = lambda: cfg
+            reason = second_pc.duplicate_reason_for(
+                renamed_source,
+                cfg,
+            )
+
+            self.assertTrue(exported.initialized)
+            self.assertEqual(exported.error, "")
+            self.assertIn(digest, second_pc.checksum_db)
+            self.assertIn("Checksum already imported", reason)
+
+    def test_shared_nas_ledger_does_not_claim_coverage_for_untracked_archive(self):
+        with tempfile.TemporaryDirectory() as value:
+            nas = Path(value) / "nas"
+            nas.mkdir()
+            (nas / "old_concert.mp4").write_bytes(b"converted before shared history")
+
+            result = duplicate_ledger.sync_shared_checksum_ledger(nas, {})
+
+            self.assertFalse(result.initialized)
+            self.assertIn("already contains media", result.error)
+            self.assertFalse((nas / duplicate_ledger.LEDGER_DIRNAME).exists())
+
+    def test_shared_nas_ledger_keeps_all_forced_import_locations(self):
+        with tempfile.TemporaryDirectory() as value:
+            nas = Path(value) / "nas"
+            nas.mkdir()
+            first = nas / "concert.mp4"
+            first.write_bytes(b"first conversion")
+            digest = "a" * 64
+            initial = duplicate_ledger.sync_shared_checksum_ledger(
+                nas,
+                {digest: {"original_size": 123, "final_path": str(first)}},
+                [first],
+            )
+            second = nas / "concert_1.mp4"
+            second.write_bytes(b"intentional extra conversion")
+            updated = duplicate_ledger.publish_shared_checksum_record(
+                nas,
+                digest,
+                {"original_size": 123, "final_path": str(second)},
+            )
+
+            self.assertTrue(initial.initialized)
+            self.assertEqual(updated.error, "")
+            self.assertEqual(set(updated.records[digest]["final_paths"]), {str(first), str(second)})
+
+    def test_incomplete_old_nas_still_learns_and_blocks_new_exact_records(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            nas = root / "nas"
+            nas.mkdir()
+            (nas / "untracked_old_concert.mp4").write_bytes(b"old archive media")
+            final = nas / "new_concert.mp4"
+            final.write_bytes(b"new converted media")
+            source = root / "camera_original.mov"
+            source.write_bytes(os.urandom(64 * 1024))
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            record = {
+                "original_size": source.stat().st_size,
+                "quick_fingerprint": duplicates.quick_fingerprint(source),
+                "final_path": str(final),
+            }
+
+            published = duplicate_ledger.publish_shared_checksum_record(nas, digest, record)
+            refreshed = duplicate_ledger.sync_shared_checksum_ledger(nas, {})
+            reason = duplicates.exact_duplicate_reason(
+                source,
+                {"input_folder": ""},
+                refreshed.records,
+                threading.Event(),
+            )
+
+            self.assertFalse(published.initialized)
+            self.assertEqual(published.exported, 1)
+            self.assertIn("already contains media", refreshed.error)
+            self.assertIn("Checksum already imported", reason)
+
+    def test_shared_checksum_claim_detects_a_concurrent_second_import(self):
+        with tempfile.TemporaryDirectory() as value:
+            nas = Path(value) / "nas"
+            nas.mkdir()
+            initialized = duplicate_ledger.sync_shared_checksum_ledger(nas, {})
+            digest = "c" * 64
+            record = {"original_size": 456, "original_name": "camera.mp4"}
+
+            first = duplicate_ledger.publish_shared_checksum_record(nas, digest, record)
+            second = duplicate_ledger.publish_shared_checksum_record(nas, digest, record)
+
+            self.assertTrue(initialized.initialized)
+            self.assertFalse(first.already_present)
+            self.assertTrue(second.already_present)
+
+    def test_initialized_ledger_with_missing_record_folder_fails_closed(self):
+        with tempfile.TemporaryDirectory() as value:
+            nas = Path(value) / "nas"
+            nas.mkdir()
+            initialized = duplicate_ledger.sync_shared_checksum_ledger(nas, {})
+            records_folder = nas / duplicate_ledger.LEDGER_DIRNAME / duplicate_ledger.LEDGER_RECORDS_DIRNAME
+            records_folder.rmdir()
+
+            refreshed = duplicate_ledger.sync_shared_checksum_ledger(nas, {})
+
+            self.assertTrue(initialized.initialized)
+            self.assertIn("missing or unavailable", refreshed.error)
+
+    def test_unavailable_shared_nas_pauses_unknown_import_for_review(self):
+        with tempfile.TemporaryDirectory() as value:
+            source = Path(value) / "new_camera_file.mov"
+            source.write_bytes(b"new recording")
+            app = self.bare_app()
+            app.config_lock = threading.RLock()
+            app.checksum_lock = threading.RLock()
+            app.history_lock = threading.RLock()
+            app.checksum_db = {}
+            app.history_records = []
+            app.import_cancel_requested = threading.Event()
+
+            reason = app.duplicate_reason_for(
+                source,
+                {
+                    "nas_folder": str(Path(value) / "offline-nas"),
+                    "input_folder": "",
+                    "checksum_database_path": str(Path(value) / "checksums.json"),
+                },
+            )
+
+            self.assertIn("NAS folder is unavailable", reason)
+            self.assertIn("Import paused", reason)
+
+    def test_local_exact_match_still_wins_when_shared_nas_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as value:
+            source = Path(value) / "known.mov"
+            source.write_bytes(os.urandom(128 * 1024))
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            app = self.bare_app()
+            app.config_lock = threading.RLock()
+            app.checksum_lock = threading.RLock()
+            app.history_lock = threading.RLock()
+            app.checksum_db = {
+                digest: {
+                    "original_size": source.stat().st_size,
+                    "quick_fingerprint": duplicates.quick_fingerprint(source),
+                    "final_path": "remembered NAS file",
+                }
+            }
+            app.history_records = []
+            app.import_cancel_requested = threading.Event()
+
+            reason = app.duplicate_reason_for(
+                source,
+                {
+                    "nas_folder": str(Path(value) / "offline-nas"),
+                    "input_folder": "",
+                    "checksum_database_path": str(Path(value) / "checksums.json"),
+                },
+            )
+
+            self.assertIn("Checksum already imported", reason)
+
+    def test_unreadable_possible_duplicate_fails_closed(self):
+        with tempfile.TemporaryDirectory() as value:
+            source = Path(value) / "camera.mov"
+            source.write_bytes(b"possible duplicate")
+            database = {
+                "b" * 64: {
+                    "original_size": source.stat().st_size,
+                    "final_path": "remembered file",
+                }
+            }
+            with mock.patch.object(duplicates, "cached_sha256_file", return_value=None):
+                reason = duplicates.exact_duplicate_reason(
+                    source,
+                    {"input_folder": ""},
+                    database,
+                    threading.Event(),
+                )
+
+            self.assertIn("Import paused", reason)
 
     def test_windows_device_names_are_made_safe(self):
         self.assertEqual(file_utils.sanitize_base_name("CON", False), "_CON")
@@ -207,6 +581,7 @@ class CoreSafetyTests(unittest.TestCase):
             app.create_task = mock.Mock(side_effect=["one", "two"])
             app.update_task = mock.Mock()
             app.queue_imported_batch_for_conversion = mock.Mock()
+            app.duplicate_reason_for = mock.Mock(return_value="")
 
             count = app.scan_existing_input_as_detected()
 
@@ -214,9 +589,111 @@ class CoreSafetyTests(unittest.TestCase):
             created_paths = {call.args[0] for call in app.create_task.call_args_list}
             self.assertEqual(created_paths, {first, second})
             for call in app.create_task.call_args_list:
-                self.assertEqual(call.kwargs, {"stage": app_module.STAGE_IMPORTED, "imported": True})
+                self.assertEqual(call.kwargs, {"stage": app_module.STAGE_CHECKING, "imported": True})
             app.queue_imported_batch_for_conversion.assert_called_once()
             self.assertCountEqual(app.queue_imported_batch_for_conversion.call_args.args[0], ["one", "two"])
+
+    def test_importfolder_exact_duplicate_waits_for_import_anyway(self):
+        with tempfile.TemporaryDirectory() as value:
+            folder = Path(value)
+            source = folder / "already_imported.mp4"
+            source.write_bytes(b"known original")
+            app = self.bare_app()
+            app.watchfolder_scan_lock = threading.Lock()
+            app.task_lock = threading.RLock()
+            app.task_by_path = {}
+            app.skipped_path_keys = set()
+            app.conversion_enabled = True
+            app.get_config = lambda: {
+                "input_folder": str(folder),
+                "conversion_extensions": [".mp4"],
+            }
+            app.create_task = mock.Mock(return_value="duplicate")
+            app.update_task = mock.Mock()
+            app.queue_imported_batch_for_conversion = mock.Mock()
+            app.duplicate_reason_for = mock.Mock(return_value="Checksum already imported")
+
+            count = app.scan_existing_input_as_detected()
+
+            self.assertEqual(count, 1)
+            app.queue_imported_batch_for_conversion.assert_not_called()
+            app.update_task.assert_any_call(
+                "duplicate",
+                stage=app_module.STAGE_DUPLICATE_REVIEW,
+                duplicate=True,
+                duplicate_reason="Checksum already imported",
+                detail="Checksum already imported",
+                progress=0,
+            )
+
+    def test_import_anyway_converts_existing_importfolder_file_without_copying_it_again(self):
+        with tempfile.TemporaryDirectory() as value:
+            source = Path(value) / "intentional_duplicate.mp4"
+            source.write_bytes(b"intentional duplicate")
+            task = app_module.TaskState(
+                task_id="watch-override",
+                original_path=source,
+                local_input_path=source,
+                display_name=source.name,
+                stage=app_module.STAGE_DUPLICATE_REVIEW,
+                duplicate=True,
+            )
+            app = self.bare_app()
+            app.tasks = {task.task_id: task}
+            app.conversion_enabled = True
+            app.ensure_workers_running = mock.Mock()
+            app.enqueue_conversion = mock.Mock()
+            app.requeue_duplicate_import = mock.Mock()
+            app.show_notification = mock.Mock()
+
+            def update_task(task_id, **changes):
+                for key, value in changes.items():
+                    setattr(app.tasks[task_id], key, value)
+
+            app.update_task = update_task
+            app.import_duplicate_task(task.task_id)
+
+            app.requeue_duplicate_import.assert_not_called()
+            app.enqueue_conversion.assert_called_once_with(task.task_id)
+            self.assertFalse(task.duplicate)
+            self.assertEqual(task.stage, app_module.STAGE_IMPORTED)
+
+    def test_import_anyway_releases_a_verified_post_copy_batch_without_copying_again(self):
+        with tempfile.TemporaryDirectory() as value:
+            source = Path(value) / "disk.mp4"
+            local = Path(value) / "imports" / "disk.mp4"
+            local.parent.mkdir()
+            source.write_bytes(b"recording disk original")
+            local.write_bytes(source.read_bytes())
+            task = app_module.TaskState(
+                task_id="post-copy-review",
+                original_path=source,
+                local_input_path=local,
+                display_name=source.name,
+                stage=app_module.STAGE_DUPLICATE_REVIEW,
+                duplicate=True,
+                original_checksum=hashlib.sha256(source.read_bytes()).hexdigest(),
+            )
+            app = self.bare_app()
+            app.tasks = {task.task_id: task}
+            app.import_job_batch = {task.task_id: "batch"}
+            app.conversion_enabled = True
+            app.ensure_workers_running = mock.Mock()
+            app.complete_import_job = mock.Mock()
+            app.enqueue_conversion = mock.Mock()
+            app.requeue_duplicate_import = mock.Mock()
+            app.show_notification = mock.Mock()
+
+            def update_task(task_id, **changes):
+                for key, value in changes.items():
+                    setattr(app.tasks[task_id], key, value)
+
+            app.update_task = update_task
+            app.import_duplicate_task(task.task_id)
+
+            app.complete_import_job.assert_called_once_with(task.task_id, success=True, blocked=False)
+            app.requeue_duplicate_import.assert_not_called()
+            app.enqueue_conversion.assert_not_called()
 
     def test_watchfolder_excludes_nested_output_and_nas_folders(self):
         with tempfile.TemporaryDirectory() as value:
@@ -279,11 +756,11 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertEqual(ui_performance.bounded_log_count(990, 25, 1000), (15, 1000))
         self.assertEqual(ui_performance.bounded_log_count(1000, 80, 1000), (80, 1000))
 
-    def test_version_is_2_1(self):
-        self.assertEqual(app_module.APP_VERSION, "2.1")
-        self.assertIn('MyAppVersion "2.1"', (ROOT / "packaging" / "MesterSync.iss").read_text(encoding="utf-8"))
-        self.assertTrue((ROOT / "README.md").read_text(encoding="utf-8").startswith("# MesterSync 2.1"))
-        self.assertTrue((APP_DIR / "README_MesterSync.txt").read_text(encoding="utf-8").startswith("MesterSync 2.1"))
+    def test_version_is_2_1_1(self):
+        self.assertEqual(app_module.APP_VERSION, "2.1.1")
+        self.assertIn('MyAppVersion "2.1.1"', (ROOT / "packaging" / "MesterSync.iss").read_text(encoding="utf-8"))
+        self.assertTrue((ROOT / "README.md").read_text(encoding="utf-8").startswith("# MesterSync 2.1.1"))
+        self.assertTrue((APP_DIR / "README_MesterSync.txt").read_text(encoding="utf-8").startswith("MesterSync 2.1.1"))
 
     def test_launcher_has_python_fallbacks_and_visible_failure_message(self):
         launcher = (APP_DIR / "MesterSync.vbs").read_text(encoding="utf-8-sig").lower()
@@ -1084,6 +1561,97 @@ class CoreSafetyTests(unittest.TestCase):
             )
             app.complete_import_job.assert_called_once_with(task.task_id, success=False, blocked=True)
             self.assertTrue(any("needs review" in line.lower() for line in app.test_logs))
+
+    def test_post_copy_duplicate_claim_keeps_disk_batch_blocked_for_review(self):
+        task = app_module.TaskState(
+            task_id="post-copy-claim",
+            original_path=Path("disk.mov"),
+            display_name="disk.mov",
+        )
+        app = self.bare_app()
+        app.task_lock = threading.RLock()
+        app.tasks = {task.task_id: task}
+        app.import_condition = threading.Condition()
+        app.import_queue = app_module.deque([task.task_id])
+        app.queued_import_ids = {task.task_id}
+        app.import_job_requires_enabled = {task.task_id: True}
+        app.import_job_batch = {task.task_id: "disk-batch"}
+        app.import_batches = {"disk-batch": {"disk_batch": True}}
+        app.import_enabled = True
+        app.current_import_id = None
+        app.update_task = mock.Mock()
+        app.set_import_progress_snapshot = mock.Mock()
+        app.clear_import_progress_snapshot = mock.Mock()
+        app.duplicate_reason_for = mock.Mock(return_value="")
+        app.task_ready_for_conversion_queue = mock.Mock(return_value=False)
+        app.emit_status = mock.Mock()
+
+        def finish_copy(*_args, **_kwargs):
+            task.stage = app_module.STAGE_DUPLICATE_REVIEW
+
+        app.import_single_file = mock.Mock(side_effect=finish_copy)
+
+        def finish_once(*_args, **_kwargs):
+            app.shutdown_event.set()
+
+        app.complete_import_job = mock.Mock(side_effect=finish_once)
+        app.import_worker()
+
+        app.complete_import_job.assert_called_once_with(task.task_id, success=False, blocked=True)
+
+    def test_verified_import_pauses_before_conversion_when_another_computer_claimed_it(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            source = root / "disk" / "camera.mov"
+            imports = root / "imports"
+            source.parent.mkdir()
+            imports.mkdir()
+            source.write_bytes(os.urandom(32 * 1024))
+            task = app_module.TaskState(
+                task_id="claim-race",
+                original_path=source,
+                display_name=source.name,
+            )
+            app = self.bare_app()
+            app.task_lock = threading.RLock()
+            app.tasks = {task.task_id: task}
+            app.task_by_path = {file_utils.path_key(source): task.task_id}
+            app.import_cancel_requested = threading.Event()
+            app.importing_count = 0
+            app.get_config = lambda: {
+                "input_folder": str(imports),
+                "copy_chunk_mb": 1,
+                "nas_folder": str(root / "nas"),
+            }
+            app.reserve_import_target = lambda desired: desired
+            app.release_import_target = mock.Mock()
+            app.clear_import_progress_snapshot = mock.Mock()
+            app.set_import_progress_snapshot = mock.Mock()
+            app.emit_status = mock.Mock()
+            app.generate_thumbnail_async = mock.Mock()
+            app.record_session_stat = mock.Mock()
+            app.remember_original_checksum = mock.Mock(return_value=True)
+            app.claim_task_in_shared_duplicate_history = mock.Mock(return_value=("", True))
+
+            def copy_safely(src, target, _stop, progress, checksum_callback):
+                target.write_bytes(src.read_bytes())
+                progress(100, target.stat().st_size, target.stat().st_size)
+                checksum_callback(hashlib.sha256(src.read_bytes()).hexdigest())
+                return True
+
+            app.copy_file_safely = copy_safely
+
+            def update_task(task_id, **changes):
+                for key, item in changes.items():
+                    setattr(app.tasks[task_id], key, item)
+
+            app.update_task = update_task
+            app.import_single_file(source, task.task_id, False)
+
+            self.assertEqual(task.stage, app_module.STAGE_DUPLICATE_REVIEW)
+            self.assertTrue(task.duplicate)
+            self.assertTrue(task.local_input_path and task.local_input_path.exists())
+            self.assertIn("another MesterSync import", task.duplicate_reason)
 
     def test_import_anyway_bypasses_duplicate_detection_and_is_persisted(self):
         task = app_module.TaskState(

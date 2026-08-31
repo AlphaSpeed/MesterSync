@@ -16,6 +16,16 @@ from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Tuple
 
 
+MANDATORY_METADATA_DIRECTORIES = {
+    "__macosx",
+    ".temporaryitems",
+    ".trashes",
+    ".spotlight-v100",
+    ".fseventsd",
+    ".blamos-private-items",
+}
+
+
 def path_key(path: Path | str) -> str:
     try:
         return str(Path(path).resolve()).lower()
@@ -72,7 +82,23 @@ def is_video_file(path: Path | str, extensions: Iterable[str]) -> bool:
     return Path(path).suffix.lower() in normalize_extensions(extensions)
 
 
+def is_system_metadata_file(filename: str) -> bool:
+    """Identify files that can look like videos but contain only OS metadata."""
+    name = Path(filename).name.lower()
+    return name.startswith("._") or name in {".ds_store", "thumbs.db", "desktop.ini"}
+
+
+def is_system_metadata_directory(dirname: str) -> bool:
+    return Path(dirname).name.lower() in MANDATORY_METADATA_DIRECTORIES
+
+
+def path_contains_system_metadata(path: Path | str) -> bool:
+    return any(part.lower() in MANDATORY_METADATA_DIRECTORIES for part in Path(path).parts)
+
+
 def should_exclude_file(filename: str, patterns: Iterable[str]) -> bool:
+    if is_system_metadata_file(filename):
+        return True
     return any(fnmatch.fnmatch(filename, pattern) for pattern in patterns)
 
 
@@ -293,7 +319,10 @@ def get_volume_serial(root: str) -> str:
             ctypes.byref(max_component), ctypes.byref(flags), fs_name, ctypes.sizeof(fs_name)
         )
         if ok:
-            return f"{root}:{serial.value}"
+            # The drive letter can change after reinsertion. The volume serial
+            # identifies the same disk independently of whether Windows mounts
+            # it as D:, E:, or another letter.
+            return f"volume:{serial.value:08x}"
     except Exception:
         pass
     return root

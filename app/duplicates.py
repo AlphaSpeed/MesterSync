@@ -10,6 +10,7 @@ from file_utils import path_key, sha256_file
 QUICK_SAMPLE_BYTES = 2 * 1024 * 1024
 QUICK_FULL_FILE_LIMIT = QUICK_SAMPLE_BYTES * 3
 FINGERPRINT_CACHE_LIMIT = 4096
+UNCERTAIN_DUPLICATE_REASON = "Duplicate safety check could not read the complete file. Import paused for review."
 
 
 def _file_signature(path: Path) -> Optional[Tuple[int, int, int, int, int]]:
@@ -131,6 +132,11 @@ def cached_sha256_file(
 
 def checksum_record_path(value: Any) -> str:
     if isinstance(value, dict):
+        paths = value.get("final_paths")
+        if isinstance(paths, list):
+            latest = next((str(path).strip() for path in reversed(paths) if str(path).strip()), "")
+            if latest:
+                return latest
         return str(value.get("final_path") or value.get("path") or value.get("imported_path") or "")
     return str(value or "")
 
@@ -216,6 +222,8 @@ def exact_duplicate_reason(
         full_hash_required = True
     if full_hash_required:
         digest = hash_file(path, "Checking exact duplicate")
+        if not digest and not stop_event.is_set():
+            return UNCERTAIN_DUPLICATE_REASON
     if digest and digest in checksum_db:
         saved_path = checksum_record_path(checksum_db[digest])
         return f"Checksum already imported as: {saved_path or 'a previous MesterSync import'}"
@@ -244,8 +252,14 @@ def exact_duplicate_reason(
             if digest is None:
                 digest = hash_file(path, "Checking exact duplicate")
             if not digest:
+                if not stop_event.is_set():
+                    return UNCERTAIN_DUPLICATE_REASON
                 return ""
             existing_digest = hash_file(existing, "Comparing importfolder copy")
+            if not existing_digest:
+                if not stop_event.is_set():
+                    return UNCERTAIN_DUPLICATE_REASON
+                return ""
             if digest and existing_digest and digest == existing_digest:
                 return f"Exact same video already exists in importfolder: {existing}"
     return ""

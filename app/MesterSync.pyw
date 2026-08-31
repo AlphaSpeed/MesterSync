@@ -28,6 +28,7 @@ except Exception:
 
 from config_defaults import COMMON_VIDEO_EXTENSIONS, DEFAULT_CONFIG, DEFAULT_FFMPEG_ARGS
 from diagnostics import query_video_encoders, run_diagnostics
+from duplicate_ledger import publish_shared_checksum_record, sync_shared_checksum_ledger
 from duplicates import exact_duplicate_reason, quick_fingerprint, remove_missing_checksum_entries
 from file_utils import (
     ensure_folder,
@@ -150,6 +151,9 @@ DASHBOARD_VIRTUAL_OVERSCAN = 5
 HISTORY_RENDER_BATCH_SIZE = 4
 LOG_MAX_LINES = 1000
 THUMBNAIL_SETTLE_DELAY_SECONDS = 1.25
+SHARED_DUPLICATE_SYNC_TTL_SECONDS = 6 * 60 * 60
+DRIVE_REMOVAL_CONFIRMATION_SCANS = 2
+MAX_REMEMBERED_DRIVE_SOURCES_PER_CHECKSUM = 64
 
 class MesterSyncApp:
     BG = "#06111f"
@@ -218,6 +222,10 @@ class MesterSyncApp:
         self.checksum_db: Dict[str, Any] = {}
         self.load_checksum_database()
         self.duplicate_fingerprint_cache: Dict[str, Any] = {}
+        self.shared_duplicate_lock = threading.RLock()
+        self.shared_duplicate_last_sync = 0.0
+        self.shared_duplicate_last_nas = ""
+        self.shared_duplicate_last_issue = ""
 
         self.gui_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
         self.import_queue: Deque[str] = deque()
@@ -316,6 +324,7 @@ class MesterSyncApp:
         self.import_cycle_task_id: Optional[str] = None
         self.import_cycle_last_switch = 0.0
         self.processed_drive_ids: set[str] = set()
+        self.drive_missing_scan_counts: Dict[str, int] = {}
         self.current_process: Optional[subprocess.Popen[str]] = None
         self.current_conversion_id: Optional[str] = None
         self.current_transfer_id: Optional[str] = None
@@ -561,7 +570,6 @@ class MesterSyncApp:
             write_json_file(config_path(), self.config)
             self.save_current_preset_default()
             self.load_checksum_database()
-            self.processed_drive_ids.clear()
             self.saved_settings_snapshot = self.current_settings_snapshot()
             self.update_unsaved_settings_warning()
             self.update_startup_warning()
@@ -820,7 +828,6 @@ class MesterSyncApp:
             if self.settings_built:
                 self.ignored_drives_widget.values = list(self.config["ignored_drives"])
                 self.ignored_drives_widget.refresh()
-            self.processed_drive_ids.clear()
             self.load_checksum_database()
             self.saved_settings_snapshot = self.current_settings_snapshot()
             self.update_unsaved_settings_warning()
@@ -1058,6 +1065,7 @@ class MesterSyncApp:
                                 "original_size": task.imported_size,
                                 "path": str(known_path),
                                 "final_path": str(known_path),
+                                "final_paths": [str(known_path)] if known_path else [],
                                 "updated_at": now_iso(),
                             }
                             restored_checksums += 1
@@ -1089,11 +1097,131 @@ class MesterSyncApp:
                     "original_size": history.get("original_size"),
                     "path": final_path,
                     "final_path": final_path,
+                    "final_paths": [final_path] if final_path else [],
                     "updated_at": now_iso(),
                 },
             )
         with self.checksum_lock:
             self.checksum_db = records
+
+    def checksum_records_for_shared_ledger(self) -> Tuple[Dict[str, Any], List[str]]:
+        """Include every remembered NAS location, including repeated forced imports."""
+        with self.checksum_lock:
+            records = {
+                digest: dict(value) if isinstance(value, dict) else value
+                for digest, value in self.checksum_db.items()
+            }
+        known_paths: List[str] = []
+        with self.history_lock:
+            history = list(self.history_records)
+        for item in history:
+            digest = str(item.get("original_checksum") or "").strip().lower()
+            if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+                continue
+            final_path = str(item.get("path") or "").strip()
+            if final_path:
+                known_paths.append(final_path)
+            value = records.get(digest)
+            record = dict(value) if isinstance(value, dict) else {}
+            paths = [str(path).strip() for path in record.get("final_paths", []) if str(path).strip()] if isinstance(record.get("final_paths"), list) else []
+            for path in (record.get("final_path"), record.get("path"), final_path):
+                text = str(path or "").strip()
+                if text and text not in paths:
+                    paths.append(text)
+            record.update(
+                {
+                    "original_name": record.get("original_name") or str(item.get("display_name") or ""),
+                    "original_size": record.get("original_size") if record.get("original_size") is not None else item.get("original_size"),
+                    "final_paths": paths,
+                }
+            )
+            if paths:
+                record["final_path"] = paths[-1]
+                record["path"] = paths[-1]
+            records[digest] = record
+        return records, known_paths
+
+    def sync_shared_duplicate_history(self, cfg: Dict[str, Any], force: bool = False) -> str:
+        """Refresh the cross-computer original-checksum ledger stored on the NAS."""
+        nas_value = str(cfg.get("nas_folder", "")).strip()
+        if not nas_value:
+            return ""
+        lock = getattr(self, "shared_duplicate_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self.shared_duplicate_lock = lock
+        with lock:
+            now = time.time()
+            last_nas = getattr(self, "shared_duplicate_last_nas", "")
+            last_sync = float(getattr(self, "shared_duplicate_last_sync", 0.0) or 0.0)
+            last_issue = str(getattr(self, "shared_duplicate_last_issue", "") or "")
+            cache_seconds = 30 if last_issue else SHARED_DUPLICATE_SYNC_TTL_SECONDS
+            if not force and last_nas == nas_value and now - last_sync < cache_seconds:
+                return last_issue
+
+            records, known_paths = self.checksum_records_for_shared_ledger()
+            result = sync_shared_checksum_ledger(Path(nas_value), records, known_paths)
+            changed = False
+            if result.records:
+                with self.checksum_lock:
+                    for digest, shared in result.records.items():
+                        old = self.checksum_db.get(digest)
+                        if not isinstance(old, dict):
+                            self.checksum_db[digest] = dict(shared)
+                            changed = True
+                            continue
+                        merged = dict(shared)
+                        merged.update({key: value for key, value in old.items() if value not in (None, "", [])})
+                        paths: List[str] = []
+                        for source in (shared, old):
+                            raw_paths = source.get("final_paths")
+                            if isinstance(raw_paths, list):
+                                for path in raw_paths:
+                                    text = str(path).strip()
+                                    if text and text not in paths:
+                                        paths.append(text)
+                            for key in ("final_path", "path"):
+                                text = str(source.get(key) or "").strip()
+                                if text and text not in paths:
+                                    paths.append(text)
+                        merged["final_paths"] = paths
+                        if merged != old:
+                            self.checksum_db[digest] = merged
+                            changed = True
+            if changed:
+                self.save_checksum_database()
+
+            issue = str(result.error or "")
+            self.shared_duplicate_last_nas = nas_value
+            self.shared_duplicate_last_sync = now
+            previous_issue = str(getattr(self, "shared_duplicate_last_issue", "") or "")
+            self.shared_duplicate_last_issue = issue
+            if result.exported:
+                self.emit_log(f"Shared {result.exported} original checksum record(s) with the NAS duplicate history.")
+            if issue and issue != previous_issue:
+                self.emit_log(f"Duplicate safety warning: {issue}")
+            return issue
+
+    def claim_task_in_shared_duplicate_history(self, task: TaskState, cfg: Dict[str, Any]) -> Tuple[str, bool]:
+        nas_value = str(cfg.get("nas_folder", "")).strip()
+        digest = str(task.original_checksum or "").strip().lower()
+        if not nas_value or not digest:
+            return "", False
+        with self.checksum_lock:
+            value = self.checksum_db.get(digest)
+            record = dict(value) if isinstance(value, dict) else {}
+        result = publish_shared_checksum_record(Path(nas_value), digest, record)
+        if result.exported:
+            self.emit_log(f"Saved original checksum to shared NAS duplicate history: {task.display_name}")
+        if not result.initialized and "not initialized" in result.error.lower():
+            return self.sync_shared_duplicate_history(cfg, force=True), result.already_present
+        if result.error:
+            self.emit_log(f"Duplicate safety warning: {result.error}")
+        return str(result.error or ""), result.already_present
+
+    def publish_task_to_shared_duplicate_history(self, task: TaskState, cfg: Dict[str, Any]) -> str:
+        issue, _already_present = self.claim_task_in_shared_duplicate_history(task, cfg)
+        return issue
 
     def save_checksum_database(self) -> bool:
         try:
@@ -1107,6 +1235,7 @@ class MesterSyncApp:
             return False
 
     def duplicate_reason_for(self, path: Path, cfg: Dict[str, Any], task_id: Optional[str] = None) -> str:
+        shared_issue = self.sync_shared_duplicate_history(cfg)
         with self.checksum_lock:
             checksum_db = dict(self.checksum_db)
         progress_phase = ""
@@ -1127,7 +1256,7 @@ class MesterSyncApp:
                     eta_seconds=eta,
                 )
                 self.set_import_progress_snapshot(task_id, f"Import/watching: {phase.lower()} for {path.name}", percent, eta)
-        return exact_duplicate_reason(
+        reason = exact_duplicate_reason(
             path,
             cfg,
             checksum_db,
@@ -1135,6 +1264,11 @@ class MesterSyncApp:
             on_progress,
             getattr(self, "duplicate_fingerprint_cache", None),
         )
+        if reason:
+            return reason
+        if shared_issue:
+            return f"{shared_issue} Import paused for safety; use Import anyway only when the extra copy is intentional."
+        return ""
 
     def duplicate_reason_for_import_task(self, task: TaskState, cfg: Dict[str, Any]) -> str:
         """Honor an explicit Import anyway choice until that import succeeds."""
@@ -1154,26 +1288,142 @@ class MesterSyncApp:
                 size = None
             self.remember_original_checksum(digest, path.name, size, path)
 
-    def remember_original_checksum(self, digest: str, original_name: str, original_size: Optional[int], path: Path) -> bool:
+    @staticmethod
+    def drive_relative_path(source: Path, root: Path) -> str:
+        try:
+            relative = source.resolve().relative_to(root.resolve())
+        except (OSError, RuntimeError, ValueError):
+            return ""
+        return str(relative).replace("\\", "/").casefold()
+
+    def drive_source_record(
+        self,
+        source: Path,
+        root: Path,
+        drive_id: str,
+        sampled_fingerprint: str,
+    ) -> Optional[Dict[str, Any]]:
+        relative_path = self.drive_relative_path(source, root)
+        drive_key = str(drive_id or "").strip().casefold()
+        if not relative_path or not drive_key or not sampled_fingerprint:
+            return None
+        try:
+            stat = source.stat()
+        except OSError:
+            return None
+        return {
+            "drive_id": drive_key,
+            "relative_path": relative_path,
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "ctime_ns": int(stat.st_ctime_ns),
+            "file_id": int(getattr(stat, "st_ino", 0) or 0),
+            "quick_fingerprint": sampled_fingerprint,
+        }
+
+    def remember_original_checksum(
+        self,
+        digest: str,
+        original_name: str,
+        original_size: Optional[int],
+        path: Path,
+        source_path: Optional[Path] = None,
+        source_root: Optional[Path] = None,
+        source_id: str = "",
+    ) -> bool:
         if not digest:
             return False
         sampled_fingerprint = quick_fingerprint(path, getattr(self, "shutdown_event", None))
+        source_record = None
+        if source_path is not None and source_root is not None:
+            source_record = self.drive_source_record(source_path, source_root, source_id, sampled_fingerprint or "")
         with self.checksum_lock:
             old = self.checksum_db.get(digest)
             record = dict(old) if isinstance(old, dict) else {}
+            paths = [str(value).strip() for value in record.get("final_paths", []) if str(value).strip()] if isinstance(record.get("final_paths"), list) else []
+            if str(path) not in paths:
+                paths.append(str(path))
             record.update(
                 {
                     "original_name": original_name,
                     "original_size": original_size,
                     "path": str(path),
                     "final_path": str(path),
+                    "final_paths": paths,
                     "updated_at": now_iso(),
                 }
             )
             if sampled_fingerprint:
                 record["quick_fingerprint"] = sampled_fingerprint
+            if source_record:
+                sources = [
+                    dict(value)
+                    for value in record.get("drive_sources", [])
+                    if isinstance(value, dict)
+                ] if isinstance(record.get("drive_sources"), list) else []
+                source_key = (source_record["drive_id"], source_record["relative_path"])
+                sources = [
+                    value
+                    for value in sources
+                    if (str(value.get("drive_id") or "").casefold(), str(value.get("relative_path") or "").casefold()) != source_key
+                ]
+                sources.append(source_record)
+                record["drive_sources"] = sources[-MAX_REMEMBERED_DRIVE_SOURCES_PER_CHECKSUM:]
             self.checksum_db[digest] = record
         return self.save_checksum_database()
+
+    def drive_source_was_imported(self, source: Path, root: Path, drive_id: str) -> bool:
+        """Recognize one unchanged file from a previously completed disk import.
+
+        The drive serial, relative path, file metadata, and sampled content must
+        all still match. If any part is unavailable or changed, the file is
+        treated as new and goes through the normal exact-content safety check.
+        """
+        relative_path = self.drive_relative_path(source, root)
+        drive_key = str(drive_id or "").strip().casefold()
+        if not relative_path or not drive_key:
+            return False
+        try:
+            stat = source.stat()
+            source_size = int(stat.st_size)
+            source_mtime = int(stat.st_mtime_ns)
+            source_ctime = int(stat.st_ctime_ns)
+            source_file_id = int(getattr(stat, "st_ino", 0) or 0)
+        except OSError:
+            return False
+        possible: List[Dict[str, Any]] = []
+        with self.checksum_lock:
+            records = list(self.checksum_db.values())
+        for record in records:
+            if not isinstance(record, dict) or not isinstance(record.get("drive_sources"), list):
+                continue
+            for value in record["drive_sources"]:
+                if not isinstance(value, dict):
+                    continue
+                if str(value.get("drive_id") or "").strip().casefold() != drive_key:
+                    continue
+                if str(value.get("relative_path") or "").strip().casefold() != relative_path:
+                    continue
+                try:
+                    if (
+                        int(value.get("size")) != source_size
+                        or int(value.get("mtime_ns")) != source_mtime
+                        or int(value.get("ctime_ns")) != source_ctime
+                    ):
+                        continue
+                    saved_file_id = int(value.get("file_id") or 0)
+                    if saved_file_id and source_file_id and saved_file_id != source_file_id:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if str(value.get("quick_fingerprint") or "").strip():
+                    possible.append(value)
+        if not possible:
+            return False
+        sampled = quick_fingerprint(source, getattr(self, "import_cancel_requested", None))
+        if not sampled:
+            return False
+        return any(str(value.get("quick_fingerprint") or "").strip().lower() == sampled.lower() for value in possible)
 
     def update_checksum_final_path(self, task: TaskState, final_path: Path) -> None:
         digest = task.original_checksum
@@ -1182,12 +1432,16 @@ class MesterSyncApp:
         with self.checksum_lock:
             old = self.checksum_db.get(digest)
             record = dict(old) if isinstance(old, dict) else {}
+            paths = [str(value).strip() for value in record.get("final_paths", []) if str(value).strip()] if isinstance(record.get("final_paths"), list) else []
+            if str(final_path) not in paths:
+                paths.append(str(final_path))
             record.update(
                 {
                     "original_name": task.display_name,
                     "original_size": task.imported_size,
                     "path": str(final_path),
                     "final_path": str(final_path),
+                    "final_paths": paths,
                     "updated_at": now_iso(),
                 }
             )
@@ -2228,7 +2482,7 @@ class MesterSyncApp:
         grid.grid_columnconfigure(1, weight=1)
         self.add_path_box(grid, 0, 0, "Importfolder", "Files imported from drives or added manually are copied here before conversion.", self.input_folder_var, True)
         self.add_path_box(grid, 0, 1, "Output folder", "Converted files stay here if Transfer is turned off. They are copied from here to the NAS when Transfer is on.", self.output_folder_var, True)
-        self.add_path_box(grid, 1, 0, "NAS folder", "Files end up here after a verified transfer. Local files are deleted only after verification.", self.nas_folder_var, True)
+        self.add_path_box(grid, 1, 0, "NAS folder", "Files end up here after a verified transfer. A small shared checksum ledger here lets every MesterSync computer recognize imported originals.", self.nas_folder_var, True)
         self.add_path_box(grid, 1, 1, "FFmpeg.exe", "Path to ffmpeg.exe used for conversion and thumbnails.", self.ffmpeg_path_var, False)
         settings_buttons = tk.Frame(paths, bg=self.CARD)
         settings_buttons.pack(anchor="e", pady=(10, 0))
@@ -2271,8 +2525,8 @@ class MesterSyncApp:
             mgrid,
             2,
             0,
-            "Checksum database",
-            "Stores duplicate hashes used to avoid importing exact duplicate videos. Default is inside the data folder.",
+            "Local checksum cache",
+            "Stores this computer's duplicate hashes. When a NAS folder is configured, they are also shared safely through the NAS.",
             self.checksum_path_var,
             save_file=True,
             action_text="Clean",
@@ -2282,7 +2536,7 @@ class MesterSyncApp:
         checkrow.pack(fill="x", pady=(10, 0))
         tk.Label(
             checkrow,
-            text="Exact duplicate protection is always on. Only Import anyway can override a confirmed match.",
+            text="Exact duplicate protection is always on and shared through the NAS. Uncertain checks pause for review; only Import anyway overrides them.",
             bg=self.CARD,
             fg=self.GREEN,
             font=("Segoe UI", 10, "bold"),
@@ -4758,6 +5012,33 @@ class MesterSyncApp:
         task = self.tasks.get(task_id)
         if not task:
             return
+        if (
+            task.local_input_path
+            and task.local_input_path.exists()
+        ):
+            belongs_to_import_batch = task_id in getattr(self, "import_job_batch", {})
+            self.update_task(
+                task_id,
+                duplicate=False,
+                duplicate_reason="",
+                force_import=False,
+                stage=STAGE_IMPORTED,
+                detail="Import anyway selected; ready for conversion",
+                progress=100,
+            )
+            self.ensure_workers_running()
+            if belongs_to_import_batch:
+                self.complete_import_job(task_id, success=True, blocked=False)
+            elif self.conversion_enabled:
+                self.enqueue_conversion(task_id)
+            else:
+                self.update_task(task_id, detail="Import anyway selected. Conversion is currently stopped.")
+            self.show_notification(
+                f"Import anyway accepted for {task.display_name}. The verified local file will be converted without replacing any output.",
+                "warning",
+                7000,
+            )
+            return
         self.import_cancel_requested.clear()
         task.import_stop_event = threading.Event()
         self.update_task(
@@ -5577,6 +5858,19 @@ class MesterSyncApp:
         self.emit_status()
         return batch_id
 
+    def disk_source_context_for_task(self, task_id: str) -> Tuple[Optional[Path], str]:
+        condition = getattr(self, "import_condition", None)
+        if condition is None:
+            return None, ""
+        with condition:
+            batch_id = getattr(self, "import_job_batch", {}).get(task_id, "")
+            batch = getattr(self, "import_batches", {}).get(batch_id)
+            if not batch or not batch.get("disk_batch"):
+                return None, ""
+            source_label = str(batch.get("source_label") or "").strip()
+            source_id = str(batch.get("source_id") or "").strip()
+        return (Path(source_label), source_id) if source_label and source_id else (None, "")
+
     def import_worker(self) -> None:
         while not self.shutdown_event.is_set():
             task_id: Optional[str] = None
@@ -5629,7 +5923,7 @@ class MesterSyncApp:
                 self.import_single_file(source, task_id, False)
                 import_success = self.task_ready_for_conversion_queue(task_id)
                 current_task = self.tasks.get(task_id)
-                import_blocked = bool(current_task and current_task.stage == STAGE_ERROR)
+                import_blocked = bool(current_task and current_task.stage in {STAGE_ERROR, STAGE_DUPLICATE_REVIEW})
                 self.complete_import_job(task_id, success=import_success, blocked=import_blocked)
             except Exception as exc:
                 self.update_task(task_id, stage=STAGE_ERROR, detail=f"Import worker error: {exc}", error_log=traceback.format_exc())
@@ -5767,6 +6061,7 @@ class MesterSyncApp:
     def add_paths_to_import(self, paths: List[Path]) -> None:
         self.import_cancel_requested.clear()
         cfg = self.get_config()
+        self.sync_shared_duplicate_history(cfg, force=True)
         folder_error = validate_writable_folder(str(cfg.get("input_folder", "")), "Importfolder")
         if folder_error:
             self.emit_log(f"Add files stopped: {folder_error}")
@@ -5911,10 +6206,37 @@ class MesterSyncApp:
                     self.update_task(task_id, stage=STAGE_ERROR, detail=error, progress=0, error_log=f"Checksum verification failed for imported copy: {target}")
                     self.emit_log(f"{error} Source: {src}")
                     return
-                if not self.remember_original_checksum(copied_digest, src.name, source_size, target):
+                source_root, source_id = self.disk_source_context_for_task(task_id)
+                if not self.remember_original_checksum(
+                    copied_digest,
+                    src.name,
+                    source_size,
+                    target,
+                    source_path=src if source_root is not None else None,
+                    source_root=source_root,
+                    source_id=source_id,
+                ):
                     error = "Imported copy was verified, but duplicate protection could not be saved. Both the recording-disk file and local copy were kept."
                     self.update_task(task_id, stage=STAGE_ERROR, detail=error, progress=100, error_log=f"Checksum database could not be saved for: {target}")
                     self.emit_log(error)
+                    return
+                claim_issue, already_claimed = self.claim_task_in_shared_duplicate_history(task, cfg)
+                if not task.force_import and (claim_issue or already_claimed):
+                    if already_claimed:
+                        reason = "The exact original checksum was registered by another MesterSync import while this file was being copied."
+                    else:
+                        reason = f"{claim_issue} The verified local copy was kept, but conversion is paused for review."
+                    self.generate_thumbnail_async(task_id, target)
+                    self.record_session_stat("imported")
+                    self.update_task(
+                        task_id,
+                        stage=STAGE_DUPLICATE_REVIEW,
+                        duplicate=True,
+                        duplicate_reason=reason,
+                        detail=reason,
+                        progress=100,
+                    )
+                    self.emit_log(f"Post-copy duplicate safety review: {src.name} | {reason}")
                     return
             else:
                 force_delete(target)
@@ -6019,10 +6341,23 @@ class MesterSyncApp:
                 with self.task_lock:
                     if key in self.task_by_path:
                         continue
-                task_id = self.create_task(path, stage=STAGE_IMPORTED, imported=True)
-                self.update_task(task_id, progress=100, detail="Detected in Importfolder; waiting for conversion")
-                queued_ids.append(task_id)
+                task_id = self.create_task(path, stage=STAGE_CHECKING, imported=True)
+                self.update_task(task_id, progress=0, detail="Checking Importfolder file against duplicate history")
+                duplicate_reason = self.duplicate_reason_for(path, cfg, task_id)
                 count += 1
+                if duplicate_reason:
+                    self.update_task(
+                        task_id,
+                        stage=STAGE_DUPLICATE_REVIEW,
+                        duplicate=True,
+                        duplicate_reason=duplicate_reason,
+                        detail=duplicate_reason,
+                        progress=0,
+                    )
+                    self.emit_log(f"Importfolder file needs duplicate review: {path.name}")
+                    continue
+                self.update_task(task_id, stage=STAGE_IMPORTED, progress=100, detail="Detected in Importfolder; waiting for conversion")
+                queued_ids.append(task_id)
             if queued_ids:
                 self.queue_imported_batch_for_conversion(queued_ids)
                 action = "queued for conversion" if self.conversion_enabled else "ready when Conversion is started"
@@ -6030,6 +6365,51 @@ class MesterSyncApp:
             return count
         finally:
             self.watchfolder_scan_lock.release()
+
+    def update_connected_drive_memory(self, current_ids: Iterable[str]) -> None:
+        """Require two missed scans before treating a drive as removed.
+
+        Windows can briefly omit a busy removable disk from one enumeration.
+        Forgetting it immediately made the next scan look like a fresh insert.
+        """
+        current = {str(value) for value in current_ids}
+        missing_counts = getattr(self, "drive_missing_scan_counts", None)
+        if missing_counts is None:
+            missing_counts = {}
+            self.drive_missing_scan_counts = missing_counts
+        for drive_id in list(self.processed_drive_ids):
+            if drive_id in current:
+                missing_counts.pop(drive_id, None)
+                continue
+            missed = int(missing_counts.get(drive_id, 0)) + 1
+            if missed >= DRIVE_REMOVAL_CONFIRMATION_SCANS:
+                self.processed_drive_ids.discard(drive_id)
+                missing_counts.pop(drive_id, None)
+            else:
+                missing_counts[drive_id] = missed
+
+    def filter_new_drive_sources(
+        self,
+        root: Path,
+        drive_id: str,
+        candidates: Iterable[Path],
+    ) -> Tuple[List[Path], int, int]:
+        fresh: List[Path] = []
+        active_count = 0
+        remembered_count = 0
+        for source in candidates:
+            key = path_key(source)
+            with self.task_lock:
+                active_id = self.task_by_path.get(key)
+                active = bool(active_id and active_id in self.tasks)
+            if active:
+                active_count += 1
+                continue
+            if self.drive_source_was_imported(source, root, drive_id):
+                remembered_count += 1
+                continue
+            fresh.append(source)
+        return fresh, active_count, remembered_count
 
     def drive_monitor_loop(self) -> None:
         while not self.shutdown_event.is_set():
@@ -6042,7 +6422,7 @@ class MesterSyncApp:
                 self.scan_existing_input_as_detected()
                 drives = list_candidate_drives(cfg.get("ignored_drives", []))
                 current_ids = {d for _, d in drives}
-                self.processed_drive_ids.intersection_update(current_ids)
+                self.update_connected_drive_memory(current_ids)
                 for root, drive_id in drives:
                     if drive_id in self.processed_drive_ids:
                         continue
@@ -6057,8 +6437,10 @@ class MesterSyncApp:
         cfg = self.get_config()
         self.emit_log(f"New drive detected: {root}")
         scan_progress_id = f"drive_scan_{path_key(root)}"
-        self.set_import_progress_snapshot(scan_progress_id, f"Import/watching: scanning {root}", 0, None)
+        self.set_import_progress_snapshot(scan_progress_id, "Import/watching: checking shared duplicate history", 0, None)
         try:
+            self.sync_shared_duplicate_history(cfg, force=True)
+            self.set_import_progress_snapshot(scan_progress_id, f"Import/watching: scanning {root}", 0, None)
             found, _scanned = scan_drive_importable_videos(
                 root,
                 cfg,
@@ -6070,6 +6452,19 @@ class MesterSyncApp:
             if not found:
                 self.emit_log(f"No importable videos found on {root}.")
                 self.set_import_progress_snapshot(scan_progress_id, f"Import/watching: no videos found on {root}", 0, None)
+                time.sleep(2)
+                return
+            found, active_count, remembered_count = self.filter_new_drive_sources(root, drive_id, found)
+            if active_count or remembered_count:
+                parts: List[str] = []
+                if active_count:
+                    parts.append(f"{active_count} already active")
+                if remembered_count:
+                    parts.append(f"{remembered_count} already imported from this disk")
+                self.emit_log(f"Skipped {', '.join(parts)} on {root}.")
+            if not found:
+                self.emit_log(f"No new videos found on {root}; unchanged earlier imports were not queued again.")
+                self.set_import_progress_snapshot(scan_progress_id, f"Import/watching: no new videos on {root}", 0, None)
                 time.sleep(2)
                 return
             self.emit_log(f"Found {len(found)} importable video(s) on {root}.")
@@ -6576,6 +6971,16 @@ class MesterSyncApp:
             task.rename_base = dest.stem
             self.update_task(task_id, stage=STAGE_COMPLETE, progress=100, transferred_at=now_iso(), nas_path=dest, detail=f"Transferred to NAS: {dest.name}", eta_seconds=0)
             self.update_checksum_final_path(task, dest)
+            shared_issue = self.publish_task_to_shared_duplicate_history(task, cfg)
+            if shared_issue:
+                self.gui_queue.put((
+                    "notification",
+                    (
+                        "The video is safe on the NAS, but shared duplicate history could not be updated. Future unknown imports will pause for review.",
+                        "warning",
+                        9000,
+                    ),
+                ))
             self.archive_task(task_id, status="transferred")
             # History/checksum state is durable before local cleanup. If cleanup
             # is interrupted, the verified NAS file remains the source of truth.
@@ -6807,6 +7212,16 @@ class MesterSyncApp:
         if not task:
             return False
         if task.stage == STAGE_DUPLICATE_REVIEW:
+            if (
+                task.local_input_path
+                and path_key(task.local_input_path) == path_key(task.original_path)
+            ):
+                task.skipped = True
+                task.stage = STAGE_SKIPPED
+                self.skipped_path_keys.add(path_key(task.original_path))
+                self.archive_task(task_id, status="skipped")
+                self.log(f"Skipped Importfolder duplicate and kept the file: {task.display_name}")
+                return True
             self.remove_task(task_id)
             self.log(f"Removed from list: {task.display_name}")
             return True

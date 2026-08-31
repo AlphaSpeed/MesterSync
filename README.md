@@ -1,12 +1,13 @@
-# MesterSync 2.1
+# MesterSync 2.1.1
 
 MesterSync is a Windows desktop tool for safely importing, renaming, converting, and transferring video files. It uses FFmpeg for conversion and FFprobe to verify completed media before local working files are removed.
 
 ## Main features
 
 - One-at-a-time, checksum-verified imports from recording drives
+- Per-drive import memory, so reconnecting a recording disk queues only files that are new or changed
 - Automatic pickup and conversion of supported videos placed in Importfolder
-- Duplicate memory that still works after NAS files are moved
+- Shared original-checksum memory on the NAS, so different ingest computers recognize the same recording even after the converted file is renamed or moved
 - Per-file FFmpeg presets and safety warnings
 - Compact and comfortable dashboard layouts, controlled from the sidebar
 - Smooth inertial scrolling and a virtualized Dashboard for long queues
@@ -94,7 +95,13 @@ The `Build Windows installer` GitHub workflow runs all tests, builds the executa
 
 MesterSync writes imports, conversions, and transfers to temporary files first. It verifies completed files and promotes them without replacing an existing destination. Final names are checked again immediately before each file is committed.
 
-Exact duplicate protection is always on. Matching filenames are not treated as proof that two recordings are duplicates. MesterSync uses file size plus cached samples from the beginning, middle, and end as a fast filter. A sample mismatch proves the recordings differ; a possible match is always confirmed with a SHA-256 checksum of every byte. The name is never part of the duplicate decision, so renamed identical recordings are still found while different camera recordings named `hyperdeck_02.mp4` remain separate. Different recordings receive unique names such as `recording.mov`, `recording_1.mov`, and `recording_2.mov`. Final converted names are reserved across both the output and NAS folders so simultaneous jobs cannot select the same name. Choosing **Import anyway** is the only duplicate override; it still uses a new unique name and never replaces an existing file. Legacy records without samples continue to receive the full check. If the checksum database cannot be saved, the import stops in an error state and keeps both the recording-disk file and its verified local copy.
+Exact duplicate protection is always on. Matching filenames are not treated as proof that two recordings are duplicates. MesterSync uses file size plus cached samples from the beginning, middle, and end as a fast filter. A sample mismatch proves the recordings differ; a possible match is always confirmed with a SHA-256 checksum of every byte. The name is never part of the duplicate decision, so renamed identical recordings are still found while different camera recordings named `hyperdeck_02.mp4` remain separate.
+
+After a disk file has been copied and checksum-verified, MesterSync also remembers that file's volume identity, relative path, metadata, and sampled content. A rescan or reinsertion skips the unchanged file before it reaches the queue, while a new or changed file at the same location still receives the normal exact-content check. A brief Windows drive-detection gap is not treated as an eject/reinsert, and an active task can never be reset to the import stage by a drive rescan.
+
+When a NAS folder is configured, MesterSync stores small per-record checksum entries under `.mestersync` in that NAS folder. This lets another MesterSync computer recognize an original that was imported elsewhere without trying to compare the converted video to the camera original. Existing local history is backfilled when it can account for the existing NAS media. If the NAS or its shared history cannot be checked safely, an unknown import pauses for review instead of proceeding; **Import anyway** remains the explicit override. The independent per-record layout prevents two ingest computers from replacing each other's history.
+
+Different recordings receive unique names such as `recording.mov`, `recording_1.mov`, and `recording_2.mov`. Final converted names are reserved across both the output and NAS folders so simultaneous jobs cannot select the same name. Choosing **Import anyway** still uses a new unique name and never replaces an existing file. Legacy records without samples continue to receive the full check. If a possible match cannot be read completely, or the checksum database cannot be saved, the import stops for review or in an error state and keeps the recording-disk file and any verified local copy. macOS `._` sidecar files and known camera/system metadata folders are always ignored even if old settings omit those exclusions.
 
 Run the core safety checks with:
 

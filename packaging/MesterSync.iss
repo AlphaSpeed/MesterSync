@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "2.1"
+  #define MyAppVersion "2.1.1"
 #endif
 
 #define MyAppName "MesterSync"
