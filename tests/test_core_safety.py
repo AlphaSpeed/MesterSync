@@ -626,6 +626,49 @@ class CoreSafetyTests(unittest.TestCase):
                 progress=0,
             )
 
+    def test_importfolder_watcher_ignores_a_completed_file_during_safe_cleanup(self):
+        with tempfile.TemporaryDirectory() as value:
+            folder = Path(value)
+            source = folder / "HyperDeck_0019.mp4"
+            source.write_bytes(b"verified working copy still being checksummed before deletion")
+            app = self.bare_app()
+            app.watchfolder_scan_lock = threading.Lock()
+            app.task_lock = threading.RLock()
+            app.task_by_path = {}
+            app.cleanup_path_keys = {file_utils.path_key(source)}
+            app.skipped_path_keys = set()
+            app.conversion_enabled = True
+            app.get_config = lambda: {
+                "input_folder": str(folder),
+                "output_folder": str(folder.parent / "output"),
+                "nas_folder": str(folder.parent / "nas"),
+                "conversion_extensions": [".mp4"],
+            }
+            app.create_task = mock.Mock()
+            app.queue_imported_batch_for_conversion = mock.Mock()
+
+            count = app.scan_existing_input_as_detected()
+
+            self.assertEqual(count, 0)
+            app.create_task.assert_not_called()
+            app.queue_imported_batch_for_conversion.assert_not_called()
+
+    def test_failed_completed_cleanup_stays_quarantined_for_the_session(self):
+        with tempfile.TemporaryDirectory() as value:
+            source = Path(value) / "HyperDeck_0019.mp4"
+            source.write_bytes(b"keep me safely")
+            app = self.bare_app()
+            app.task_lock = threading.RLock()
+            app.cleanup_path_keys = set()
+
+            app.hold_paths_during_completed_cleanup(source)
+            app.release_cleaned_paths(source)
+            self.assertIn(file_utils.path_key(source), app.cleanup_path_keys)
+
+            source.unlink()
+            app.release_cleaned_paths(source)
+            self.assertNotIn(file_utils.path_key(source), app.cleanup_path_keys)
+
     def test_import_anyway_converts_existing_importfolder_file_without_copying_it_again(self):
         with tempfile.TemporaryDirectory() as value:
             source = Path(value) / "intentional_duplicate.mp4"
@@ -756,11 +799,11 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertEqual(ui_performance.bounded_log_count(990, 25, 1000), (15, 1000))
         self.assertEqual(ui_performance.bounded_log_count(1000, 80, 1000), (80, 1000))
 
-    def test_version_is_2_1_1(self):
-        self.assertEqual(app_module.APP_VERSION, "2.1.1")
-        self.assertIn('MyAppVersion "2.1.1"', (ROOT / "packaging" / "MesterSync.iss").read_text(encoding="utf-8"))
-        self.assertTrue((ROOT / "README.md").read_text(encoding="utf-8").startswith("# MesterSync 2.1.1"))
-        self.assertTrue((APP_DIR / "README_MesterSync.txt").read_text(encoding="utf-8").startswith("MesterSync 2.1.1"))
+    def test_version_is_2_1_2(self):
+        self.assertEqual(app_module.APP_VERSION, "2.1.2")
+        self.assertIn('MyAppVersion "2.1.2"', (ROOT / "packaging" / "MesterSync.iss").read_text(encoding="utf-8"))
+        self.assertTrue((ROOT / "README.md").read_text(encoding="utf-8").startswith("# MesterSync 2.1.2"))
+        self.assertTrue((APP_DIR / "README_MesterSync.txt").read_text(encoding="utf-8").startswith("MesterSync 2.1.2"))
 
     def test_launcher_has_python_fallbacks_and_visible_failure_message(self):
         launcher = (APP_DIR / "MesterSync.vbs").read_text(encoding="utf-8-sig").lower()

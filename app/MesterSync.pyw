@@ -242,6 +242,7 @@ class MesterSyncApp:
 
         self.tasks: Dict[str, TaskState] = {}
         self.task_by_path: Dict[str, str] = {}
+        self.cleanup_path_keys: set[str] = set()
         self.reserved_import_paths: set[str] = set()
         self.reserved_output_paths: set[str] = set()
         self.reserved_nas_paths: set[str] = set()
@@ -4689,6 +4690,30 @@ class MesterSyncApp:
         """Remove a managed copy only after proving it is still the same file."""
         return delete_path_if_checksum_matches(path, expected_checksum, self.emit_log)
 
+    def hold_paths_during_completed_cleanup(self, *paths: Optional[Path]) -> None:
+        """Keep the folder watcher from rediscovering a just-completed source."""
+        with self.task_lock:
+            if not hasattr(self, "cleanup_path_keys"):
+                self.cleanup_path_keys = set()
+            for path in paths:
+                if path:
+                    self.cleanup_path_keys.add(path_key(path))
+
+    def release_cleaned_paths(self, *paths: Optional[Path]) -> None:
+        """Release only paths that are gone; failed cleanup remains quarantined."""
+        with self.task_lock:
+            if not hasattr(self, "cleanup_path_keys"):
+                self.cleanup_path_keys = set()
+            for path in paths:
+                if not path:
+                    continue
+                try:
+                    missing = not path.exists()
+                except OSError:
+                    missing = False
+                if missing:
+                    self.cleanup_path_keys.discard(path_key(path))
+
     def update_task(self, task_id: str, **kwargs: Any) -> None:
         should_save = False
         with self.task_lock:
@@ -6339,7 +6364,7 @@ class MesterSyncApp:
                 if key in self.skipped_path_keys:
                     continue
                 with self.task_lock:
-                    if key in self.task_by_path:
+                    if key in self.task_by_path or key in getattr(self, "cleanup_path_keys", set()):
                         continue
                 task_id = self.create_task(path, stage=STAGE_CHECKING, imported=True)
                 self.update_task(task_id, progress=0, detail="Checking Importfolder file against duplicate history")
@@ -6818,6 +6843,7 @@ class MesterSyncApp:
         if not task or not task.output_path or not task.output_path.exists():
             self.update_task(task_id, stage=STAGE_ERROR, detail="Converted output missing before output-folder finalize")
             return
+        working_input = task.local_input_path
         target = self.reserve_safe_final_target(task, task.output_path.parent, "reserved_output_paths")
         try:
             if path_key(target) != path_key(task.output_path):
@@ -6832,16 +6858,18 @@ class MesterSyncApp:
             task.detail = "Converted to output folder; not transferred"
             task.progress = 100
             self.update_checksum_final_path(task, task.output_path)
+            self.hold_paths_during_completed_cleanup(working_input)
             self.archive_task(task_id, status="converted_only")
             # Persist the completed record before cleanup. A crash can then only
             # leave an extra local source, never an unrecorded converted result.
-            if task.local_input_path and task.local_input_path.exists():
-                if self.delete_verified_working_file(task.local_input_path, task.original_checksum):
-                    self.emit_log(f"Deleted local imported source after output conversion: {task.local_input_path.name}")
+            if working_input and working_input.exists():
+                if self.delete_verified_working_file(working_input, task.original_checksum):
+                    self.emit_log(f"Deleted local imported source after output conversion: {working_input.name}")
                 else:
-                    self.emit_log(f"Kept local imported source because safe cleanup could not prove it was unchanged: {task.local_input_path}")
+                    self.emit_log(f"Kept local imported source because safe cleanup could not prove it was unchanged; it will not be converted again this session: {working_input}")
         finally:
             self.release_output_target(target)
+            self.release_cleaned_paths(working_input)
 
     def finalize_convert_in_place(self, task_id: str) -> None:
         task = self.tasks.get(task_id)
@@ -6904,6 +6932,7 @@ class MesterSyncApp:
         cfg = self.get_config()
         nas_folder = Path(cfg["nas_folder"])
         dest = self.reserve_safe_final_target(task, nas_folder, "reserved_nas_paths")
+        working_input = task.local_input_path
         try:
             source_size = source.stat().st_size if source.exists() else 0
             disk_warning = self.low_disk_warning(dest, source_size, "Transfer", cfg)
@@ -6981,20 +7010,25 @@ class MesterSyncApp:
                         9000,
                     ),
                 ))
+            # archive_task removes normal path ownership. Hold these paths first
+            # so the continuously running Importfolder watcher cannot rediscover
+            # either file while checksum-safe cleanup is still reading it.
+            self.hold_paths_during_completed_cleanup(source, working_input)
             self.archive_task(task_id, status="transferred")
             # History/checksum state is durable before local cleanup. If cleanup
             # is interrupted, the verified NAS file remains the source of truth.
             if self.delete_verified_working_file(source, copied_digest):
                 self.emit_log(f"Deleted local converted file: {source.name}")
             else:
-                self.emit_log(f"Kept local converted file because safe cleanup could not prove it was unchanged: {source}")
-            if task.local_input_path and task.local_input_path.exists():
-                if self.delete_verified_working_file(task.local_input_path, task.original_checksum):
-                    self.emit_log(f"Deleted local imported source after NAS verification: {task.local_input_path.name}")
+                self.emit_log(f"Kept local converted file because safe cleanup could not prove it was unchanged; it will not be processed again this session: {source}")
+            if working_input and working_input.exists():
+                if self.delete_verified_working_file(working_input, task.original_checksum):
+                    self.emit_log(f"Deleted local imported source after NAS verification: {working_input.name}")
                 else:
-                    self.emit_log(f"Kept local imported source because safe cleanup could not prove it was unchanged: {task.local_input_path}")
+                    self.emit_log(f"Kept local imported source because safe cleanup could not prove it was unchanged; it will not be converted again this session: {working_input}")
         finally:
             self.release_nas_target(dest)
+            self.release_cleaned_paths(source, working_input)
             self.emit_progress("transfer", "Transfer: idle", 0, None)
 
     # ---------------- skip/remove/archive ----------------

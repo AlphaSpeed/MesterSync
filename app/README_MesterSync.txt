@@ -1,4 +1,4 @@
-MesterSync 2.1.1
+MesterSync 2.1.2
 
 Installed use:
 - Open MesterSync from the Start menu or desktop shortcut.
@@ -25,6 +25,7 @@ Notes:
 - Pending dashboard work is restored from mestersync_tasks.json after restarting the app.
 - Exact duplicate protection is always on. Original checksums are shared under .mestersync in the configured NAS folder so other MesterSync computers can recognize the same recording. Confirmed matches and checks that cannot be completed safely wait for review; use Import anyway only when the extra copy is intentional.
 - After a disk file is copied and verified, its drive identity and unchanged-file signature are remembered. Rescanning or reinserting that disk queues only new or changed recordings. A momentary Windows drive-detection gap cannot restart the same import, and an active conversion cannot be pushed back into the import queue.
+- A completed working copy stays reserved while checksum-safe cleanup reads and removes it. The Importfolder watcher cannot rediscover and reconvert it during that cleanup window; if cleanup must keep the file, it remains quarantined for the rest of the session.
 - Preset safety warnings appear in Settings when FFmpeg args look risky, such as missing audio handling, unsupported encoders, or large-output settings.
 - Preset test is inside Settings and converts a 15-second sample from the middle of a selected video. Test files are stored in the user-data folder and never replace or modify the selected source. A successful new test automatically deletes previous test videos.
 - History cards appear progressively, and the live log stays bounded so long sessions remain responsive.
