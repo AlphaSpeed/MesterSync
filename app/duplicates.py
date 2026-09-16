@@ -94,6 +94,8 @@ def _cache_entry(path: Path, cache: Dict[str, Any]) -> Tuple[str, Optional[Tuple
 
 
 def cached_quick_fingerprint(path: Path, cache: Optional[Dict[str, Any]], stop_event: threading.Event) -> Optional[str]:
+    if stop_event.is_set():
+        return None
     if cache is None:
         return quick_fingerprint(path, stop_event)
     key, signature, entry = _cache_entry(path, cache)
@@ -103,7 +105,9 @@ def cached_quick_fingerprint(path: Path, cache: Optional[Dict[str, Any]], stop_e
     if remembered:
         return remembered
     fingerprint = quick_fingerprint(path, stop_event)
-    if fingerprint and _file_signature(path) == signature:
+    if _file_signature(path) != signature:
+        return None
+    if fingerprint:
         entry["quick"] = fingerprint
         cache[key] = entry
     return fingerprint
@@ -115,16 +119,21 @@ def cached_sha256_file(
     stop_event: threading.Event,
     progress_callback: Optional[Callable[[int, int, int], None]] = None,
 ) -> Optional[str]:
+    if stop_event.is_set():
+        return None
     if cache is None:
-        return sha256_file(path, stop_event, progress_callback)
-    key, signature, entry = _cache_entry(path, cache)
+        key, signature, entry = "", _file_signature(path), {}
+    else:
+        key, signature, entry = _cache_entry(path, cache)
     if signature is None:
         return None
     remembered = _valid_fingerprint(entry.get("sha256"))
     if remembered:
         return remembered
     digest = sha256_file(path, stop_event, progress_callback)
-    if digest and _file_signature(path) == signature:
+    if _file_signature(path) != signature:
+        return None
+    if digest and cache is not None:
         entry["sha256"] = digest
         cache[key] = entry
     return digest
@@ -176,10 +185,19 @@ def exact_duplicate_reason(
     progress_callback: Optional[Callable[[str, int, int, int], None]] = None,
     fingerprint_cache: Optional[Dict[str, Any]] = None,
 ) -> str:
-    try:
-        source_size = path.stat().st_size
-    except OSError:
-        source_size = None
+    if stop_event.is_set():
+        return ""
+    initial_signature = _file_signature(path)
+    if initial_signature is None:
+        return UNCERTAIN_DUPLICATE_REASON
+    source_size = initial_signature[2]
+
+    def finish(reason: str = "") -> str:
+        # A recording may be replaced or still be growing while the fast filters
+        # run. A result for those old bytes cannot clear the current file.
+        if _file_signature(path) != initial_signature and not stop_event.is_set():
+            return UNCERTAIN_DUPLICATE_REASON
+        return reason
 
     digest: Optional[str] = None
     source_quick: Optional[str] = None
@@ -226,7 +244,7 @@ def exact_duplicate_reason(
             return UNCERTAIN_DUPLICATE_REASON
     if digest and digest in checksum_db:
         saved_path = checksum_record_path(checksum_db[digest])
-        return f"Checksum already imported as: {saved_path or 'a previous MesterSync import'}"
+        return finish(f"Checksum already imported as: {saved_path or 'a previous MesterSync import'}")
 
     input_folder_value = str(cfg.get("input_folder", "")).strip()
     if input_folder_value:
@@ -261,8 +279,8 @@ def exact_duplicate_reason(
                     return UNCERTAIN_DUPLICATE_REASON
                 return ""
             if digest and existing_digest and digest == existing_digest:
-                return f"Exact same video already exists in importfolder: {existing}"
-    return ""
+                return finish(f"Exact same video already exists in importfolder: {existing}")
+    return finish()
 
 
 def remove_missing_checksum_entries(checksum_db: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:

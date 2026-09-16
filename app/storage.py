@@ -12,9 +12,15 @@ from typing import Any, Dict, Optional
 
 from tasks import (
     STAGE_CHECKING,
+    STAGE_COMPLETE,
+    STAGE_CONVERTED,
+    STAGE_CONVERTED_IN_PLACE,
+    STAGE_CONVERTED_OUTPUT,
     STAGE_CONVERTING,
     STAGE_CONVERTING_IN_PLACE,
     STAGE_DETECTED,
+    STAGE_DUPLICATE_REVIEW,
+    STAGE_IMPORTED,
     STAGE_IMPORTING,
     STAGE_QUEUED,
     STAGE_STOPPED,
@@ -29,6 +35,7 @@ from tasks import (
 CONFIG_FILENAME = "mestersync_config.json"
 HISTORY_FILENAME = "mestersync_history.json"
 TASKS_FILENAME = "mestersync_tasks.json"
+RETAINED_MEDIA_FILENAME = "retained_media.json"
 THUMBNAIL_DIRNAME = ".mestersync_thumbnails"
 DATA_DIRNAME = "data"
 CHECKSUM_DIRNAME = "checksums"
@@ -156,7 +163,7 @@ def ensure_user_storage() -> None:
                 # kept JSON/cache files beside the launcher or in app/.
                 legacy_data_locations = [legacy_root / DATA_DIRNAME, legacy_root, legacy_root / "app"]
                 for legacy_data in legacy_data_locations:
-                    for filename in (CONFIG_FILENAME, HISTORY_FILENAME, TASKS_FILENAME):
+                    for filename in (CONFIG_FILENAME, HISTORY_FILENAME, TASKS_FILENAME, RETAINED_MEDIA_FILENAME):
                         for suffix in ("", ".bak"):
                             source = legacy_data / f"{filename}{suffix}"
                             target = destination_data / source.name
@@ -227,6 +234,10 @@ def history_path() -> Path:
 
 def tasks_path() -> Path:
     return data_dir() / TASKS_FILENAME
+
+
+def retained_media_path() -> Path:
+    return data_dir() / RETAINED_MEDIA_FILENAME
 
 
 def thumbnail_dir() -> Path:
@@ -410,6 +421,53 @@ def save_checksum_records(path: Path, records: Dict[str, Any]) -> None:
     write_json_file(path, records)
 
 
+def _validated_retained_media_records(data: Any) -> Dict[str, Dict[str, Any]]:
+    from file_utils import path_key
+
+    if not isinstance(data, dict):
+        raise ValueError("Retained video safety records must be a mapping.")
+    records: Dict[str, Dict[str, Any]] = {}
+    for value in data.values():
+        if not isinstance(value, dict) or not isinstance(value.get("path"), str) or not value["path"].strip():
+            raise ValueError("A retained video safety record has no valid file location.")
+        signature = value.get("signature")
+        quick = value.get("quick_fingerprint")
+        if (
+            not isinstance(signature, list)
+            or len(signature) != 5
+            or any(type(item) is not int for item in signature)
+            or not isinstance(quick, str)
+            or len(quick) != 64
+            or any(char not in "0123456789abcdefABCDEF" for char in quick)
+        ):
+            raise ValueError("A retained video safety record has an invalid file fingerprint.")
+        normalized = dict(value)
+        normalized["quick_fingerprint"] = quick.lower()
+        records[path_key(value["path"])] = normalized
+    return records
+
+
+def load_retained_media_records() -> Dict[str, Dict[str, Any]]:
+    """Restore automatic-conversion exclusions independently of visible History.
+
+    Existing unreadable state must not silently become an empty map: that could
+    make a deliberately retained converted video eligible for conversion again.
+    """
+    path = retained_media_path()
+    backup = path.with_suffix(path.suffix + ".bak")
+    if not path.exists() and not backup.exists():
+        return {}
+    data = read_json_file(path, None)
+    if data is None:
+        raise ValueError("Retained video safety records could not be read or recovered from backup.")
+    return _validated_retained_media_records(data)
+
+
+def save_retained_media_records(records: Dict[str, Dict[str, Any]]) -> None:
+    """Persist retained video identities before releasing completed task paths."""
+    write_json_file(retained_media_path(), _validated_retained_media_records(records))
+
+
 def converted_history_count(records: list[Dict[str, Any]]) -> int:
     return sum(1 for rec in records if rec.get("status") in {"transferred", "converted_only", "converted_in_place"})
 
@@ -434,16 +492,21 @@ def task_to_record(task: TaskState) -> Dict[str, Any]:
         "converted_at": task.converted_at,
         "transferred_at": task.transferred_at,
         "eta_seconds": task.eta_seconds,
+        "source_duration_seconds": task.source_duration_seconds,
         "created_at": task.created_at,
         "started_at": task.started_at,
         "thumbnail_path": task.thumbnail_path,
         "thumbnail_preview_paths": task.thumbnail_preview_paths,
         "imported_size": task.imported_size,
         "original_checksum": task.original_checksum,
+        "import_verified": task.import_verified,
         "output_size": task.output_size,
+        "output_validated": task.output_validated,
         "preset_name": task.preset_name,
         "ffmpeg_args": task.ffmpeg_args,
         "conversion_started": task.conversion_started,
+        "pending_conversion_args": task.pending_conversion_args,
+        "conversion_stop_requested": task.conversion_stop_event.is_set(),
         "space_savings": task.space_savings,
         "skipped": task.skipped,
         "skip_archive_due": task.skip_archive_due,
@@ -461,6 +524,28 @@ def record_to_task(record: Dict[str, Any]) -> Optional[TaskState]:
         if not original_value:
             return None
         original_path = Path(original_value)
+        saved_stage = str(record.get("stage") or STAGE_STOPPED)
+        checksum = str(record.get("original_checksum") or "").strip().lower()
+        valid_checksum = len(checksum) == 64 and all(ch in "0123456789abcdef" for ch in checksum)
+        # Older versions did not persist verification separately. Only infer it
+        # from a stage that was reached after the relevant check completed;
+        # Interrupted/Error/Stopped tasks may still contain unchecked media.
+        completed_output_stages = {
+            STAGE_CONVERTED, STAGE_WAITING_TRANSFER, STAGE_TRANSFERRING,
+            STAGE_COMPLETE, STAGE_CONVERTED_OUTPUT, STAGE_CONVERTED_IN_PLACE,
+        }
+        verified_import_stages = completed_output_stages | {
+            STAGE_IMPORTED, STAGE_QUEUED, STAGE_WAITING, STAGE_CONVERTING,
+            STAGE_CONVERTING_IN_PLACE, STAGE_DUPLICATE_REVIEW,
+        }
+        legacy_import_verified = bool(
+            record.get("local_input_path") and record.get("imported_at")
+            and valid_checksum and saved_stage in verified_import_stages
+        )
+        legacy_output_validated = bool(
+            record.get("output_path") and record.get("converted_at")
+            and saved_stage in completed_output_stages
+        )
         task = TaskState(
             task_id=str(record.get("task_id") or uuid.uuid4().hex),
             original_path=original_path,
@@ -477,16 +562,20 @@ def record_to_task(record: Dict[str, Any]) -> Optional[TaskState]:
             converted_at=record.get("converted_at"),
             transferred_at=record.get("transferred_at"),
             eta_seconds=record.get("eta_seconds"),
+            source_duration_seconds=record.get("source_duration_seconds"),
             created_at=float(record.get("created_at") or time.time()),
             started_at=float(record.get("started_at") or time.time()),
             thumbnail_path=record.get("thumbnail_path"),
             thumbnail_preview_paths=record.get("thumbnail_preview_paths") if isinstance(record.get("thumbnail_preview_paths"), list) else [],
             imported_size=record.get("imported_size"),
             original_checksum=str(record.get("original_checksum") or ""),
+            import_verified=record.get("import_verified", legacy_import_verified) is True,
             output_size=record.get("output_size"),
+            output_validated=record.get("output_validated", legacy_output_validated) is True,
             preset_name=str(record.get("preset_name") or "Current settings"),
             ffmpeg_args=record.get("ffmpeg_args") if isinstance(record.get("ffmpeg_args"), list) else None,
             conversion_started=bool(record.get("conversion_started", False)),
+            pending_conversion_args=record.get("pending_conversion_args") if isinstance(record.get("pending_conversion_args"), list) else None,
             space_savings=str(record.get("space_savings") or ""),
             skipped=bool(record.get("skipped", False)),
             skip_archive_due=record.get("skip_archive_due"),
@@ -496,6 +585,8 @@ def record_to_task(record: Dict[str, Any]) -> Optional[TaskState]:
             error_log=str(record.get("error_log") or ""),
             convert_in_place=bool(record.get("convert_in_place", False)),
         )
+        if record.get("conversion_stop_requested") is True:
+            task.conversion_stop_event.set()
         if task.stage in {
             STAGE_CHECKING,
             STAGE_DETECTED,
@@ -509,7 +600,7 @@ def record_to_task(record: Dict[str, Any]) -> Optional[TaskState]:
             STAGE_WAITING,
         }:
             task.stage = STAGE_STOPPED
-            task.detail = "Restored after app restart. Press Restart/Resume to continue."
+            task.detail = "Ready to resume after restart."
             task.progress = 0
         return task
     except Exception:

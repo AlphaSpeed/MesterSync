@@ -589,7 +589,7 @@ class CoreSafetyTests(unittest.TestCase):
             created_paths = {call.args[0] for call in app.create_task.call_args_list}
             self.assertEqual(created_paths, {first, second})
             for call in app.create_task.call_args_list:
-                self.assertEqual(call.kwargs, {"stage": app_module.STAGE_CHECKING, "imported": True})
+                self.assertEqual(call.kwargs, {"stage": app_module.STAGE_CHECKING, "imported": True, "new_only": True})
             app.queue_imported_batch_for_conversion.assert_called_once()
             self.assertCountEqual(app.queue_imported_batch_for_conversion.call_args.args[0], ["one", "two"])
 
@@ -799,11 +799,11 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertEqual(ui_performance.bounded_log_count(990, 25, 1000), (15, 1000))
         self.assertEqual(ui_performance.bounded_log_count(1000, 80, 1000), (80, 1000))
 
-    def test_version_is_2_1_2(self):
-        self.assertEqual(app_module.APP_VERSION, "2.1.2")
-        self.assertIn('MyAppVersion "2.1.2"', (ROOT / "packaging" / "MesterSync.iss").read_text(encoding="utf-8"))
-        self.assertTrue((ROOT / "README.md").read_text(encoding="utf-8").startswith("# MesterSync 2.1.2"))
-        self.assertTrue((APP_DIR / "README_MesterSync.txt").read_text(encoding="utf-8").startswith("MesterSync 2.1.2"))
+    def test_version_is_2_1_3(self):
+        self.assertEqual(app_module.APP_VERSION, "2.1.3")
+        self.assertIn('MyAppVersion "2.1.3"', (ROOT / "packaging" / "MesterSync.iss").read_text(encoding="utf-8"))
+        self.assertTrue((ROOT / "README.md").read_text(encoding="utf-8").startswith("# MesterSync 2.1.3"))
+        self.assertTrue((APP_DIR / "README_MesterSync.txt").read_text(encoding="utf-8").startswith("MesterSync 2.1.3"))
 
     def test_launcher_has_python_fallbacks_and_visible_failure_message(self):
         launcher = (APP_DIR / "MesterSync.vbs").read_text(encoding="utf-8-sig").lower()
@@ -1794,7 +1794,7 @@ class CoreSafetyTests(unittest.TestCase):
             self.assertIsNotNone(restored)
             self.assertEqual(restored.stage, app_module.STAGE_STOPPED)
             self.assertTrue(restored.force_import)
-            self.assertIn("Restart/Resume", restored.detail)
+            self.assertIn("Ready to resume", restored.detail)
 
     def test_atomic_json_write_keeps_previous_backup(self):
         with tempfile.TemporaryDirectory() as value:

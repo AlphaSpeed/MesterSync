@@ -1,6 +1,24 @@
-# MesterSync 2.1.2
+# MesterSync 2.1.3
 
 MesterSync is a Windows desktop tool for safely importing, renaming, converting, and transferring video files. It uses FFmpeg for conversion and FFprobe to verify completed media before local working files are removed.
+
+## Safety and usability review in 2.1.3
+
+- Cleaner selection bar with on-demand batch rename and live before/after previews. Bulk rename still requires confirmation.
+- File rows show coloured preset tags, selection checkmarks, a large percentage, remaining time and approximate output size. Warning tags open the explanation in Details and also produce a notification.
+- Settings include short visible descriptions, with advanced controls collapsed by default. Non-deleting actions use neutral colours. Convert beside original… remains a file-picker action, not a selection-bar action.
+- History displays the saved destination path. The Conversion box shows the current video's remaining time and a learned, approximate queue encoding estimate.
+- Make new preset… guides you through resolution, frame rate, encoder, bitrate, and naming. One-video settings include previews, resolution/frame rate, 1–200 Mbps video bitrate, MP4/MOV/MKV format, AAC/MP3/AC-3 audio and 64–320 kbps audio bitrate. MP3 uses stereo. The size estimate is approximate and needs duration and target rates.
+- Change settings… is beside the queued video's preset dropdown and remains available in More… after conversion starts. Applying changed settings stops that video's old operation before restarting it; finished files are kept and new output uses no-overwrite naming. The original must still be available. Pause/Stop controls are respected, and duplicate review cannot be bypassed. Restart requests survive closing the app.
+- Stronger duplicate protection during concurrent NAS imports, interrupted jobs, and repeated folder scans. Resume and Retry cannot bypass **Import anyway**.
+- Restart recovery distinguishes verified imports and completed conversions from unfinished files. In-place recovery always keeps the original and does not send it through normal source cleanup.
+- In-place results and rejected outputs kept for inspection are remembered independently of History, so clearing History or restarting does not make unchanged files eligible for automatic conversion again. Different recordings reusing the same names are still detected.
+- A rejected recovered output can be retried as a new, uniquely named conversion without deleting the rejected file. Recovery actions wait until an old operation has finished stopping.
+- Checks for readable source/output video, expected audio, and duration before completion or transfer. Long recordings no longer receive a multi-minute duration tolerance; the maximum difference is five seconds.
+- Windows working-file cleanup checks and removes the same exclusively held file, preventing a replacement between verification and deletion. Failed copy verification keeps both files for inspection.
+- The notification center keeps active drive notices alongside the latest three ordinary messages. Dismissed messages cannot return through a delayed callback.
+
+See [the review and test notes](AUDIT_2.1.3.md) for coverage and remaining real-world checks.
 
 ## Main features
 
@@ -21,7 +39,7 @@ MesterSync is a Windows desktop tool for safely importing, renaming, converting,
 - Persistent disk-ready feedback that remains active until the corresponding recording drive is disconnected
 - A contextual selection bar that always shows how many files an action will affect and clears after batch actions
 - Safe rename scoping: inline fields rename one file only, while multi-file rename requires an explicit preview and confirmation
-- Separate commands for choosing files to convert in place and converting selected Dashboard rows
+- A separate file-picker command for converting beside the original; selecting Dashboard rows does not change its scope
 - An actionable empty Dashboard plus visible start/completion feedback for manual Importfolder scans
 - Visible success, unsupported-file, and cancellation feedback for file-picker and drag-and-drop imports
 - A durable Import anyway override that bypasses duplicate detection until the requested import succeeds

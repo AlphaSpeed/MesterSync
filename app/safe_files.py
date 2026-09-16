@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -15,17 +16,84 @@ LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int, int], None]
 
 
+def _delete_windows_file_if_checksum_matches(path: Path, expected: str, log: LogCallback) -> bool:
+    """Hash and mark the same exclusive Windows handle for deletion.
+
+    Keeping this handle open without write/delete sharing prevents another
+    process from replacing the verified file between hashing and deletion.
+    Never fall back to deleting by pathname when the exclusive open fails.
+    """
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    set_information = kernel32.SetFileInformationByHandle
+    set_information.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    set_information.restype = wintypes.BOOL
+
+    # GENERIC_READ | DELETE; no sharing; OPEN_EXISTING; sequential read,
+    # OPEN_REPARSE_POINT so a replaced symlink cannot redirect cleanup.
+    handle = create_file(str(path), 0x80000000 | 0x00010000, 0, None, 3, 0x08200000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        if error in (2, 3):  # File/path genuinely absent.
+            return True
+        log(f"Kept working file because it could not be locked for safe cleanup: {path} ({ctypes.WinError(error)})")
+        return False
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except Exception:
+        close_handle(handle)
+        raise
+    with os.fdopen(descriptor, "rb") as stream:
+        opened_stat = os.fstat(stream.fileno())
+        if not stat.S_ISREG(opened_stat.st_mode) or getattr(opened_stat, "st_file_attributes", 0) & 0x400:
+            log(f"Kept file because it became a link or special file before cleanup: {path}")
+            return False
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+        if digest.hexdigest() != expected:
+            log(f"Kept file because its content changed after MesterSync created it: {path}")
+            return False
+        # FILE_DISPOSITION_INFO contains one BOOLEAN, FileDispositionInfo = 4.
+        disposition = ctypes.c_ubyte(1)
+        if not set_information(handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)):
+            error = ctypes.get_last_error()
+            log(f"Kept verified working file because safe cleanup was refused: {path} ({ctypes.WinError(error)})")
+            return False
+    return True
+
+
 def delete_file_if_checksum_matches(path: Path, expected_checksum: str, log: LogCallback) -> bool:
     """Delete only when the file still has the exact content MesterSync expects.
 
     This protects against deleting a different recording that was edited or put
     at the same path after the app created its working copy.
     """
-    if not path.exists():
-        return True
     expected = str(expected_checksum or "").strip().lower()
     if len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
         log(f"Kept file because no trusted checksum was available before cleanup: {path}")
+        return False
+    try:
+        initial_stat = path.lstat()
+        if not stat.S_ISREG(initial_stat.st_mode) or getattr(initial_stat, "st_file_attributes", 0) & 0x400:
+            log(f"Kept file because safe cleanup cannot delete a link or special file: {path}")
+            return False
+        if os.name == "nt":
+            return _delete_windows_file_if_checksum_matches(path, expected, log)
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        log(f"Kept working file because it could not be checked for safe cleanup: {path}: {exc}")
         return False
     actual = sha256_file(path)
     if not actual:
@@ -34,8 +102,18 @@ def delete_file_if_checksum_matches(path: Path, expected_checksum: str, log: Log
     if actual.lower() != expected:
         log(f"Kept file because its content changed after MesterSync created it: {path}")
         return False
-    if not force_delete(path):
-        log(f"Could not delete verified working file: {path}")
+    try:
+        final_stat = path.lstat()
+        if (initial_stat.st_dev, initial_stat.st_ino, initial_stat.st_size, initial_stat.st_mtime_ns) != (
+            final_stat.st_dev, final_stat.st_ino, final_stat.st_size, final_stat.st_mtime_ns
+        ):
+            log(f"Kept file because it changed before cleanup: {path}")
+            return False
+        path.unlink()
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        log(f"Could not delete verified working file: {path}: {exc}")
         return False
     return True
 
@@ -160,6 +238,8 @@ def copy_file_safely(
                 if should_stop():
                     raise InterruptedError()
                 wait_if_paused()
+                if should_stop():
+                    raise InterruptedError()
                 data = src.read(chunk)
                 if not data:
                     break
@@ -175,6 +255,8 @@ def copy_file_safely(
             force_delete(temp)
             log(f"Copy stopped because the source changed while it was being read: {source}")
             return False
+        if should_stop():
+            raise InterruptedError()
         if not promote_temp(temp, destination):
             force_delete(temp)
             log(f"Copy stopped because destination appeared during copy: {destination}")

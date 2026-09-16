@@ -97,7 +97,9 @@ def path_contains_system_metadata(path: Path | str) -> bool:
 
 
 def should_exclude_file(filename: str, patterns: Iterable[str]) -> bool:
-    if is_system_metadata_file(filename):
+    # FFmpeg needs a real video extension on its temporary output. These files
+    # are still being written and must never become new imports/conversions.
+    if is_system_metadata_file(filename) or Path(filename).name.lower().startswith(".mestersync_"):
         return True
     return any(fnmatch.fnmatch(filename, pattern) for pattern in patterns)
 
@@ -197,11 +199,13 @@ def file_is_ready(path: Path, stable_seconds: int = 10, check_interval: float = 
     if not path.exists() or not path.is_file():
         return False
     try:
-        previous = path.stat().st_size
-        end = time.time() + max(1, stable_seconds)
-        while time.time() < end:
+        initial_stat = path.stat()
+        previous = (initial_stat.st_dev, initial_stat.st_ino, initial_stat.st_size, initial_stat.st_mtime_ns)
+        end = time.monotonic() + max(1, stable_seconds)
+        while time.monotonic() < end:
             time.sleep(check_interval)
-            current = path.stat().st_size
+            current_stat = path.stat()
+            current = (current_stat.st_dev, current_stat.st_ino, current_stat.st_size, current_stat.st_mtime_ns)
             if current != previous:
                 return False
             previous = current

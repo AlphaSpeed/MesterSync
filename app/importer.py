@@ -33,7 +33,12 @@ def collect_import_candidates(paths: Iterable[Path], extensions: Iterable[str], 
                     and is_video_file(sub, extensions)
                 ):
                     candidates.append(sub)
-        elif path.is_file() and not should_exclude_file(path.name, ()) and is_video_file(path, extensions):
+        elif (
+            path.is_file()
+            and not path_contains_system_metadata(path)
+            and not should_exclude_file(path.name, ())
+            and is_video_file(path, extensions)
+        ):
             candidates.append(path)
     return candidates
 

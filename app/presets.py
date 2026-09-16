@@ -68,6 +68,16 @@ def preset_badges(name: str, ffmpeg_args: Iterable[str]) -> List[Tuple[str, str]
     output = detect_output_extension(args).lstrip(".").upper()
     vf = arg_value(args, "-vf") or ""
     size = "SCALE" if "scale" in vf.lower() else "ORIGINAL SIZE"
+    if vf == "scale=trunc(iw/2)*2:trunc(ih/2)*2":
+        size = "ORIGINAL SIZE"
+    dimensions = re.findall(r"scale=(\d+):(\d+)", vf)
+    if dimensions:
+        width, height = dimensions[-1]
+        size = "4K" if (width, height) == ("3840", "2160") else f"{height}p"
+    fps = arg_value(args, "-r", "-r:v")
+    bitrate = arg_value(args, "-b:v")
+    picture = " · ".join(value for value in [size, f"{fps} fps" if fps else "",
+                                            f"{bitrate[:-1]} Mbps" if bitrate and bitrate.endswith("M") else ""] if value)
     warnings = analyze_preset_args(args)
     safety = "SAFETY OK" if not warnings else f"{len(warnings)} WARNING"
     return [
@@ -75,6 +85,6 @@ def preset_badges(name: str, ffmpeg_args: Iterable[str]) -> List[Tuple[str, str]
         (video, "#1f8a5b"),
         (audio, "#805ad5"),
         (output, "#b7791f"),
-        (size, "#4a5568"),
+        (picture, "#4a5568"),
         (safety, "#1f8a5b" if not warnings else "#c05621"),
     ]

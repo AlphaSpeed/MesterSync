@@ -20,6 +20,7 @@ class TaskViewSnapshot:
     converted_at: Optional[str]
     transferred_at: Optional[str]
     eta_seconds: Optional[float]
+    source_duration_seconds: Optional[float]
     skipped: bool
     skip_archive_due: Optional[float]
     preset_name: str
@@ -46,6 +47,7 @@ class TaskViewSnapshot:
             converted_at=task.converted_at,
             transferred_at=task.transferred_at,
             eta_seconds=task.eta_seconds,
+            source_duration_seconds=task.source_duration_seconds,
             skipped=task.skipped,
             skip_archive_due=task.skip_archive_due,
             preset_name=task.preset_name,

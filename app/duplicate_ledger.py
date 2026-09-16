@@ -72,6 +72,10 @@ def _record_paths(value: Mapping[str, Any]) -> list[str]:
 
 def _normalized_record(digest: str, value: Any) -> Optional[Dict[str, Any]]:
     digest = _valid_digest(digest)
+    # Older local databases used digest -> path. The checksum is still valid
+    # even though these records do not have size/sample metadata yet.
+    if isinstance(value, str) and value.strip():
+        value = {"final_path": value.strip()}
     if not digest or not isinstance(value, Mapping):
         return None
     try:
@@ -203,10 +207,11 @@ def _load_shared_records(records_folder: Path, required: bool = False) -> Tuple[
         if required:
             return records, ["the checksum-record folder is missing or unavailable"]
         return records, errors
-    try:
-        paths = list(records_folder.rglob("*.json"))
-    except OSError as exc:
-        return records, [str(exc)]
+    paths: list[Path] = []
+    # pathlib's recursive glob can silently suppress directory access errors.
+    # Keep readable records, but never claim the missing part was checked.
+    for root, _dirnames, filenames in os.walk(records_folder, onerror=lambda exc: errors.append(str(exc))):
+        paths.extend(Path(root) / name for name in filenames if Path(name).suffix.lower() == ".json")
     for path in paths:
         digest = _valid_digest(path.stem)
         if not digest:
@@ -261,11 +266,15 @@ def _first_untracked_media(
 ) -> Optional[Path]:
     exact = _known_media_locations(nas_folder, records, extra_paths)
     ledger_name = LEDGER_DIRNAME.lower()
+    def raise_scan_error(exc: OSError) -> None:
+        raise exc
     try:
-        for root, dirnames, filenames in os.walk(nas_folder):
+        for root, dirnames, filenames in os.walk(nas_folder, onerror=raise_scan_error):
             dirnames[:] = [name for name in dirnames if name.lower() != ledger_name]
             for filename in filenames:
                 if Path(filename).suffix.lower() not in MEDIA_EXTENSIONS:
+                    continue
+                if filename.startswith("._"):
                     continue
                 path = Path(root) / filename
                 key = os.path.normcase(os.path.abspath(str(path)))
@@ -323,7 +332,10 @@ def sync_shared_checksum_ledger(
 
     if not marker_exists:
         try:
-            untracked = _first_untracked_media(nas_folder, local, known_final_paths)
+            coverage = dict(shared)
+            for digest, value in local.items():
+                coverage[digest] = _merge_records(digest, shared.get(digest, {}), value)
+            untracked = _first_untracked_media(nas_folder, coverage, known_final_paths)
         except OSError as exc:
             return SharedLedgerSync(shared, False, error=str(exc))
         if untracked is not None:
@@ -341,10 +353,14 @@ def sync_shared_checksum_ledger(
         for digest, value in local.items():
             path = _shared_record_path(records_folder, digest)
             previous = shared.get(digest, {})
-            merged = _merge_records(digest, previous, value)
-            if not path.exists() or merged != previous:
-                _write_json_atomic(path, merged)
-                exported += 1
+            if previous and _merge_records(digest, previous, value) == previous:
+                # Most records are unchanged. Avoid creating/flushing a NAS
+                # lock file for each of those on every disk insertion.
+                continue
+            # A different computer may have published this same recording since
+            # the scan above. Read and merge again under the claim writer's lock.
+            merged, written, _present = _update_shared_record(path, digest, value)
+            exported += int(written)
             shared[digest] = merged
         if not marker_exists:
             records_folder.mkdir(parents=True, exist_ok=True)
@@ -361,6 +377,29 @@ def sync_shared_checksum_ledger(
         return SharedLedgerSync(shared, marker_exists, exported, f"Shared NAS duplicate history could not be saved: {exc}")
 
     return SharedLedgerSync(shared, marker_exists, exported)
+
+
+def _update_shared_record(path: Path, digest: str, value: Mapping[str, Any]) -> Tuple[Dict[str, Any], bool, bool]:
+    lock_path = _acquire_record_lock(path)
+    try:
+        old: Dict[str, Any] = {}
+        try:
+            raw = _read_json(path)
+        except FileNotFoundError:
+            already_present = False
+        else:
+            already_present = True
+            payload_digest = _valid_digest(raw.get("original_checksum")) if isinstance(raw, Mapping) else ""
+            if payload_digest != digest:
+                raise ValueError("checksum inside the record does not match its filename")
+            old = dict(raw)
+        merged = _merge_records(digest, old, value)
+        written = not already_present or merged != _normalized_record(digest, old)
+        if written:
+            _write_json_atomic(path, merged)
+        return merged, written, already_present
+    finally:
+        _release_record_lock(lock_path)
 
 
 def publish_shared_checksum_record(nas_folder: Path, digest: str, value: Mapping[str, Any]) -> SharedLedgerSync:
@@ -391,33 +430,12 @@ def publish_shared_checksum_record(nas_folder: Path, digest: str, value: Mapping
     except Exception as exc:
         return SharedLedgerSync({}, False, error=f"The shared NAS duplicate-history marker could not be read: {exc}")
 
-    path = _shared_record_path(records_folder, digest)
-    lock_path: Optional[Path] = None
     try:
-        lock_path = _acquire_record_lock(path)
+        if marker_exists and not records_folder.is_dir():
+            return SharedLedgerSync({}, True, error="The shared checksum-record folder is missing or unavailable.")
+        path = _shared_record_path(records_folder, digest)
+        merged, written, already_present = _update_shared_record(path, digest, record)
     except Exception as exc:
-        return SharedLedgerSync({}, marker_exists, error=f"The shared checksum record is busy: {exc}")
-    old: Dict[str, Any] = {}
-    already_present = path.exists()
-    if already_present:
-        try:
-            raw = _read_json(path)
-            payload_digest = _valid_digest(raw.get("original_checksum")) if isinstance(raw, Mapping) else ""
-            if payload_digest != digest:
-                raise ValueError("checksum inside the record does not match its filename")
-            old = dict(raw)
-        except Exception as exc:
-            _release_record_lock(lock_path)
-            return SharedLedgerSync({}, marker_exists, error=f"The existing shared checksum record could not be read: {exc}")
-    merged = _merge_records(digest, old, record)
-    try:
-        if not path.exists() or merged != _normalized_record(digest, old):
-            _write_json_atomic(path, merged)
-            issue = "" if marker_exists else "Shared NAS duplicate history is not initialized for older archive media."
-            return SharedLedgerSync({digest: merged}, marker_exists, exported=1, error=issue, already_present=already_present)
-    except Exception as exc:
-        return SharedLedgerSync({}, marker_exists, error=f"Shared NAS duplicate history could not be updated: {exc}", already_present=already_present)
-    finally:
-        _release_record_lock(lock_path)
+        return SharedLedgerSync({}, marker_exists, error=f"Shared NAS duplicate history could not be updated: {exc}")
     issue = "" if marker_exists else "Shared NAS duplicate history is not initialized for older archive media."
-    return SharedLedgerSync({digest: merged}, marker_exists, error=issue, already_present=already_present)
+    return SharedLedgerSync({digest: merged}, marker_exists, exported=int(written), error=issue, already_present=already_present)

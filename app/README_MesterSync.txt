@@ -1,4 +1,4 @@
-MesterSync 2.1.2
+MesterSync 2.1.3
 
 Installed use:
 - Open MesterSync from the Start menu or desktop shortcut.
@@ -6,6 +6,21 @@ Installed use:
 - Stop active media work before installing an update.
 
 Notes:
+- Select multiple files, then choose Rename… to open the batch editor. Review the before/after filenames and confirm before applying.
+- More… contains Details, Change conversion settings…, queue ordering, and Copy error. Coloured preset tags and selection checkmarks remain visible on rows.
+- Settings show short descriptions. Advanced controls in Safety and Presets are collapsed by default.
+- Settings > Presets & test > Make new preset… guides you through making a reusable MP4 preset without replacing any existing preset or changing the default.
+- Change settings… is beside the queued video's preset dropdown and remains in More… after conversion starts. It offers previews, resolution, frame rate, 1–200 Mbps video bitrate, MP4/MOV/MKV, AAC/MP3/AC-3 audio and 64–320 kbps audio bitrate. MP3 uses stereo. Other videos and presets are unchanged.
+- Applying changed settings restarts an already-started conversion after its old operation has stopped. Existing finished files are kept, and the original must still be available. Pending restart requests survive closing the app. Pause/Stop and duplicate review still apply.
+- Warning tags open Details with the explanation; a notification also explains the warning. A 50 Mbps or higher target produces a large-file advisory, not a conversion failure.
+- Dashboard rows have a larger percentage and estimated time/size. Size needs a known duration and target bitrates and is approximate. Continue conversion replaces the previous Finish conversion label.
+- History shows the saved destination path, which can be selected and copied.
+- The Conversion box shows current-video time and an approximate whole-queue encoding estimate. Unknown durations/settings are shown as estimating. It learns speed during this session and does not include import or NAS transfer time.
+- Convert beside original… is the renamed in-place conversion command; it still keeps the original and creates a separate file.
+- Version 2.1.3 hardens duplicate protection, restart/stop recovery, verified cleanup, and incomplete-output checks.
+- In-place originals/results and rejected outputs kept for inspection are remembered separately from History. Unchanged files are not picked up again after clearing History or restarting; a different recording with the same name remains eligible.
+- A rejected recovered output stays on disk for inspection. Retry can create a new uniquely named conversion when the source can be checked.
+- The notification center includes active drive notices plus the latest three ordinary messages.
 - Installed program files are kept separate from writable settings and work data.
 - Settings, history, pending tasks, thumbnails, update downloads, and presets are under %LOCALAPPDATA%\MesterSync.
 - Portable data is copied into the user-data folder during migration; the portable originals are not deleted.
@@ -36,7 +51,7 @@ Notes:
 - Settings are split into compact Folders, Drives, Safety, Presets, and About & updates categories.
 - Dashboard rows show the safe final name MesterSync would choose right now. Final output/NAS filenames are checked again at the moment files are finalized so videos cannot overwrite each other.
 - Matching filenames alone do not mean two videos are duplicates. MesterSync uses size plus cached beginning/middle/end samples as a fast filter, then confirms possible matches by hashing every byte. Names are never part of the decision, so renamed identical videos are found while different recordings with the same camera filename are kept separately using numbered filenames. Legacy records still get the full check. Import anyway also uses a new unique name and never replaces an existing file. macOS ._ sidecars and known metadata folders are always ignored.
-- Imports run one at a time. Use the row Up/Down controls or Alt+Up/Down to change which waiting video goes next.
+- Imports run one at a time. Use More… > Move up/Move down or Alt+Up/Down to change which waiting video goes next.
 - A green Disk ready to remove notice appears after every video from a detected recording disk has been copied and checksum-verified. Conversion and NAS transfer may continue afterward.
 - Settings save automatically after a short pause.
 - Imported and NAS copies are checksum-verified before MesterSync removes any local working file. Converted media is checked with FFprobe for readable video, duration, and expected audio.

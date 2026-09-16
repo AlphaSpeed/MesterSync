@@ -46,16 +46,20 @@ class TaskState:
     converted_at: Optional[str] = None
     transferred_at: Optional[str] = None
     eta_seconds: Optional[float] = None
+    source_duration_seconds: Optional[float] = None
     created_at: float = field(default_factory=time.time)
     started_at: float = field(default_factory=time.time)
     thumbnail_path: Optional[str] = None
     thumbnail_preview_paths: List[str] = field(default_factory=list)
     imported_size: Optional[int] = None
     original_checksum: str = ""
+    import_verified: bool = False
     output_size: Optional[int] = None
+    output_validated: bool = False
     preset_name: str = "Current settings"
     ffmpeg_args: Optional[List[str]] = None
     conversion_started: bool = False
+    pending_conversion_args: Optional[List[str]] = None
     space_savings: str = ""
     skipped: bool = False
     skip_archive_due: Optional[float] = None
@@ -65,6 +69,7 @@ class TaskState:
     error_log: str = ""
     convert_in_place: bool = False
     import_stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    conversion_stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
     transfer_stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
     copy_thread_active: bool = False
 

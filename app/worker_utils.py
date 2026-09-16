@@ -23,14 +23,16 @@ def wait_for_conversion_task(
             condition.wait(timeout=0.5)
         if shutdown_event.is_set():
             return None
-        task_id = conversion_queue.popleft()
+        enabled = conversion_enabled()
+        if enabled:
+            task_id = conversion_queue.popleft()
+        else:
+            task_id = next((item for item in conversion_queue if item in force_ids), None)
+            if task_id is None:
+                return None
+            conversion_queue.remove(task_id)
         queued_ids.discard(task_id)
         force = task_id in force_ids
-        if not conversion_enabled() and not force:
-            conversion_queue.append(task_id)
-            queued_ids.add(task_id)
-            condition.wait(timeout=0.5)
-            return None
         return task_id, force
 
 
