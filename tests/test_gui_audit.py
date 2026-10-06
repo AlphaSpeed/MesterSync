@@ -114,6 +114,17 @@ class GuiAuditTests(unittest.TestCase):
                 app.tasks = {first.task_id: first, second.task_id: second}
                 app.create_task_row(first)
                 app.create_task_row(second)
+                # State changes must recolour the whole passive surface even
+                # when the progress percentage has not changed.
+                surface_keys = ("card", "right", "top", "progress_wrap", "progress_text", "estimate_text", "preset_holder", "preset_label")
+                for stage, background in ((app_module.STAGE_CONVERTING, app.DARK_GREEN),
+                                          (app_module.STAGE_CONVERTING_IN_PLACE, app.DARK_GREEN),
+                                          (app_module.STAGE_ERROR, "#3a1018"),
+                                          (app_module.STAGE_QUEUED, app.CARD)):
+                    first.stage = stage
+                    app.render_task(first.task_id)
+                    for key in surface_keys:
+                        self.assertEqual(app.row_widgets[first.task_id][key].cget("bg"), background, (stage, key))
                 app.selected_ids = [first.task_id, second.task_id]
                 app.update_batch_box_visibility()
                 self.assertEqual(app.selection_summary_var.get(), "2 selected")

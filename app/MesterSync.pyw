@@ -5103,7 +5103,7 @@ class MesterSyncApp:
         cache = row["render_cache"]
         selected = view.selected
         is_error = view.stage == STAGE_ERROR
-        active_green = view.stage == STAGE_CONVERTING
+        active_green = view.stage in {STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE}
         skipped_bg = "#221b1e" if view.skipped else None
         error_bg = "#3a1018" if is_error else None
         card_bg = error_bg or (self.DARK_GREEN if active_green else (skipped_bg or self.CARD))
@@ -5119,7 +5119,7 @@ class MesterSyncApp:
                 badge.pack_forget()
         if cache.get("card_bg") != card_bg:
             row["card"].configure(bg=card_bg)
-            for widget_key in ["right", "top", "safe_name", "preset_badges", "times", "detail", "src", "ext", "buttons", "preset_holder"]:
+            for widget_key in ["right", "top", "safe_name", "preset_badges", "times", "detail", "src", "ext", "buttons", "preset_holder", "preset_label", "progress_wrap", "progress_text", "estimate_text"]:
                 try:
                     row[widget_key].configure(bg=card_bg)
                 except Exception:
@@ -5143,7 +5143,6 @@ class MesterSyncApp:
         self.update_preset_badges(row, view, card_bg)
         if cache.get("progress") != view.progress:
             row["progress_var"].set(view.progress)
-            row["progress_text"].configure(bg=card_bg)
             cache["progress"] = view.progress
         remaining = f"~{format_duration(view.eta_seconds)} left" if view.eta_seconds and view.eta_seconds > 0 else "Estimating…"
         progress_text = f"{view.progress}%"
@@ -5255,7 +5254,8 @@ class MesterSyncApp:
         more_btn.pack(side="left", padx=(0, 6))
         preset_holder = tk.Frame(buttons, bg=self.CARD)
         preset_holder.pack(side="right")
-        tk.Label(preset_holder, text="Preset", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(0, 6))
+        preset_label = tk.Label(preset_holder, text="Preset", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9))
+        preset_label.pack(side="left", padx=(0, 6))
         preset_var = tk.StringVar(value=task.preset_name)
         preset_combo = ttk.Combobox(preset_holder, textvariable=preset_var, values=self.preset_menu_values(), state="readonly", width=22)
         preset_combo.pack(side="left")
@@ -5266,7 +5266,7 @@ class MesterSyncApp:
             "right": right, "top": top, "selection_badge": selection_badge, "src": src, "rename_var": rename_var, "rename_entry": rename_entry, "ext": ext,
             "stage": stage, "safe_name": safe_name, "preset_badges": preset_badges_frame, "times": times, "progress_wrap": pwrap, "progress_var": pvar, "progressbar": pbar, "progress_text": ptxt, "estimate_text": estimate_text, "detail": detail,
             "buttons": buttons, "skip_btn": skip_btn, "resume_btn": resume_btn, "remove_btn": remove_btn, "top_btn": top_btn, "up_btn": up_btn, "down_btn": down_btn, "import_anyway_btn": import_anyway_btn, "retry_btn": retry_btn, "restart_btn": restart_btn, "copy_error_btn": copy_error_btn, "more_btn": more_btn,
-            "preset_holder": preset_holder, "preset_var": preset_var, "preset_combo": preset_combo, "preset_dirty": False,
+            "preset_holder": preset_holder, "preset_label": preset_label, "preset_var": preset_var, "preset_combo": preset_combo, "preset_dirty": False,
             "dirty": False, "preview_index": None, "displayed_thumb_path": None, "safe_name_key": None, "safe_name_checked": 0.0,
             "button_layout": None, "preset_values_key": None,
             "render_cache": {},
