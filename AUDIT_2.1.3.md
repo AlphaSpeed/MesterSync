@@ -1,5 +1,62 @@
 # MesterSync 2.1.3 review
 
+## Version 2.2 follow-up
+
+### Resize and navigation performance correction, 13 October
+
+Profiling reproduced multi-second stalls after the rounded-control changes. Small translucent ttk image tiles made Windows redraws expensive, and stacked hidden pages continued receiving layout callbacks. Select also destroyed and recreated every visible card on resize. Rounded controls now use wide opaque assets with precomposited corners and avoid reapplying unchanged styles. Inactive pages are unmapped but cached. Select retains visible card widgets, coalesces resize callbacks, delays preview refitting until geometry settles, and suppresses preview work while hidden. Dashboard rows retain their widgets and apply deferred progress on return; completed History pages are reused until records change.
+
+An isolated 1200×900 Windows Tk stress fixture used 60 queued tasks, 200 History records (25 initially rendered), and 300 Select candidates with cached ten-frame sample previews. The same five-navigation/six-resize profile fell from 36.3 seconds to 3.3 seconds, including deliberate event-pump pauses. Ordinary Select/Settings revisits used approximately 0.07–0.17 seconds of UI work, compared with 2.4–2.9 seconds before; six Select resizes used 0.18–0.39 seconds each, compared with 3.0–4.5 seconds. Initial History rendering still creates cards (about 0.65 seconds); a separate Dashboard run confirmed History reuse and no Select renders while hidden. These are local synthetic timings, not guarantees for other computers or media.
+
+Regression checks verify card identity across resize and navigation, preserved selection/presets, idle hidden previews, reused History widgets, and deferred Dashboard progress without row replacement. All **229 tests passed with no skips**. The existing full suite continues to cover native controls, compact density, imports, conversion, transfer, and recovery. This is a source update; no executable or release was installed or published.
+
+### Rounded controls and density correction
+
+Moved the Log panel to the bottom of the main window and reduced the top control bar to 55 pixels in the isolated desktop layout. The default preset label and selector now share one row. Added scalable rounded ttk surfaces for buttons, rename/numeric entries, dropdowns, queue-number badges, and affix toggles; the status box and Dashboard rows also use rounded panels. Native control behavior is retained, including readonly fields, dropdown popups, disabled states, focus, and keyboard activation. Controls refresh their backdrop when a task changes color. Narrow arrow-free scrollbars have a rounded thumb, hover feedback, and a muted full-range state.
+
+Compact mode previously left the large percentage and four-line estimate dominating row height. It now uses smaller controls and spacing, a two-line estimate alongside the progress bar, and a smaller percentage while retaining warnings, presets, and recovery actions. The same two sample Dashboard rows measured 276 pixels each in Comfortable and 182 pixels each in Compact (about 34% shorter). Select cards also tighten their controls and metadata spacing while retaining the thumbnail aspect ratio. Virtual row spacing was updated to match the new layouts.
+
+Expanded GUI checks verify an actual reduction in whole-row height, bounded top-bar height, bottom placement of Log, native dropdown posting, native scrollbar press/drag handlers, and keyboard activation without also toggling Pause. The normal regression suite continues to exercise renaming, preset overrides, conversions, recovery, duplicates, settings, and History. Desktop captures verified both densities and the bottom log panel using temporary settings and sample images.
+
+Final styling verification: **229 tests passed with no skips**; Git whitespace checks passed. The source remains version 2.2. No installed executable, release, or production recording was modified.
+
+The mode switch now controls what happens when a new recording device is detected: Auto imports, while Select automatically opens the embedded review. Choosing Select alone keeps the normal Dashboard visible. Cancel dismisses review and releases candidate reservations without creating tasks, allowing a later reconnect to offer the recordings again. After a successful selection submission, the app returns to normal processing; unselected recordings stay on the device. Explicit manual imports and watched-folder processing retain their usual Dashboard behavior.
+
+Review now scrolls continuously instead of using pages. Rows are virtualized to keep large device lists light, and selection and preset overrides survive scrolling and resizing. Card backgrounds, borders, names, and metadata toggle selection; thumbnails and dropdowns retain their own actions. Controls share one toolbar row, with horizontal scrolling on narrow displays. The two requested instruction lines and Active queue/Select videos navigation were removed.
+
+Thumbnail boxes use Pillow's aspect-preserving, centered resize/crop at the actual widget dimensions, including enlargement. Pillow 12.3.0 is declared in runtime requirements and imported normally so the installer can collect it. Decoded source images and resized Tk images have bounded caches. Cancelled preview work stops between frame extractions, and late results carry session tokens so they cannot overwrite previews for a reconnected device. A mode switch while a drive-scan GUI event is pending follows the current mode without leaving invisible held candidates.
+
+The app version, installer default, bundled help, README, and version-consistency test are now 2.2. Verification covers exact filled-thumbnail dimensions and pixels across small, large, and portrait boxes; card clicks and thumbnail exclusions; device-triggered opening, Cancel, continuous scrolling through 214 candidates, preserved selections and overrides, normal manual/watched-folder behavior, stale preview results, and pending scan mode changes. Window-specific captures at 800, 1000, and 1500 pixels confirm the responsive grid and single-line toolbar. This is a source update; no release or installed executable was changed.
+
+Final 2.2 verification: **229 tests passed with no skips**, and Git whitespace checks passed. Added review-session guards also prevent a manually added batch or its delayed GUI event from importing after Cancel. The longer GUI fixture now cancels unrelated startup timers while retaining its checks that user interface actions do not start background work unexpectedly.
+
+## Select-mode review, 13 October 2026
+
+### Embedded review and interface follow-up
+
+Select review now occupies the main Dashboard rather than a popup, with an Active queue link and a return action. A keyboard-accessible, centered Auto/Select switch replaces the separate radio row. Log moved below Compact and opens a full-width panel. Rounded native-Tk panels, a softer palette, consistent dark dropdowns, and responsive two/three-column cards improve both modes without adding runtime dependencies. Stage cards hide during selection to leave room for video previews and return with the processing queue.
+
+Group presets apply only to checked candidates and preserve explicit per-video overrides. Each overridden card has a Use group action. Changing a preset updates its label without rebuilding the cards or losing focus. The group command reports how many videos changed and how many overrides were retained.
+
+Additional UX fixes: discoveries no longer steal navigation focus; unavailable presets explain the problem inline; empty and paginated states have clear actions; navigation disables at page boundaries; Ctrl+A/Escape operate on candidates while queue shortcuts cannot affect hidden jobs. Window-specific captures at 1000 and 1500 pixels confirmed two/three columns and exposed a Notifications button overlapping the import action. Notifications now live in the header. The Auto view also exposed a clipped Prioritize import control at narrower widths; import actions now have their own row.
+
+Added a saved Auto/Select setting and an explicit intake gate across recording drives, manual/drop imports, and the watched Importfolder. Candidates remain outside the runnable/persisted task queue until confirmation. Per-item presets are captured before task creation, preserving container naming and existing duplicate, copy, conversion, and transfer checks. Switching to Auto does not release candidates already held in this session. Missing sources remain in review for retry; duplicate-check failures become recoverable task errors.
+
+Performance improvements in the new review: twelve visible cards per page, one background preview worker, a bounded image cache, one preset-directory listing per page, one default-preset read per incoming batch, batched watched-folder discovery notifications, and no shared-history synchronization for manual candidates before selection. The existing Dashboard virtualization, progressive History, bounded logs, and coalesced progress updates remain in place.
+
+Verification includes the full regression suite covering import/conversion/transfer, duplicates and concurrency, recovery and retained media, renaming, diagnostics, updates/installer behavior, settings, notifications, and actual Tk widgets. Added selection-specific checks cover all intake paths, no pre-confirmation work, rescan/mode-switch protection, distinct per-video presets, missing sources, duplicate blocking, error recovery, pagination, selection counts, thumbnail display, and fullscreen. The GUI checks found and fixed a Windows Tk incompatibility between borderless popup windows and the fullscreen flag.
+
+Final result: **223 tests passed with no skips**; Git whitespace checks passed. Tests ran with the bundled Python runtime and a temporary directory inside the workspace because the system Python launcher and default sandbox temporary directory were unavailable.
+
+Limits: automated tests use isolated temporary settings and disposable media. They do not establish reliability for physical drive removal, live NAS outages, long-running GPU jobs, or installation on another computer. This change updates source only. Unconfirmed selections are session-only.
+
+Suggested follow-ups, not implemented:
+
+- Save review sessions, including checked items and per-file presets, across restarts.
+- Add duration/resolution/frame-rate filters and capture-date sorting to the review grid.
+- Add metadata-based preset rules (the requested manual group-preset feature is now implemented).
+- Reuse review thumbnails in processing rows and investigate extracting the filmstrip with fewer FFmpeg launches; measure on long recordings and slow drives before changing seek behavior.
+
 ## Pre-commit verification, 16 September 2026
 
 This follow-up used a fresh isolated Python environment containing only the declared runtime/build requirements. It found and corrected three issues:

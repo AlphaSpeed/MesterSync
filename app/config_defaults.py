@@ -44,6 +44,7 @@ COMMON_VIDEO_EXTENSIONS = [
 ]
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    "import_mode": "auto",
     "input_folder": "",
     "output_folder": "",
     "nas_folder": "",

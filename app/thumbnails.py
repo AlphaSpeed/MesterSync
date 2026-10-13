@@ -13,12 +13,15 @@ def extract_video_thumbnails(
     task_id: str,
     duration: Optional[float],
     no_window_flags: Callable[[], int],
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> Tuple[Optional[Path], List[str]]:
     thumb = thumbnail_dir() / f"{task_id}.png"
     preview_paths: List[str] = []
     vf = "scale=444:250:force_original_aspect_ratio=increase,crop=444:250"
 
     def make_frame(offset: float, destination: Path) -> bool:
+        if should_stop and should_stop():
+            return False
         cmd = [
             str(ffmpeg),
             "-y",
@@ -53,6 +56,8 @@ def extract_video_thumbnails(
         offsets = [max(0.5, duration * (i / 11)) for i in range(1, 11)]
     main_offset = offsets[len(offsets) // 2] if offsets else 1.0
     if not make_frame(main_offset, thumb):
+        if should_stop and should_stop():
+            return None, []
         fallback = [str(ffmpeg), "-y", "-hide_banner", "-loglevel", "error", "-i", str(src), "-vf", f"thumbnail,{vf}", "-frames:v", "1", str(thumb)]
         try:
             subprocess.run(
@@ -66,6 +71,8 @@ def extract_video_thumbnails(
         except Exception:
             return None, []
     for index, offset in enumerate(offsets[:10], start=1):
+        if should_stop and should_stop():
+            break
         preview = thumbnail_dir() / f"{task_id}_preview_{index}.png"
         if make_frame(offset, preview):
             preview_paths.append(str(preview))

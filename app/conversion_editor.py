@@ -9,6 +9,7 @@ from conversion_options import (ENCODERS, FRAME_RATES, KEEP, RESOLUTIONS, CONTAI
 from presets import arg_value, analyze_preset_args
 from file_utils import format_size
 from thumbnail_ui import scale_photo
+from ui_widgets import RoundedEntry, RoundedCombobox
 
 
 class ConversionEditor(tk.Toplevel):
@@ -80,9 +81,9 @@ class ConversionEditor(tk.Toplevel):
         tk.Label(group, text=title, bg=app.CARD, fg=app.TEXT, font=("Segoe UI", 11, "bold"), anchor="w").pack(fill="x")
         tk.Label(group, text=explanation, bg=app.CARD, fg=app.MUTED, font=("Segoe UI", 10), anchor="w", wraplength=580, justify="left").pack(fill="x", pady=(3, 6))
         if options is None:
-            widget = tk.Entry(group, textvariable=variable, font=("Segoe UI", 11))
+            widget = RoundedEntry(group, textvariable=variable, font=("Segoe UI", 11))
         else:
-            widget = ttk.Combobox(group, textvariable=variable, values=list(options), state="normal" if editable else "readonly", font=("Segoe UI", 11))
+            widget = RoundedCombobox(group, textvariable=variable, values=list(options), state="normal" if editable else "readonly", font=("Segoe UI", 11))
         widget.pack(fill="x", ipady=3)
         return widget
 

@@ -1,4 +1,4 @@
-MesterSync 2.1.3
+MesterSync 2.2
 
 Installed use:
 - Open MesterSync from the Start menu or desktop shortcut.
@@ -6,6 +6,9 @@ Installed use:
 - Stop active media work before installing an update.
 
 Notes:
+- Log opens a full-width panel at the bottom of the app. Compact reduces whole-row height and tightens Select cards; Comfortable restores the larger controls and progress layout.
+- Auto starts importing when a recording drive is detected. Select opens review automatically for that drive; the switch alone keeps the normal Dashboard visible.
+- In review, click a card to select it, hover its thumbnail to scrub, or click the thumbnail for fullscreen. Per-video dropdown choices override group presets. Cancel returns to the Dashboard without importing candidates.
 - Select multiple files, then choose Rename… to open the batch editor. Review the before/after filenames and confirm before applying.
 - More… contains Details, Change conversion settings…, queue ordering, and Copy error. Coloured preset tags and selection checkmarks remain visible on rows.
 - Settings show short descriptions. Advanced controls in Safety and Presets are collapsed by default.

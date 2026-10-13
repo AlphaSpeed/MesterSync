@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import json
@@ -53,6 +53,7 @@ from file_utils import (
     validate_writable_folder,
 )
 from importer import collect_import_candidates, scan_drive_importable_videos, scan_watchfolder_candidates
+from import_selection import ImportSelection
 from history_utils import (
     history_page,
     recorded_input_file,
@@ -131,7 +132,8 @@ from tasks import (
 from task_view import TaskViewSnapshot
 from thumbnails import extract_video_thumbnails
 from thumbnail_ui import ImageCache, ThumbnailPopup, scale_photo, scrub_index_from_event
-from ui_widgets import ChipSelector
+from ui_widgets import (ChipSelector, ModeSwitch, RoundedPanel, RoundedButton, RoundedEntry,
+                        RoundedCombobox, RoundedCheckbutton, RoundedLabel, configure_scrollbars)
 from ui_copy import recovery_label, row_status_text
 from conversion_options import save_new_preset, estimated_output_bytes
 from conversion_editor import ConversionEditor
@@ -169,11 +171,11 @@ DRIVE_REMOVAL_CONFIRMATION_SCANS = 2
 MAX_REMEMBERED_DRIVE_SOURCES_PER_CHECKSUM = 64
 
 class MesterSyncApp:
-    BG = "#06111f"
-    CARD = "#0d1e36"
-    CARD2 = "#102642"
-    CARD3 = "#18365c"
-    BORDER = "#345982"
+    BG = "#0b1220"
+    CARD = "#131f30"
+    CARD2 = "#19283d"
+    CARD3 = "#243951"
+    BORDER = "#2c4058"
     TEXT = "#f1f6ff"
     MUTED = "#a9bfdb"
     BLUE = "#3f8fd8"
@@ -219,6 +221,9 @@ class MesterSyncApp:
 
         self.config_lock = threading.RLock()
         self.task_lock = threading.RLock()
+        self.selection_path_keys: set[str] = set()
+        self.import_selection = None
+        self.select_view = False
         self.history_lock = threading.RLock()
         self.current_process_lock = threading.Lock()
         self.checksum_lock = threading.RLock()
@@ -410,6 +415,7 @@ class MesterSyncApp:
 
     def bind_keyboard_shortcuts(self) -> None:
         self.keyboard_shortcuts = [
+            ("<Escape>", self.clear_task_selection),
             ("<Delete>", self.delete_selected_tasks),
             ("<Control-a>", self.select_all_tasks),
             ("<Control-A>", self.select_all_tasks),
@@ -425,6 +431,10 @@ class MesterSyncApp:
             ("<Shift-Up>", self.extend_selection_up),
             ("<Shift-Down>", self.extend_selection_down),
         ]
+        self.keyboard_shortcuts = [
+            (sequence, lambda event, action=callback: self.dispatch_keyboard_shortcut(event, action))
+            for sequence, callback in self.keyboard_shortcuts
+        ]
         for sequence, callback in self.keyboard_shortcuts:
             self.root.bind_all(sequence, callback, add="+")
             self.root.bind(sequence, callback, add="+")
@@ -439,6 +449,22 @@ class MesterSyncApp:
     def bind_shortcuts_to_widget(self, widget: tk.Widget) -> None:
         for sequence, callback in getattr(self, "keyboard_shortcuts", []):
             widget.bind(sequence, callback, add="+")
+
+    def dispatch_keyboard_shortcut(self, event, action):
+        if (event is not None and isinstance(getattr(event, "widget", None), (ttk.Button, ttk.Checkbutton, tk.Button, tk.Checkbutton))
+                and action.__name__ in {"toggle_pause_shortcut", "open_selected_task"}):
+            return ""
+        if (self.current_tab == "dashboard" and self.get_config().get("import_mode") == "select"
+                and self.select_view and self.import_selection is not None):
+            if self.selected_editing_text():
+                return ""
+            if action.__name__ == "select_all_tasks":
+                self.import_selection.select_all(True)
+            elif action.__name__ == "clear_task_selection":
+                self.import_selection.select_all(False)
+            # Queue shortcuts must never mutate processing rows behind review.
+            return "break"
+        return action(event)
 
     # ---------------- configuration ----------------
     def load_config(self) -> Dict[str, Any]:
@@ -637,6 +663,8 @@ class MesterSyncApp:
             return False
 
     def refresh_settings_ui_from_config(self) -> None:
+        if hasattr(self, "import_mode_var"):
+            self.import_mode_var.set(self.config.get("import_mode", "auto"))
         if not hasattr(self, "input_folder_var"):
             return
         self.settings_ui_refreshing = True
@@ -766,7 +794,7 @@ class MesterSyncApp:
             tk.Label(box, text=help_text, bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 9), wraplength=820, justify="left").pack(anchor="w", pady=(2, 8))
             row = tk.Frame(box, bg=self.CARD2)
             row.pack(fill="x")
-            tk.Entry(row, textvariable=values[key], bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat").pack(side="left", fill="x", expand=True, ipady=5)
+            RoundedEntry(row, textvariable=values[key], bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat").pack(side="left", fill="x", expand=True, ipady=5)
             def choose() -> None:
                 if browse_folder:
                     selected = filedialog.askdirectory(parent=wizard)
@@ -1008,6 +1036,10 @@ class MesterSyncApp:
 
     def referenced_thumbnail_paths(self) -> set[str]:
         referenced = set()
+        selection = getattr(self, "import_selection", None)
+        if selection:
+            for paths in selection.previews.values():
+                referenced.update(path_key(path) for path in paths)
         with self.task_lock:
             tasks = list(self.tasks.values())
         for task in tasks:
@@ -1580,24 +1612,27 @@ class MesterSyncApp:
         style.configure("RowConvert.Horizontal.TProgressbar", troughcolor=self.CARD3, background=self.GREEN, lightcolor=self.GREEN, darkcolor=self.GREEN, bordercolor=self.CARD3, thickness=10)
         style.configure("RowTransfer.Horizontal.TProgressbar", troughcolor=self.CARD3, background=self.PURPLE, lightcolor=self.PURPLE, darkcolor=self.PURPLE, bordercolor=self.CARD3, thickness=10)
         style.configure("RowError.Horizontal.TProgressbar", troughcolor=self.CARD3, background=self.RED, lightcolor=self.RED, darkcolor=self.RED, bordercolor=self.CARD3, thickness=10)
-        # Readable dropdowns. The rest of the UI is dark, but Tk's dropdown list
-        # becomes hard to read with white text on a grey native listbox.
+        # Style both the field and popup list for consistent dark-mode contrast.
         style.configure(
             "TCombobox",
-            fieldbackground="#ffffff",
-            background="#ffffff",
-            foreground="#000000",
-            arrowcolor="#000000",
+            fieldbackground=self.CARD2,
+            background=self.CARD3,
+            foreground=self.TEXT,
+            arrowcolor=self.TEXT,
+            bordercolor=self.BORDER,
+            lightcolor=self.BORDER,
+            darkcolor=self.BORDER,
             font=("Segoe UI", 10),
             padding=5,
         )
-        style.map("TCombobox", fieldbackground=[("readonly", "#ffffff")], foreground=[("readonly", "#000000")], selectbackground=[("readonly", "#d7e8ff")], selectforeground=[("readonly", "#000000")])
-        self.root.option_add("*TCombobox*Listbox.background", "#ffffff")
-        self.root.option_add("*TCombobox*Listbox.foreground", "#000000")
-        self.root.option_add("*TCombobox*Listbox.selectBackground", "#d7e8ff")
-        self.root.option_add("*TCombobox*Listbox.selectForeground", "#000000")
+        style.map("TCombobox", fieldbackground=[("readonly", self.CARD2)], foreground=[("disabled", self.MUTED), ("readonly", self.TEXT)], selectbackground=[("readonly", self.CARD2)], selectforeground=[("readonly", self.TEXT)])
+        self.root.option_add("*TCombobox*Listbox.background", self.CARD2)
+        self.root.option_add("*TCombobox*Listbox.foreground", self.TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", self.BLUE)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", self.TEXT)
         self.root.option_add("*TCombobox*Listbox.font", ("Segoe UI", 10))
         style.configure("Vertical.TScrollbar", background=self.CARD3, troughcolor=self.CARD, bordercolor=self.BORDER, arrowcolor=self.TEXT)
+        configure_scrollbars(self.root, self.BG)
 
     def build_notification_toast(self) -> None:
         self.notification_frame = tk.Frame(self.main, bg=self.BORDER, highlightthickness=0)
@@ -1655,18 +1690,18 @@ class MesterSyncApp:
         self.notification_history_items.pack(fill="both", expand=True)
 
         self.notification_history_button = self.small_button(
-            self.main,
+            self.header_frame,
             "Notifications",
             self.toggle_notification_history,
             self.CARD3,
         )
         self.notification_history_button.configure(font=("Segoe UI", 10, "bold"), padx=12, pady=7)
-        self.notification_history_button.place(relx=1.0, rely=1.0, x=-48, y=-22, anchor="se")
+        self.notification_history_button.pack(side="right", padx=10, pady=(7, 0))
         self.notification_history_button.lift()
         self.refresh_notification_history_ui()
 
     def close_button(self, parent: tk.Widget, command: Callable[[], None], bg: str) -> tk.Button:
-        return tk.Button(
+        return RoundedButton(
             parent,
             text="X",
             command=command,
@@ -1804,7 +1839,7 @@ class MesterSyncApp:
         self.notification_inner.configure(bg=bg)
         self.notification_label.configure(bg=bg, fg=fg)
         for child in self.notification_inner.winfo_children():
-            if child is not self.notification_label and isinstance(child, tk.Button):
+            if child is not self.notification_label and isinstance(child, (tk.Button, ttk.Button)):
                 child.configure(bg=self.CARD3, activebackground=self.CARD3)
         self.place_active_notification()
         self.notification_frame.lift()
@@ -1842,15 +1877,14 @@ class MesterSyncApp:
         self.display_notification(payload)
 
     def button(self, parent: tk.Widget, text: str, command: Callable[[], None], bg: str, fg: str = "white", padx: int = 12) -> tk.Button:
-        return tk.Button(parent, text=text, command=command, bg=bg, fg=fg, activebackground=bg, activeforeground=fg, relief="flat", bd=0, highlightthickness=2, highlightbackground=self.BORDER, padx=padx, pady=8, font=("Segoe UI", 10, "bold"), cursor="hand2")
+        return RoundedButton(parent, text=text, command=command, bg=bg, fg=fg, activebackground=bg, activeforeground=fg, relief="flat", bd=0, highlightthickness=2, highlightbackground=self.BORDER, padx=padx, pady=8, font=("Segoe UI", 10, "bold"), cursor="hand2")
 
     def small_button(self, parent: tk.Widget, text: str, command: Callable[[], None], bg: str = None) -> tk.Button:
-        return tk.Button(parent, text=text, command=command, bg=bg or self.CARD3, fg="white", activebackground=bg or self.CARD3, activeforeground="white", relief="flat", bd=0, highlightthickness=2, highlightbackground=self.BORDER, padx=8, pady=5, font=("Segoe UI", 9), cursor="hand2")
+        return RoundedButton(parent, text=text, command=command, bg=bg or self.CARD3, fg="white", activebackground=bg or self.CARD3, activeforeground="white", relief="flat", bd=0, highlightthickness=2, highlightbackground=self.BORDER, padx=8, pady=5, font=("Segoe UI", 9), cursor="hand2")
 
     def card_frame(self, parent: tk.Widget, bg: str = None, **pack_kwargs: Any) -> tk.Frame:
-        outer = tk.Frame(parent, bg=self.BORDER, bd=0)
-        inner = tk.Frame(outer, bg=bg or self.CARD, padx=14, pady=12)
-        inner.pack(fill="both", expand=True, padx=2, pady=2)
+        outer = RoundedPanel(parent, fill=bg or self.CARD, border=self.BORDER, padding=6)
+        inner = outer.inner
         if pack_kwargs:
             outer.pack(**pack_kwargs)
         inner.outer = outer  # type: ignore[attr-defined]
@@ -1888,11 +1922,11 @@ class MesterSyncApp:
             self.logo_label = tk.Label(left, text=APP_NAME, bg=self.BG, fg=self.TEXT, font=("Segoe UI", 26, "bold"))
             self.logo_label.pack(anchor="w")
 
-        status_outer = tk.Frame(header, bg=self.BORDER)
-        status_outer.pack(side="right", pady=(7, 0))
+        status_outer = RoundedPanel(header, fill=self.CARD, border=self.BORDER, padding=0)
+        status_outer.pack(side="right")
         self.header_status_outer = status_outer
-        status = tk.Frame(status_outer, bg=self.CARD, padx=10, pady=6)
-        status.pack(padx=2, pady=2)
+        status = status_outer.inner
+        status.configure(padx=2, pady=0)
         tk.Label(status, text="STATUS", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
         self.status_dot = tk.Canvas(status, width=12, height=12, bg=self.CARD, highlightthickness=0)
         self.status_dot.pack(side="left", padx=(8, 6))
@@ -1903,22 +1937,31 @@ class MesterSyncApp:
 
     def build_top_bar(self) -> None:
         bar = self.card_frame(self.main, fill="x", padx=18, pady=(0, 10))
-        bar.configure(padx=16, pady=14)
-        self.start_btn = self.button(bar, "Start all", self.toggle_start_all, self.GREEN)
+        self.top_control_bar = bar.outer
+        bar.configure(padx=8, pady=0)
+        controls = tk.Frame(bar, bg=self.CARD)
+        controls.pack(fill="x")
+        controls.columnconfigure(0, weight=1, uniform="toolbar")
+        controls.columnconfigure(2, weight=1, uniform="toolbar")
+        left = tk.Frame(controls, bg=self.CARD)
+        left.grid(row=0, column=0, sticky="w")
+        self.start_btn = self.button(left, "Start all", self.toggle_start_all, self.GREEN)
         self.start_btn.pack(side="left")
-        self.pause_btn = self.button(bar, "Pause", self.toggle_pause, self.YELLOW)
+        self.pause_btn = self.button(left, "Pause", self.toggle_pause, self.CARD3)
         self.pause_btn.pack(side="left", padx=(10, 0))
-        self.log_toggle = self.button(bar, "Log", self.toggle_log, self.CARD3)
-        self.log_toggle.pack(side="left", padx=(10, 0))
-        for control in (self.start_btn, self.pause_btn, self.log_toggle):
-            control.configure(font=("Segoe UI", 11, "bold"), pady=10, padx=15)
-        self.top_log_outer = tk.Frame(bar, bg=self.BORDER, height=58)
-        self.top_log_outer.pack_propagate(False)
-        top_log_panel = tk.Frame(self.top_log_outer, bg="#07111e", padx=5, pady=4)
-        top_log_panel.pack(fill="both", expand=True, padx=2, pady=2)
+        self.import_mode_var = tk.StringVar(value=self.config.get("import_mode", "auto"))
+        self.mode_switch = ModeSwitch(controls, self.import_mode_var, self.change_import_mode,
+                                      self.CARD2, self.BLUE, self.TEXT, self.MUTED)
+        self.mode_switch.grid(row=0, column=1, padx=16)
+        for control in (self.start_btn, self.pause_btn):
+            control.configure(font=("Segoe UI", 10, "bold"), pady=6, padx=13)
+        self.bottom_log_outer = RoundedPanel(self.main, fill="#07111e", border=self.BORDER, padding=0, height=100)
+        self.bottom_log_outer.pack_propagate(False)
+        log_panel = self.bottom_log_outer.inner
+        log_panel.configure(padx=5, pady=4)
         self.log_text = scrolledtext.ScrolledText(
-            top_log_panel,
-            height=2,
+            log_panel,
+            height=4,
             bg="#07111e",
             fg="#d7e8ff",
             insertbackground="#d7e8ff",
@@ -1928,18 +1971,24 @@ class MesterSyncApp:
             wrap="word",
         )
         self.log_text.pack(fill="both", expand=True)
+        self.log_text.vbar.destroy()
+        self.log_text.vbar = ttk.Scrollbar(self.log_text.frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.vbar.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=self.log_text.vbar.set)
+        notices = tk.Frame(bar, bg=self.CARD)
+        notices.pack(fill="x")
         self.startup_warning_var = tk.StringVar(value="")
-        self.startup_warning_frame = tk.Frame(bar, bg="#3a3114", padx=10, pady=6)
+        self.startup_warning_frame = tk.Frame(notices, bg="#3a3114", padx=10, pady=6)
         tk.Label(self.startup_warning_frame, textvariable=self.startup_warning_var, bg="#3a3114", fg="#ffd36a", font=("Segoe UI", 9, "bold"), anchor="w").pack(side="left")
         self.small_button(self.startup_warning_frame, "Setup", self.run_setup_wizard, "#5c4517").pack(side="left", padx=(10, 0))
         self.thumbnail_queue_var = tk.StringVar(value="Previews: idle")
-        self.thumbnail_queue_label = tk.Label(bar, textvariable=self.thumbnail_queue_var, bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 9, "bold"), anchor="w", padx=10, pady=6)
+        self.thumbnail_queue_label = tk.Label(notices, textvariable=self.thumbnail_queue_var, bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 9, "bold"), anchor="w", padx=10, pady=6)
         self.unsaved_settings_var = tk.StringVar(value="")
-        tk.Label(bar, textvariable=self.unsaved_settings_var, bg=self.CARD, fg=self.RED, font=("Segoe UI", 12, "bold")).pack(side="left", padx=(18, 0))
+        tk.Label(left, textvariable=self.unsaved_settings_var, bg=self.CARD, fg=self.RED, font=("Segoe UI", 12, "bold")).pack(side="left")
 
-        preset_area = tk.Frame(bar, bg=self.CARD)
-        preset_area.pack(side="right")
-        tk.Label(preset_area, text="Default preset", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 8))
+        preset_area = tk.Frame(controls, bg=self.CARD)
+        preset_area.grid(row=0, column=2, sticky="e")
+        tk.Label(preset_area, text="Default preset", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(0, 6))
         top_preset_values = self.preset_menu_values()
         saved_top_preset = self.config.get("default_preset_name", "Current settings")
         if saved_top_preset not in top_preset_values:
@@ -1947,22 +1996,23 @@ class MesterSyncApp:
             with self.config_lock:
                 self.config["default_preset_name"] = saved_top_preset
         self.top_preset_var = tk.StringVar(value=saved_top_preset)
-        self.top_preset_combo = ttk.Combobox(preset_area, textvariable=self.top_preset_var, values=top_preset_values, state="readonly", width=26)
+        self.top_preset_combo = RoundedCombobox(preset_area, textvariable=self.top_preset_var, values=top_preset_values, state="readonly", width=20)
         self.top_preset_combo.pack(side="left")
         self.top_preset_combo.bind("<<ComboboxSelected>>", lambda e: self.load_top_preset())
 
     def build_stage_cards(self) -> None:
         wrap = tk.Frame(self.main, bg=self.BG)
+        self.stage_cards_frame = wrap
         wrap.pack(fill="x", padx=18, pady=(0, 10))
         self.stage_cards: Dict[str, Dict[str, Any]] = {}
         configs = [("import", "Import/watching", "Orange.Horizontal.TProgressbar"), ("conversion", "Conversion", "Green.Horizontal.TProgressbar"), ("transfer", "Transfer", "Purple.Horizontal.TProgressbar")]
         for idx, (key, title, style) in enumerate(configs):
-            outer = tk.Frame(wrap, bg=self.BORDER, height=148)
+            outer = RoundedPanel(wrap, fill=self.CARD, border=self.BORDER, padding=3, height=160)
             outer.grid(row=0, column=idx, sticky="nsew", padx=(0 if idx == 0 else 10, 0))
-            outer.grid_propagate(False)
+            outer.pack_propagate(False)
             wrap.grid_columnconfigure(idx, weight=1)
-            card = tk.Frame(outer, bg=self.CARD, padx=12, pady=9, height=122)
-            card.pack(fill="both", expand=True, padx=2, pady=2)
+            card = outer.inner
+            card.configure(padx=8, pady=3)
             card.pack_propagate(False)
             head = tk.Frame(card, bg=self.CARD)
             head.pack(fill="x")
@@ -1974,9 +2024,13 @@ class MesterSyncApp:
             cancel_btn = None
             priority_btn = None
             if key == "import":
-                priority_btn = self.small_button(head, "Prioritize import", self.toggle_import_priority, self.CARD3)
+                import_actions = tk.Frame(card, bg=self.CARD)
+                import_actions.pack(side="bottom", fill="x", pady=(3, 0))
+                priority_btn = self.small_button(import_actions, "Prioritize import", self.toggle_import_priority, self.CARD3)
+                priority_btn.configure(pady=2)
                 priority_btn.pack(side="right", padx=(0, 8))
-                cancel_btn = self.small_button(head, "Cancel import", self.cancel_current_import, self.CARD3)
+                cancel_btn = self.small_button(import_actions, "Cancel import", self.cancel_current_import, self.CARD3)
+                cancel_btn.configure(pady=2)
                 cancel_btn.pack(side="right", padx=(0, 8))
             label_var = tk.StringVar(value=f"{title}: idle")
             eta_var = tk.StringVar(value="ETA: -")
@@ -2002,9 +2056,10 @@ class MesterSyncApp:
 
     def build_body(self) -> None:
         body = tk.Frame(self.main, bg=self.BG)
+        self.body_frame = body
         body.pack(fill="both", expand=True, padx=18, pady=(0, 18))
         left = self.card_frame(body, side="left", fill="y", padx=(0, 10))
-        left.configure(width=160)
+        left.configure(width=146)
         left.pack_propagate(False)
         self.tab_buttons: Dict[str, tk.Button] = {}
         for key, label in [("dashboard", "Dashboard"), ("history", "History"), ("settings", "Settings")]:
@@ -2021,6 +2076,8 @@ class MesterSyncApp:
             self.BLUE if self.compact_dashboard else self.CARD3,
         )
         self.compact_dashboard_btn.pack(fill="x", pady=(0, 10))
+        self.log_toggle = self.button(self.dashboard_side_controls, "Log", self.toggle_log, self.CARD3)
+        self.log_toggle.pack(fill="x", pady=(0, 4))
         self.update_compact_dashboard_button()
         self.content = tk.Frame(body, bg=self.BG)
         self.content.pack(side="left", fill="both", expand=True)
@@ -2029,7 +2086,8 @@ class MesterSyncApp:
         self.dashboard_frame = tk.Frame(self.content, bg=self.BG)
         self.history_frame = tk.Frame(self.content, bg=self.BG)
         self.settings_frame = tk.Frame(self.content, bg=self.BG)
-        for frame in (self.dashboard_frame, self.history_frame, self.settings_frame):
+        self.selection_frame = tk.Frame(self.content, bg=self.BG)
+        for frame in (self.dashboard_frame, self.history_frame, self.settings_frame, self.selection_frame):
             frame.grid(row=0, column=0, sticky="nsew")
         self.build_dashboard()
         self.build_history()
@@ -2050,22 +2108,37 @@ class MesterSyncApp:
             # Selection is a temporary Dashboard context, not a sticky app mode.
             # Leaving the page dismisses it so a later action cannot use stale rows.
             self.clear_task_selection()
-        if self.current_tab == "history" and key != "history":
+        if self.current_tab == "history" and key != "history" and self.history_render_after_id is not None:
             self.cancel_history_render(mark_dirty=True)
         for k, b in self.tab_buttons.items():
             b.configure(bg=self.BLUE if k == key else self.CARD3)
-        getattr(self, f"{key}_frame").tkraise()
+        selecting = key == "dashboard" and self.get_config().get("import_mode") == "select" and self.select_view
         changed = self.current_tab != key
+        previous_frame = getattr(self, "active_content_frame", None)
         self.current_tab = key
+        if selecting:
+            self.clear_task_selection()
+            if self.import_selection is None:
+                self.import_selection = ImportSelection(self)
+            active_frame = self.selection_frame
+        else:
+            active_frame = getattr(self, f"{key}_frame")
+        # Unmap cached pages so hidden canvases do not lay out and repaint on resize.
+        for frame in (self.dashboard_frame, self.history_frame, self.settings_frame, self.selection_frame):
+            if frame is not active_frame:
+                frame.grid_remove()
+        active_frame.grid(row=0, column=0, sticky="nsew")
+        self.active_content_frame = active_frame
+        if selecting:
+            self.stage_cards_frame.pack_forget()
+        elif not self.stage_cards_frame.winfo_manager():
+            self.stage_cards_frame.pack(fill="x", padx=18, pady=(0, 10), before=self.body_frame)
         if key == "settings" and not self.settings_built and not self.settings_building:
             self.settings_building = True
             self.root.after(10, self.finish_lazy_settings_build)
-        if hasattr(self, "dashboard_side_controls"):
-            if key == "dashboard" and not self.dashboard_side_controls.winfo_ismapped():
-                self.dashboard_side_controls.pack(fill="x", side="bottom")
-            elif key != "dashboard" and self.dashboard_side_controls.winfo_ismapped():
-                self.dashboard_side_controls.pack_forget()
-        if key == "dashboard" and changed:
+        if selecting:
+            self.import_selection.render(force=previous_frame is not active_frame)
+        elif key == "dashboard" and (changed or previous_frame is not active_frame):
             self.refresh_dashboard_rows()
             self.deferred_dashboard_task_ids.clear()
         elif key == "history" and self.history_view_dirty:
@@ -2108,23 +2181,31 @@ class MesterSyncApp:
         self.update_batch_box_visibility()
 
     def dashboard_row_extent(self) -> int:
-        return 240 if self.compact_dashboard else 288
+        return 196 if self.compact_dashboard else 300
 
     def schedule_dashboard_virtual_refresh(self) -> None:
+        if not self.dashboard_is_visible():
+            return
         if self.dashboard_virtual_refresh_after_id is not None:
             return
         self.dashboard_virtual_refresh_after_id = self.root.after_idle(self.refresh_dashboard_virtual_rows)
 
     def dashboard_task_should_render(self, task_id: str) -> bool:
+        if not self.dashboard_is_visible():
+            return False
         with self.task_lock:
             if task_id not in self.tasks:
                 return False
             total = len(self.tasks)
         return total <= DASHBOARD_VIRTUAL_THRESHOLD or task_id in self.dashboard_virtual_ids
 
+    def dashboard_is_visible(self) -> bool:
+        return self.current_tab == "dashboard" and not (
+            self.get_config().get("import_mode") == "select" and self.select_view)
+
     def refresh_dashboard_virtual_rows(self, force: bool = False) -> None:
         self.dashboard_virtual_refresh_after_id = None
-        if not hasattr(self, "dashboard_canvas"):
+        if not hasattr(self, "dashboard_canvas") or not self.dashboard_is_visible():
             return
         order = self.ordered_task_ids()
         empty_state = getattr(self, "dashboard_empty_state", None)
@@ -2148,6 +2229,8 @@ class MesterSyncApp:
             DASHBOARD_VIRTUAL_OVERSCAN,
         )
         visible_order = tuple(order[start:end])
+        order_changed = (visible_order != self.dashboard_virtual_order
+                         or any(not self.row_widget_alive(task_id) for task_id in visible_order))
         if (
             not force
             and (start, end) == self.dashboard_virtual_range
@@ -2176,7 +2259,7 @@ class MesterSyncApp:
             self.render_task(task_id)
         for task_id in order[start:end]:
             row = self.row_widgets.get(task_id)
-            if row:
+            if row and order_changed:
                 row["outer"].pack_forget()
                 row["outer"].pack(fill="x", pady=3 if self.compact_dashboard else 7, before=self.dashboard_bottom_spacer)
 
@@ -2354,8 +2437,8 @@ class MesterSyncApp:
         self.batch_prefix_var = tk.BooleanVar(value=False)
         self.batch_suffix_var = tk.BooleanVar(value=False)
         tk.Label(self.batch_rename_row, text="Rename selected", bg="#102b46", fg=self.TEXT, font=("Segoe UI", 10, "bold")).pack(side="left")
-        tk.Entry(self.batch_rename_row, textvariable=self.batch_name_var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat", width=24, font=("Segoe UI", 10)).pack(side="left", padx=(10, 8), ipady=4)
-        self.batch_prefix_btn = tk.Checkbutton(
+        RoundedEntry(self.batch_rename_row, textvariable=self.batch_name_var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat", width=24, font=("Segoe UI", 10)).pack(side="left", padx=(10, 8), ipady=4)
+        self.batch_prefix_btn = RoundedCheckbutton(
             self.batch_rename_row,
             text="Prefix",
             variable=self.batch_prefix_var,
@@ -2374,7 +2457,7 @@ class MesterSyncApp:
             cursor="hand2",
         )
         self.batch_prefix_btn.pack(side="left", padx=(0, 6))
-        self.batch_suffix_btn = tk.Checkbutton(
+        self.batch_suffix_btn = RoundedCheckbutton(
             self.batch_rename_row,
             text="Suffix",
             variable=self.batch_suffix_var,
@@ -2464,9 +2547,10 @@ class MesterSyncApp:
     def apply_dashboard_density(self) -> None:
         for task_id in list(self.row_widgets.keys()):
             self.apply_row_density(task_id)
-            if not self.compact_dashboard:
-                self.render_task(task_id)
+            self.render_task(task_id)
         self.refresh_dashboard_virtual_rows(force=True)
+        if self.import_selection is not None:
+            self.import_selection.render()
 
     def apply_row_density(self, task_id: str) -> None:
         row = self.row_widgets.get(task_id)
@@ -2475,16 +2559,35 @@ class MesterSyncApp:
         compact = self.compact_dashboard
         thumb_width, thumb_height = (142, 80) if compact else (222, 125)
         row["outer"].pack_configure(pady=3 if compact else 7)
-        row["card"].configure(padx=8 if compact else 12, pady=7 if compact else 12)
+        row["card"].configure(padx=8 if compact else 12, pady=5 if compact else 12)
         row["thumb_frame"].configure(width=thumb_width, height=thumb_height)
         row["right"].pack_configure(padx=(10 if compact else 14, 0))
-        row["rename_entry"].configure(font=("Segoe UI", 10 if compact else 11))
-        row["rename_entry"].pack_configure(ipady=2 if compact else 4)
+        row["rename_entry"].configure(font=("Segoe UI", 10 if compact else 11), width=22 if compact else 34, pady=2 if compact else 3)
+        row["rename_entry"].pack_configure(ipady=0 if compact else 3)
+        row["src"].configure(font=("Segoe UI", 9 if compact else 11, "bold"))
+        row["ext"].configure(font=("Segoe UI", 9 if compact else 11))
         row["stage"].configure(padx=8 if compact else 10, pady=3 if compact else 4)
         row["preset_badges"].pack(fill="x", pady=(3, 0), before=row["progress_wrap"])
-        row["detail"].pack_configure(pady=(4 if compact else 8, 0))
-        row["buttons"].pack_configure(pady=(5 if compact else 8, 0))
-        row["preset_combo"].configure(width=16 if compact else 22)
+        row["detail"].pack_configure(pady=(2 if compact else 8, 0))
+        row["detail"].configure(wraplength=0 if compact else 900, width=1)
+        row["buttons"].pack_configure(pady=(4 if compact else 8, 0))
+        row["preset_combo"].configure(width=16 if compact else 22, font=("Segoe UI", 9 if compact else 10), pady=1 if compact else 3)
+        row["progress_text"].configure(font=("Segoe UI", 24 if compact else 38, "bold"))
+        row["estimate_text"].configure(font=("Segoe UI", 9 if compact else 11))
+        for widget in row["buttons"].winfo_children():
+            if isinstance(widget, RoundedButton):
+                widget.configure(pady=3 if compact else 5)
+        row["settings_btn"].configure(text="Settings…" if compact else "Change settings…", pady=3 if compact else 5)
+        for key in ("progressbar", "progress_text", "estimate_text"):
+            row[key].pack_forget()
+        if compact:
+            row["progress_text"].pack(side="right", padx=(8, 0))
+            row["estimate_text"].pack(side="right", padx=(8, 0))
+            row["progressbar"].pack(side="left", fill="x", expand=True)
+        else:
+            row["progressbar"].pack(fill="x", pady=(4, 0))
+            row["progress_text"].pack(side="right", padx=(14, 0))
+            row["estimate_text"].pack(side="right", pady=3)
         row["safe_name"].pack_forget()
         row["times"].pack_forget()
         row["displayed_thumb_path"] = None
@@ -2595,13 +2698,13 @@ class MesterSyncApp:
         tk.Label(folder_row, text="Saved conversion settings, stored as .txt files.", bg=self.CARD2, fg=self.MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(3, 6))
         folder_controls = tk.Frame(folder_row, bg=self.CARD2)
         folder_controls.pack(fill="x")
-        tk.Entry(folder_controls, textvariable=self.preset_folder_var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat").pack(side="left", fill="x", expand=True, ipady=5)
+        RoundedEntry(folder_controls, textvariable=self.preset_folder_var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat").pack(side="left", fill="x", expand=True, ipady=5)
         self.small_button(folder_controls, "Browse", self.browse_preset_folder, self.CARD3).pack(side="left", padx=(8, 0))
 
         preset_row = tk.Frame(ff, bg=self.CARD)
         preset_row.pack(fill="x", pady=(0, 8))
         self.preset_var = tk.StringVar()
-        self.preset_combo = ttk.Combobox(preset_row, textvariable=self.preset_var, values=self.list_presets(), state="readonly", width=28)
+        self.preset_combo = RoundedCombobox(preset_row, textvariable=self.preset_var, values=self.list_presets(), state="readonly", width=28)
         self.preset_combo.pack(side="left")
         self.preset_combo.bind("<<ComboboxSelected>>", lambda e: self.load_selected_preset())
         self.make_preset_button = self.small_button(preset_row, "Make new preset…", self.make_new_preset, self.BLUE)
@@ -2827,7 +2930,7 @@ class MesterSyncApp:
         box = tk.Frame(parent, bg=self.CARD2, padx=12, pady=12, highlightthickness=2, highlightbackground=self.BORDER)
         box.grid(row=row, column=col, sticky="nsew", padx=7, pady=7)
         self.setting_title(box, label, help_text, self.CARD2)
-        entry = tk.Entry(box, textvariable=var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat")
+        entry = RoundedEntry(box, textvariable=var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat")
         entry.pack(side="left", fill="x", expand=True, ipady=6)
         self.small_button(box, "Browse", (lambda v=var: self.browse_folder(v)) if folder else (lambda v=var: self.browse_file(v)), self.CARD3).pack(side="left", padx=(8, 0))
 
@@ -2835,7 +2938,7 @@ class MesterSyncApp:
         box = tk.Frame(parent, bg=self.CARD2, padx=10, pady=10, highlightthickness=2, highlightbackground=self.BORDER)
         box.grid(row=row, column=col, sticky="nsew", padx=7, pady=7)
         self.setting_title(box, label, help_text, self.CARD2)
-        tk.Entry(box, textvariable=var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat").pack(fill="x", ipady=5)
+        RoundedEntry(box, textvariable=var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat").pack(fill="x", ipady=5)
 
     def add_browse_field(
         self,
@@ -2854,7 +2957,7 @@ class MesterSyncApp:
         self.setting_title(box, label, help_text, self.CARD2)
         row_frame = tk.Frame(box, bg=self.CARD2)
         row_frame.pack(fill="x")
-        tk.Entry(row_frame, textvariable=var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat").pack(side="left", fill="x", expand=True, ipady=5)
+        RoundedEntry(row_frame, textvariable=var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat").pack(side="left", fill="x", expand=True, ipady=5)
         command = (lambda v=var: self.browse_save_file(v)) if save_file else (lambda v=var: self.browse_file(v))
         self.small_button(row_frame, "Browse", command, self.CARD3).pack(side="left", padx=(8, 0))
         if action_text and action_command:
@@ -3167,6 +3270,8 @@ class MesterSyncApp:
             if combo is not None:
                 combo.configure(values=values)
                 row["preset_values_key"] = tuple(values)
+        if getattr(self, "import_selection", None) is not None:
+            self.import_selection.render()
         try:
             self.log(f"Preset list refreshed from: {self.get_preset_folder()}")
         except Exception:
@@ -3712,7 +3817,12 @@ class MesterSyncApp:
                 break
             processed += 1
             try:
-                if event == "log":
+                if event == "import_selection":
+                    self.receive_import_selection(payload)
+                elif event == "selection_finished":
+                    if self.import_selection is not None:
+                        self.import_selection.finished(payload)
+                elif event == "log":
                     pending_logs.append(str(payload))
                 elif event == "task":
                     if isinstance(payload, tuple) and len(payload) == 2:
@@ -3815,7 +3925,7 @@ class MesterSyncApp:
                 self.throttled_dashboard_task_ids.discard(task_id)
         for task_id in pending_task_renders:
             try:
-                if getattr(self, "current_tab", "dashboard") == "dashboard":
+                if self.dashboard_is_visible():
                     immediate = task_id in pending_task_render_immediate
                     if immediate or now - self.last_task_render_at.get(task_id, 0.0) >= TASK_RENDER_INTERVAL_SECONDS:
                         self.render_task(task_id)
@@ -3988,12 +4098,12 @@ class MesterSyncApp:
     def toggle_log(self) -> None:
         self.log_visible = not self.log_visible
         if self.log_visible:
-            self.top_log_outer.pack(side="left", fill="x", expand=True, padx=(10, 10), after=self.log_toggle)
+            self.bottom_log_outer.pack(side="bottom", fill="x", padx=18, pady=(0, 12), before=self.body_frame)
             self.log_toggle.configure(text="Hide log", bg=self.BLUE)
             if self.log_text is not None:
                 self.log_text.see("end")
         else:
-            self.top_log_outer.pack_forget()
+            self.bottom_log_outer.pack_forget()
             self.log_toggle.configure(text="Log", bg=self.CARD3)
 
     def draw_dot(self, canvas: tk.Canvas, color: str) -> None:
@@ -4105,6 +4215,8 @@ class MesterSyncApp:
             self.draw_dot(card["dot"], active_colors[key] if enabled else self.MUTED)
             bg = active_backgrounds[key] if enabled else self.INACTIVE_STAGE_BG
             card["card"].configure(bg=bg)
+            card["outer"].fill = bg
+            card["outer"].draw()
             for child in card["card"].winfo_children():
                 try:
                     child.configure(bg=bg)
@@ -4116,6 +4228,10 @@ class MesterSyncApp:
                             pass
                 except Exception:
                     pass
+            for control_key in ("button", "cancel_button", "priority_button"):
+                control = card.get(control_key)
+                if isinstance(control, RoundedButton):
+                    control.refresh_style()
         self.update_import_cancel_button()
 
     def import_cancel_available(self) -> bool:
@@ -4135,13 +4251,13 @@ class MesterSyncApp:
             available = self.import_cancel_available()
             if btn:
                 if available:
-                    if not btn.winfo_ismapped():
+                    if not btn.winfo_manager():
                         btn.pack(side="right", padx=(0, 8))
                     btn.configure(state="normal", bg=self.CARD3, activebackground=self.CARD3, fg="white")
-                elif btn.winfo_ismapped():
+                elif btn.winfo_manager():
                     btn.pack_forget()
             if priority_btn:
-                if not priority_btn.winfo_ismapped():
+                if not priority_btn.winfo_manager():
                     priority_btn.pack(side="right", padx=(0, 8))
                 active = self.import_priority_enabled
                 priority_btn.configure(
@@ -4751,7 +4867,7 @@ class MesterSyncApp:
         except Exception:
             return preset_dir()
 
-    def create_task(self, original_path: Path, stage: str = STAGE_DETECTED, imported: bool = False, allow_duplicate: bool = False, generate_thumbnail: bool = True, new_only: bool = False) -> str:
+    def create_task(self, original_path: Path, stage: str = STAGE_DETECTED, imported: bool = False, allow_duplicate: bool = False, generate_thumbnail: bool = True, new_only: bool = False, preset_snapshot: Optional[Tuple[str, List[str]]] = None) -> str:
         key = path_key(original_path)
         with self.task_lock:
             if new_only and any(
@@ -4763,7 +4879,7 @@ class MesterSyncApp:
                 return ""
             if not allow_duplicate and key in self.task_by_path:
                 return "" if new_only else self.task_by_path[key]
-            preset_name, ffmpeg_args = self.default_task_preset_snapshot()
+            preset_name, ffmpeg_args = preset_snapshot or self.default_task_preset_snapshot()
             ext = detect_output_extension(ffmpeg_args)
             task_id = uuid.uuid4().hex
             task = TaskState(
@@ -5076,6 +5192,9 @@ class MesterSyncApp:
         }
 
     def render_task(self, task_id: str) -> None:
+        if not self.dashboard_is_visible():
+            self.deferred_dashboard_task_ids.add(task_id)
+            return
         with self.task_lock:
             task = self.tasks.get(task_id)
             if not task:
@@ -5109,7 +5228,7 @@ class MesterSyncApp:
         card_bg = error_bg or (self.DARK_GREEN if active_green else (skipped_bg or self.CARD))
         border = self.BLUE if selected else self.BORDER
         if cache.get("border") != border:
-            row["outer"].configure(bg=border)
+            row["outer"].set_border(border)
             cache["border"] = border
         badge = row.get("selection_badge")
         if badge:
@@ -5118,6 +5237,8 @@ class MesterSyncApp:
             elif not selected and badge.winfo_ismapped():
                 badge.pack_forget()
         if cache.get("card_bg") != card_bg:
+            row["outer"].fill = card_bg
+            row["outer"].draw()
             row["card"].configure(bg=card_bg)
             for widget_key in ["right", "top", "safe_name", "preset_badges", "times", "detail", "src", "ext", "buttons", "preset_holder", "preset_label", "progress_wrap", "progress_text", "estimate_text"]:
                 try:
@@ -5125,6 +5246,9 @@ class MesterSyncApp:
                 except Exception:
                     pass
             cache["card_bg"] = card_bg
+            for control in row.values():
+                if isinstance(control, (RoundedButton, RoundedEntry, RoundedCombobox, RoundedLabel)):
+                    control.refresh_style()
         source_text = f"{view.display_name}  ->  "
         if cache.get("source_text") != source_text:
             row["src"].configure(text=source_text)
@@ -5147,7 +5271,10 @@ class MesterSyncApp:
         remaining = f"~{format_duration(view.eta_seconds)} left" if view.eta_seconds and view.eta_seconds > 0 else "Estimating…"
         progress_text = f"{view.progress}%"
         size = estimated_output_bytes(view.ffmpeg_args or self.get_config().get("ffmpeg_args", []), getattr(view, "source_duration_seconds", None))
-        row["estimate_text"].configure(text=f"Estimated time\n{remaining}\nEstimated size\n{'~' + format_size(size) if size else '—'}", bg=card_bg)
+        estimate = ('~' + format_size(size)) if size else '—'
+        estimate_text = (f"Estimated time: {remaining}\nEstimated size: {estimate}" if self.compact_dashboard
+                         else f"Estimated time\n{remaining}\nEstimated size\n{estimate}")
+        row["estimate_text"].configure(text=estimate_text, bg=card_bg)
         if cache.get("progress_text") != progress_text:
             row["progress_text"].configure(text=progress_text)
             cache["progress_text"] = progress_text
@@ -5196,10 +5323,10 @@ class MesterSyncApp:
             cache["thumbnail_key"] = thumbnail_key
 
     def create_task_row(self, task: TaskState) -> None:
-        outer = tk.Frame(self.dashboard_inner, bg=self.BORDER)
+        outer = RoundedPanel(self.dashboard_inner, fill=self.CARD, border=self.BORDER, padding=0)
         outer.pack(fill="x", pady=7, before=self.dashboard_bottom_spacer)
-        card = tk.Frame(outer, bg=self.CARD, padx=12, pady=12)
-        card.pack(fill="x", padx=2, pady=2)
+        card = outer.inner
+        card.configure(padx=12, pady=12)
         thumb_frame = tk.Frame(card, bg=self.CARD3, width=222, height=125, highlightthickness=2, highlightbackground=self.BORDER)
         thumb_frame.pack(side="left")
         thumb_frame.pack_propagate(False)
@@ -5213,11 +5340,11 @@ class MesterSyncApp:
         src = tk.Label(top, text=f"{task.display_name}  ->  ", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 11, "bold"), anchor="w")
         src.pack(side="left")
         rename_var = tk.StringVar(value=task.rename_base)
-        rename_entry = tk.Entry(top, textvariable=rename_var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat", font=("Segoe UI", 11), width=34)
+        rename_entry = RoundedEntry(top, textvariable=rename_var, bg=self.CARD3, fg=self.TEXT, insertbackground=self.TEXT, relief="flat", font=("Segoe UI", 11), width=34)
         rename_entry.pack(side="left", fill="x", expand=True, padx=(2, 3), ipady=4)
         ext = tk.Label(top, text=task.output_ext, bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 11))
         ext.pack(side="left", padx=(2, 8))
-        stage = tk.Label(top, text=task.stage, bg=self.CARD3, fg=self.TEXT, font=("Segoe UI", 9, "bold"), padx=10, pady=4)
+        stage = RoundedLabel(top, text=task.stage, bg=self.CARD3, fg=self.TEXT, font=("Segoe UI", 9, "bold"), padx=10, pady=4)
         stage.pack(side="right")
         safe_name = tk.Label(right, text="", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9, "bold"), anchor="w")
         safe_name.pack(fill="x", pady=(8, 0))
@@ -5257,16 +5384,17 @@ class MesterSyncApp:
         preset_label = tk.Label(preset_holder, text="Preset", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9))
         preset_label.pack(side="left", padx=(0, 6))
         preset_var = tk.StringVar(value=task.preset_name)
-        preset_combo = ttk.Combobox(preset_holder, textvariable=preset_var, values=self.preset_menu_values(), state="readonly", width=22)
+        preset_combo = RoundedCombobox(preset_holder, textvariable=preset_var, values=self.preset_menu_values(), state="readonly", width=22)
         preset_combo.pack(side="left")
-        self.small_button(preset_holder, "Change settings…", lambda tid=task.task_id: self.edit_video_settings(tid), self.CARD3).pack(side="left", padx=(6, 0))
+        settings_btn = self.small_button(preset_holder, "Change settings…", lambda tid=task.task_id: self.edit_video_settings(tid), self.CARD3)
+        settings_btn.pack(side="left", padx=(6, 0))
         preset_combo.bind("<<ComboboxSelected>>", lambda e, tid=task.task_id: self.set_task_preset(tid))
         self.row_widgets[task.task_id] = {
             "outer": outer, "card": card, "thumb_frame": thumb_frame, "thumb": thumb,
             "right": right, "top": top, "selection_badge": selection_badge, "src": src, "rename_var": rename_var, "rename_entry": rename_entry, "ext": ext,
             "stage": stage, "safe_name": safe_name, "preset_badges": preset_badges_frame, "times": times, "progress_wrap": pwrap, "progress_var": pvar, "progressbar": pbar, "progress_text": ptxt, "estimate_text": estimate_text, "detail": detail,
             "buttons": buttons, "skip_btn": skip_btn, "resume_btn": resume_btn, "remove_btn": remove_btn, "top_btn": top_btn, "up_btn": up_btn, "down_btn": down_btn, "import_anyway_btn": import_anyway_btn, "retry_btn": retry_btn, "restart_btn": restart_btn, "copy_error_btn": copy_error_btn, "more_btn": more_btn,
-            "preset_holder": preset_holder, "preset_label": preset_label, "preset_var": preset_var, "preset_combo": preset_combo, "preset_dirty": False,
+            "preset_holder": preset_holder, "preset_label": preset_label, "preset_var": preset_var, "preset_combo": preset_combo, "settings_btn": settings_btn, "preset_dirty": False,
             "dirty": False, "preview_index": None, "displayed_thumb_path": None, "safe_name_key": None, "safe_name_checked": 0.0,
             "button_layout": None, "preset_values_key": None,
             "render_cache": {},
@@ -5498,7 +5626,7 @@ class MesterSyncApp:
 
     def selected_editing_text(self) -> bool:
         widget = self.root.focus_get()
-        return isinstance(widget, (tk.Entry, tk.Text, scrolledtext.ScrolledText, ttk.Combobox))
+        return isinstance(widget, (tk.Entry, ttk.Entry, tk.Text, scrolledtext.ScrolledText, ttk.Combobox))
 
     def delete_selected_tasks(self, event: Optional[tk.Event] = None) -> str:
         if self.selected_editing_text():
@@ -5594,7 +5722,7 @@ class MesterSyncApp:
         for tid, row in self.row_widgets.items():
             try:
                 selected = tid in self.selected_ids
-                row["outer"].configure(bg=self.BLUE if selected else self.BORDER)
+                row["outer"].set_border(self.BLUE if selected else self.BORDER)
                 badge = row.get("selection_badge")
                 if badge:
                     if selected and not badge.winfo_ismapped():
@@ -5606,6 +5734,8 @@ class MesterSyncApp:
                 pass
 
     def clear_task_selection(self, event: Optional[tk.Event] = None) -> str:
+        if not self.selected_ids and self.selection_anchor_id is None:
+            return "break" if event is not None else ""
         self.selected_ids = []
         self.selection_anchor_id = None
         self.update_selection_visuals()
@@ -6201,12 +6331,128 @@ class MesterSyncApp:
         self.thumbnail_generation_requested.discard(task_id)
 
     # ---------------- add/import/scan ----------------
+    def change_import_mode(self) -> None:
+        with self.config_lock:
+            self.config["import_mode"] = self.import_mode_var.get()
+        self.schedule_config_autosave()
+        if self.import_mode_var.get() == "auto":
+            if self.import_selection is not None and not self.import_selection.busy:
+                self.import_selection.cancel()
+            self.select_view = False
+        if self.current_tab == "dashboard":
+            self.show_tab("dashboard")
+
+    def show_import_selection(self) -> None:
+        if (self.get_config().get("import_mode") == "select" and self.import_selection is not None
+                and self.import_selection.items):
+            self.import_selection.show()
+
+    def show_processing_queue(self) -> None:
+        self.select_view = False
+        self.show_tab("dashboard")
+
+    def cancel_import_selection(self) -> None:
+        if self.import_selection is not None:
+            self.import_selection.cancel()
+
+    def receive_import_selection(self, payload) -> None:
+        paths, context = payload
+        review_session = context.get("review_session")
+        if review_session and review_session != getattr(getattr(self, "import_selection", None), "session_id", None):
+            with self.task_lock:
+                self.selection_path_keys.difference_update(path_key(path) for path in paths)
+            return
+        if self.get_config().get("import_mode", "auto") == "auto":
+            # Honor a mode change made while the drive scan's GUI event was pending.
+            with self.task_lock:
+                self.selection_path_keys.difference_update(path_key(path) for path in paths)
+            if self.shutdown_event.is_set():
+                return
+            name, args = self.default_task_preset_snapshot()
+            selected = [(path_key(path), path, context, name, list(args)) for path in paths]
+            threading.Thread(target=self.import_selected_candidates, args=(selected,),
+                             daemon=True, name="ModeChangedImport").start()
+            return
+        if self.import_selection is None:
+            self.import_selection = ImportSelection(self)
+        self.import_selection.add(payload)
+
+    def offer_import_selection(self, paths, **context) -> int:
+        """Reserve candidates without creating a runnable or recoverable task."""
+        accepted = []
+        with self.task_lock:
+            for path in paths:
+                key = path_key(path)
+                if key in self.selection_path_keys or key in self.task_by_path:
+                    continue
+                self.selection_path_keys.add(key)
+                accepted.append(path)
+        if accepted:
+            self.gui_queue.put(("import_selection", (accepted, context)))
+        return len(accepted)
+
+    def import_selected_candidates(self, selected) -> None:
+        completed = []
+        batches = {}
+        try:
+            cfg = self.get_config()
+            for key, path, context, name, args in selected:
+                task_id = ""
+                if self.shutdown_event.is_set() or self.import_cancel_requested.is_set():
+                    break
+                try:
+                    if not path.is_file():
+                        raise OSError(f"Source unavailable: {path}")
+                    imported = bool(context.get("imported"))
+                    task_id = self.create_task(path, stage=STAGE_CHECKING if imported else STAGE_DETECTED,
+                                               imported=imported, new_only=True, preset_snapshot=(name, args))
+                    if not task_id:
+                        completed.append(key)
+                        continue
+                    completed.append(key)
+                    if imported:
+                        reason = self.duplicate_reason_for(path, cfg, task_id)
+                        if reason:
+                            self.update_task(task_id, stage=STAGE_DUPLICATE_REVIEW, duplicate=True,
+                                             duplicate_reason=reason, detail=reason, progress=0)
+                        else:
+                            self.update_task(task_id, stage=STAGE_IMPORTED, progress=100, detail="Selected for conversion")
+                            self.queue_imported_batch_for_conversion([task_id])
+                    else:
+                        batch_key = (context.get("source_label", "Selected files"), context.get("source_id", ""), bool(context.get("disk_batch")))
+                        batches.setdefault(batch_key, []).append((path, task_id))
+                except Exception as exc:
+                    if task_id:
+                        self.update_task(task_id, stage=STAGE_ERROR, detail=str(exc))
+                    self.emit_log(f"Selected import failed: {exc}")
+                    self.gui_queue.put(("notification", (f"Could not prepare {path.name}: {exc}", "error", 9000)))
+            for (label, source_id, disk_batch), items in batches.items():
+                try:
+                    if self.import_cancel_requested.is_set() or self.shutdown_event.is_set():
+                        for _, task_id in items:
+                            self.update_task(task_id, stage=STAGE_STOPPED, detail="Selected import stopped")
+                    else:
+                        self.queue_import_batch(items, disk_batch, label, disk_batch=disk_batch, source_id=source_id)
+                except Exception as exc:
+                    for _, task_id in items:
+                        self.update_task(task_id, stage=STAGE_ERROR, detail=f"Could not queue import: {exc}")
+                    self.gui_queue.put(("notification", (f"Could not queue selected imports: {exc}", "error", 9000)))
+        finally:
+            with self.task_lock:
+                self.selection_path_keys.difference_update(completed)
+            self.gui_queue.put(("selection_finished", completed))
+
     def handle_drop(self, event: Any) -> None:
         paths = [Path(x) for x in self.root.tk.splitlist(event.data)]
         if not paths:
             return
         self.show_notification(f"Checking {len(paths)} dropped item{'s' if len(paths) != 1 else ''} for videos...", "info", 2500)
-        threading.Thread(target=self.add_paths_to_import, args=(paths,), daemon=True, name="DroppedFileImport").start()
+        threading.Thread(target=self.add_paths_to_import, args=(paths, self.current_import_review()), daemon=True, name="DroppedFileImport").start()
+
+    def current_import_review(self) -> Optional[str]:
+        if self.get_config().get("import_mode") == "select" and self.select_view and self.import_selection is not None:
+            return self.import_selection.session_id
+        return None
 
     def add_files_dialog(self) -> None:
         self.clear_task_selection()
@@ -6215,7 +6461,7 @@ class MesterSyncApp:
             self.show_notification(f"Checking {len(files)} selected file{'s' if len(files) != 1 else ''}...", "info", 2500)
             threading.Thread(
                 target=self.add_paths_to_import,
-                args=([Path(x) for x in files],),
+                args=([Path(x) for x in files], self.current_import_review()),
                 daemon=True,
                 name="SelectedFileImport",
             ).start()
@@ -6474,10 +6720,12 @@ class MesterSyncApp:
             self.emit_log(ready_notice["text"])
             self.gui_queue.put(("disk_ready", ready_notice))
 
-    def add_paths_to_import(self, paths: List[Path]) -> None:
+    def add_paths_to_import(self, paths: List[Path], review_session: Optional[str] = None) -> None:
         self.import_cancel_requested.clear()
         cfg = self.get_config()
-        self.sync_shared_duplicate_history(cfg, force=True)
+        review_requested = review_session is not None or (cfg.get("import_mode") == "select" and getattr(self, "select_view", False))
+        if review_requested and review_session is None:
+            review_session = getattr(getattr(self, "import_selection", None), "session_id", None)
         folder_error = validate_writable_folder(str(cfg.get("input_folder", "")), "Importfolder")
         if folder_error:
             self.emit_log(f"Add files stopped: {folder_error}")
@@ -6490,6 +6738,17 @@ class MesterSyncApp:
             cfg.get("conversion_extensions", COMMON_VIDEO_EXTENSIONS),
             lambda: self.import_cancel_requested.is_set() or self.shutdown_event.is_set(),
         )
+        if review_requested:
+            if (not getattr(self, "select_view", False)
+                    or (review_session and review_session != getattr(getattr(self, "import_selection", None), "session_id", None))):
+                self.emit_log("Adding files to the cancelled review was stopped.")
+                return
+            self.offer_import_selection(candidates, source_label="Added files", review_session=review_session)
+            if not candidates:
+                self.gui_queue.put(("notification", ("No supported video files were found.", "warning", 5500)))
+            return
+        candidates = [path for path in candidates if path_key(path) not in getattr(self, "selection_path_keys", set())]
+        self.sync_shared_duplicate_history(cfg, force=True)
         queued_items: List[Tuple[Path, str]] = []
         for src in candidates:
             if self.import_cancel_requested.is_set() or self.shutdown_event.is_set():
@@ -6757,6 +7016,8 @@ class MesterSyncApp:
             ]
             for path in scan_watchfolder_candidates(input_folder, exts, excluded_folders):
                 key = path_key(path)
+                if key in getattr(self, "selection_path_keys", set()):
+                    continue
                 if key in self.skipped_path_keys:
                     continue
                 with self.task_lock:
@@ -6888,6 +7149,7 @@ class MesterSyncApp:
                 time.sleep(2)
                 return
             found, active_count, remembered_count = self.filter_new_drive_sources(root, drive_id, found)
+            found = [path for path in found if path_key(path) not in getattr(self, "selection_path_keys", set())]
             if active_count or remembered_count:
                 parts: List[str] = []
                 if active_count:
@@ -6901,6 +7163,9 @@ class MesterSyncApp:
                 time.sleep(2)
                 return
             self.emit_log(f"Found {len(found)} importable video(s) on {root}.")
+            if self.get_config().get("import_mode", "auto") == "select":
+                self.offer_import_selection(found, source_label=str(root), disk_batch=True, source_id=drive_id)
+                return
             self.set_import_progress_snapshot(scan_progress_id, f"Import/watching: found {len(found)} video(s), starting soon", 0, None)
             delay = int(cfg.get("auto_import_delay_seconds", 5))
             for remaining in range(delay, 0, -1):
@@ -6910,6 +7175,9 @@ class MesterSyncApp:
                 time.sleep(1)
             queued_items: List[Tuple[Path, str]] = []
             total = len(found)
+            if self.get_config().get("import_mode", "auto") == "select":
+                self.offer_import_selection(found, source_label=str(root), disk_batch=True, source_id=drive_id)
+                return
             for src in found:
                 if not self.import_enabled or self.import_cancel_requested.is_set() or self.shutdown_event.is_set():
                     return
@@ -8210,7 +8478,7 @@ class MesterSyncApp:
         if path_value:
             title.bind("<Double-Button-1>", lambda e, p=path_value: self.open_path_with_feedback(p, "file"))
             tk.Label(right, text="Saved to", bg=bg, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(7, 0))
-            destination = tk.Entry(right, relief="flat", readonlybackground=bg, fg=self.TEXT, font=("Segoe UI", 10))
+            destination = RoundedEntry(right, relief="flat", readonlybackground=bg, fg=self.TEXT, font=("Segoe UI", 10))
             destination.insert(0, str(path_value))
             destination.configure(state="readonly")
             destination.pack(fill="x", pady=(2, 3))

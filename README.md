@@ -1,6 +1,22 @@
-# MesterSync 2.1.3
+# MesterSync 2.2
 
 MesterSync is a Windows desktop tool for safely importing, renaming, converting, and transferring video files. It uses FFmpeg for conversion and FFprobe to verify completed media before local working files are removed.
+
+## Auto and Select import modes
+
+Use the **Auto / Select** switch in the center of the top bar. Both modes show the normal Dashboard until a recording drive is detected with Import/watching enabled. Auto starts importing automatically; Select opens a review of that drive's new videos inside the main view. Switching modes alone does not open review. No processing task for those device videos is created until **Import selected** is clicked.
+
+Each video starts unchecked and has its own preset dropdown underneath. Scroll through a continuous grid with two or three columns. Only nearby rows render, keeping large devices responsive. Thumbnails smoothly fill their exact boxes at every size, with a centered crop that preserves aspect ratio. Hover to scrub ten frames or click for fullscreen (Escape/click closes it). Clicking the rest of a card toggles selection. Ctrl+A selects all candidates and Escape clears the selection. Presets are captured when you confirm, and normal duplicate checks and copy verification still apply.
+
+Choose a **Group preset** and click **Apply to selected** to update checked videos. Choosing a per-video dropdown creates an **Individual preset** override, which later group changes preserve. **Use group** clears that override and adopts the last group preset applied to that video. Unchecked videos are unchanged.
+
+**Cancel** dismisses review without importing its candidates; reconnect the device to review them again. Importing your selection returns to the normal Dashboard; unselected videos remain on the device. The toolbar stays on one line, with horizontal scrolling when needed on smaller windows. The mode is saved across restarts, while unconfirmed selections and preset choices are session-only.
+
+Manual Add files and Importfolder scans keep their usual behavior from the Dashboard. Add files inside an open review adds candidates to that review. Scanning the Importfolder continues its normal conversion workflow. Previously queued jobs follow the existing Start/Pause/Stop controls. The Log button sits below Compact in the sidebar and opens a full-width panel at the bottom of the app. Notifications are in the header, clear of the import controls. Pillow is included in the declared runtime requirements for smooth thumbnail resizing and rounded control surfaces.
+
+Compact reduces whole-row height with smaller controls, tighter spacing, and a two-line time/size estimate alongside the progress bar. It also tightens Select cards without changing their thumbnail aspect ratio. Comfortable restores larger controls and the expanded progress layout. Buttons, rename and number fields, preset dropdowns, queue numbers, and the status indicator share rounded corners. Scrollbars use a narrow rounded thumb with hover feedback and retain native dragging, track clicks, and mouse-wheel behavior.
+
+Resizing reuses visible review cards and waits briefly for the window size to settle before refitting previews. Inactive pages remain cached without laying out or repainting behind the current view. Completed History pages are reused until their records change. Rounded controls use cached, opaque drawing assets to keep Windows repaints lightweight.
 
 ## Safety and usability review in 2.1.3
 
@@ -33,7 +49,7 @@ See [the review and test notes](AUDIT_2.1.3.md) for coverage and remaining real-
 - Progressive History rendering so large histories do not block navigation
 - Batched, bounded live logging that stays lightweight during long sessions
 - Coalesced progress updates and faster background preview generation
-- A collapsible Log box in the top control bar between the playback controls and preset selector
+- A collapsible full-width Log panel at the bottom of the app, toggled below Compact in the sidebar
 - Bottom-right, non-blocking notifications with compact X controls and a floating latest-three notification center
 - Notification controls shifted clear of the scrollbar, with Dismiss all for transient messages
 - Persistent disk-ready feedback that remains active until the corresponding recording drive is disconnected

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Deque, Dict, Iterable, Optional
 
 import tkinter as tk
+from PIL import Image, ImageOps, ImageTk
 
 
 def scale_photo(img: tk.PhotoImage, max_width: int, max_height: int) -> tk.PhotoImage:
@@ -36,6 +37,7 @@ class ImageCache:
         self.source_data: Dict[str, str] = {}
         self.source_order: Deque[str] = deque()
         self.lock = threading.RLock()
+        self.cover_sources = {}
 
     def has_source(self, path: str) -> bool:
         with self.lock:
@@ -62,6 +64,7 @@ class ImageCache:
             for cache_key in matching:
                 self.images.pop(cache_key, None)
             self.source_data.pop(key, None)
+            self.cover_sources.pop(key, None)
             try:
                 self.source_order.remove(key)
             except ValueError:
@@ -116,6 +119,26 @@ class ImageCache:
         label.configure(image=img, text="")
         label.image = img
         return True
+
+    def configure_cover(self, label: tk.Label, path: str, width: int, height: int) -> bool:
+        """Fill an exact viewport, preserving aspect ratio with a centered crop."""
+        width, height = max(1, width), max(1, height)
+        key = f"{path}::cover::{width}x{height}"
+        try:
+            if key not in self.images:
+                if path not in self.cover_sources:
+                    with Image.open(path) as source:
+                        self.cover_sources[path] = source.convert("RGB")
+                    while len(self.cover_sources) > min(30, self.max_items):
+                        self.cover_sources.pop(next(iter(self.cover_sources)))
+                fitted = ImageOps.fit(self.cover_sources[path], (width, height), method=Image.Resampling.LANCZOS)
+                self.put(key, ImageTk.PhotoImage(fitted, master=label))
+            if getattr(label, "image", None) is not self.images[key]:
+                label.configure(image=self.images[key], text="", bd=0, padx=0, pady=0)
+                label.image = self.images[key]
+            return True
+        except (OSError, tk.TclError, ValueError):
+            return False
 
 
 class ThumbnailPopup:
