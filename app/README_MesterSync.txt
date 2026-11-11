@@ -1,4 +1,4 @@
-MesterSync 2.2
+MesterSync 2.3
 
 Installed use:
 - Open MesterSync from the Start menu or desktop shortcut.

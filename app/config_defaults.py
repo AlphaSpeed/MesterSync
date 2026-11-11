@@ -45,6 +45,7 @@ COMMON_VIDEO_EXTENSIONS = [
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "import_mode": "auto",
+    "import_priority_enabled": False,
     "input_folder": "",
     "output_folder": "",
     "nas_folder": "",
@@ -74,6 +75,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "auto_underscore_renames": False,
     "prevent_sleep_while_working": True,
     "compact_dashboard": True,
+    "simple_dashboard": False,
     "preset_folder": "",
     "default_preset_name": "Current settings",
     "setup_complete": False,

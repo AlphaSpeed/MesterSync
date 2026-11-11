@@ -147,6 +147,24 @@ class ImportSelectionTests(unittest.TestCase):
         self.assertIsNone(self.app.import_selection)
         self.assertFalse(self.app.selection_path_keys)
 
+    def test_restoring_auto_after_simple_does_not_submit_pending_drive_review(self):
+        path = self.source()
+        self.app.get_config()["simple_dashboard"] = True
+        self.app.sync_shared_duplicate_history = mock.Mock()
+        self.app.filter_new_drive_sources = mock.Mock(return_value=([path], 0, 0))
+        with mock.patch.object(app_module, "scan_drive_importable_videos", return_value=([path], 1)):
+            self.app.import_drive(path.parent, "disk-one")
+        event, payload = self.app.gui_queue.get_nowait()
+        self.assertEqual(event, "import_selection")
+
+        self.app.get_config().update(simple_dashboard=False, import_mode="auto")
+        with mock.patch.object(app_module.threading, "Thread") as thread:
+            self.app.receive_import_selection(payload)
+        thread.assert_not_called()
+        self.app.queue_import_batch.assert_not_called()
+        self.assertFalse(self.app.tasks)
+        self.assertFalse(self.app.selection_path_keys)
+
     def test_cancelled_preview_result_cannot_replace_reconnected_device_preview(self):
         review = app_module.ImportSelection.__new__(app_module.ImportSelection)
         review.app = self.app

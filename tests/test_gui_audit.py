@@ -312,6 +312,147 @@ class GuiAuditTests(unittest.TestCase):
                 compact_height = app.row_widgets[first.task_id]["outer"].winfo_reqheight()
                 self.assertLess(compact_height, comfortable_height-35)
                 self.assertLessEqual(compact_height, app.dashboard_row_extent())
+                side_controls = app.dashboard_side_controls.pack_slaves()
+                self.assertEqual(side_controls.index(app.simple_dashboard_btn) + 1,
+                                 side_controls.index(app.compact_dashboard_btn))
+                self.assertFalse(app.simple_dashboard)
+                app.mode_switch.choose("auto")
+                app.import_priority_enabled = False
+                hidden_controls = [app.top_control_bar, app.stage_cards["import"]["priority_button"]]
+                hidden_controls.extend(card["button"] for card in app.stage_cards.values())
+                full_stage_layouts = {
+                    key: card["card"].pack_slaves() for key, card in app.stage_cards.items()
+                }
+
+                def check_skip_and_remove(simple):
+                    source = folder / f"skip-{simple}.mp4"
+                    source.write_bytes(b"original video")
+                    task = app_module.TaskState(f"skip-{simple}", source, source.name)
+                    app.tasks[task.task_id] = task
+                    app.refresh_dashboard_rows()
+                    row = app.row_widgets[task.task_id]
+                    self.assertEqual(row["skip_btn"].winfo_manager(), "pack")
+                    row["skip_btn"].invoke()
+                    self.assertTrue(task.skipped)
+                    self.assertEqual(row["resume_btn"].winfo_manager(), "pack")
+                    self.assertEqual(row["remove_btn"].winfo_manager(), "pack")
+                    row["remove_btn"].invoke()
+                    self.assertNotIn(task.task_id, app.tasks)
+                    self.assertNotIn(task.task_id, app.row_widgets)
+                    self.assertEqual(source.read_bytes(), b"original video")
+
+                with mock.patch.object(app, "start_all", wraps=app.start_all) as start_all, mock.patch.object(
+                    app, "ensure_workers_running",
+                ) as start_workers, mock.patch.multiple(
+                    app, import_enabled=True, conversion_enabled=True, transfer_enabled=False,
+                ):
+                    app.update_status()
+                    original_appearance = {
+                        key: (card["outer"].fill, card["outer"].border, card["bar"].cget("style"))
+                        for key, card in app.stage_cards.items()
+                    }
+                    check_skip_and_remove(False)
+                    first.eta_seconds = 12
+                    app.render_task(first.task_id)
+                    app.select_task(first.task_id)
+                    heights = {}
+                    for compact in (True, False):
+                        if app.compact_dashboard != compact:
+                            app.compact_dashboard_btn.invoke()
+                        root.update_idletasks()
+                        row = app.row_widgets[first.task_id]
+                        heights[compact] = row["outer"].winfo_reqheight()
+                        visible = ("thumb", "src", "progressbar", "estimate_text", "skip_btn", "more_btn")
+                        layout = {key: row[key].pack_info() for key in visible}
+                        with mock.patch.object(app, "import_cancel_available", return_value=True):
+                            for simple in (True, False):
+                                with self.subTest(simple=simple, compact=compact):
+                                    app.simple_dashboard_btn.invoke()
+                                    root.update_idletasks()
+                                    self.assertEqual(app.simple_dashboard, simple)
+                                    self.assertEqual(app.compact_dashboard, compact)
+                                    self.assertEqual(app.import_priority_enabled, simple)
+                                    self.assertEqual(app.get_config()["import_mode"], "select" if simple else "auto")
+                                    self.assertEqual(app.top_control_bar.winfo_manager(), "" if simple else "pack")
+                                    self.assertEqual(app.status_var.get(), "Ready to select" if simple else "Stopped")
+                                    self.assertFalse(app.started)
+                                    self.assertTrue(app.import_enabled and app.conversion_enabled)
+                                    self.assertFalse(app.transfer_enabled)
+                                    for control in hidden_controls:
+                                        self.assertEqual(bool(control.winfo_manager()), not simple)
+                                    for index, (stage, card) in enumerate(app.stage_cards.items(), start=1):
+                                        progress = 20 * index + int(simple)
+                                        app.update_stage_card(stage, f"{stage}: file {index}", progress, 45)
+                                        self.assertEqual(int(card["outer"].cget("height")), 124 if simple else 160)
+                                        self.assertEqual((card["outer"].fill, card["outer"].border,
+                                                          card["bar"].cget("style")), original_appearance[stage])
+                                        self.assertEqual(card["progress"].get(), progress)
+                                        self.assertEqual(float(card["bar"].cget("value")), progress)
+                                        self.assertEqual(card["percent"].get(), f"{progress}%")
+                                        self.assertEqual(str(card["header_percent"].cget("textvariable")), str(card["percent"]))
+                                        if simple:
+                                            head = card["dot"].master
+                                            self.assertEqual(card["card"].pack_slaves(), [head, card["bar"]])
+                                            self.assertEqual(len(head.pack_slaves()), 3)
+                                            self.assertEqual(card["header_percent"].pack_info()["side"], "right")
+                                        else:
+                                            self.assertEqual(card["card"].pack_slaves(), full_stage_layouts[stage])
+                                            self.assertFalse(card["header_percent"].winfo_manager())
+                                            self.assertIn("45s", card["eta"].get())
+                                    self.assertIs(app.row_widgets[first.task_id], row)
+                                    self.assertEqual(row["outer"].winfo_reqheight(), heights[compact])
+                                    self.assertEqual({key: row[key].pack_info() for key in visible}, layout)
+                                    self.assertEqual(row["progress_var"].get(), 37)
+                                    self.assertIn("12s", row["estimate_text"].cget("text"))
+                                    self.assertEqual(app.selected_ids, [first.task_id])
+                                    self.assertEqual(app.batch_frame.winfo_manager(), "pack")
+                                    if simple:
+                                        app.toggle_import_priority()
+                                        app.mode_switch.choose("auto")
+                                        self.assertTrue(app.import_priority_enabled)
+                                        self.assertEqual(app.import_mode_var.get(), "select")
+                                        check_skip_and_remove(True)
+                                        self.assertTrue(app.flush_config_autosave())
+                                        saved = storage.load_config_data(app_module.DEFAULT_CONFIG, app_module.DEFAULT_FFMPEG_ARGS)
+                                        self.assertTrue(saved["simple_dashboard"])
+                                        self.assertEqual(saved["compact_dashboard"], compact)
+                                        self.assertEqual(saved["import_mode"], "auto")
+                                        self.assertFalse(saved["import_priority_enabled"])
+                    self.assertLess(heights[True], heights[False])
+                    start_all.assert_not_called()
+                    start_workers.assert_not_called()
+                    app.clear_task_selection()
+                    app.mode_switch.choose("select")
+                    app.toggle_import_priority()
+                    review_key = app_module.path_key(paths[0])
+                    review.previews[review_key] = [str(preview)]
+                    review.add(([paths[0]], {"disk_batch": True}))
+                    checkbox = next(widget for widget in review.cards[review_key].inner.winfo_children()
+                                    if isinstance(widget, tk.Checkbutton))
+                    checkbox.invoke()
+                    self.assertTrue(review.items[review_key][2].get())
+                    app.simple_dashboard_btn.invoke()
+                    with mock.patch.object(app, "started", True):
+                        app.update_status()
+                        self.assertEqual(app.status_var.get(), "Watching")
+                        with mock.patch.object(app, "current_conversion_id", first.task_id):
+                            app.update_status()
+                            self.assertEqual(app.status_var.get(), "Processing")
+                        app.update_status()
+                        self.assertEqual(app.status_var.get(), "Watching")
+                    self.assertTrue(checkbox.winfo_exists())
+                    self.assertTrue(review.items[review_key][2].get())
+                    checkbox.invoke()
+                    self.assertFalse(review.items[review_key][2].get())
+                    app.simple_dashboard_btn.invoke()
+                    checkbox.invoke()
+                    self.assertTrue(review.items[review_key][2].get())
+                    self.assertTrue(app.import_priority_enabled)
+                    self.assertEqual(app.get_config()["import_mode"], "select")
+                    review.cancel()
+                    app.mode_switch.choose("auto")
+                    app.toggle_import_priority()
+                app.compact_dashboard_btn.invoke()
                 self.assertLessEqual(app.top_control_bar.winfo_reqheight(), round(64*root.winfo_fpixels("1i")/96))
                 from types import SimpleNamespace
                 with mock.patch.object(app, "toggle_pause") as pause:

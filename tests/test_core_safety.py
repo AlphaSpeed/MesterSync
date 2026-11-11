@@ -802,10 +802,10 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertEqual(ui_performance.bounded_log_count(1000, 80, 1000), (80, 1000))
 
     def test_version_is_2_2(self):
-        self.assertEqual(app_module.APP_VERSION, "2.2")
-        self.assertIn('MyAppVersion "2.2"', (ROOT / "packaging" / "MesterSync.iss").read_text(encoding="utf-8"))
-        self.assertTrue((ROOT / "README.md").read_text(encoding="utf-8").startswith("# MesterSync 2.2"))
-        self.assertTrue((APP_DIR / "README_MesterSync.txt").read_text(encoding="utf-8").startswith("MesterSync 2.2"))
+        self.assertEqual(app_module.APP_VERSION, "2.3")
+        self.assertIn('MyAppVersion "2.3"', (ROOT / "packaging" / "MesterSync.iss").read_text(encoding="utf-8"))
+        self.assertTrue((ROOT / "README.md").read_text(encoding="utf-8").startswith("# MesterSync 2.3"))
+        self.assertTrue((APP_DIR / "README_MesterSync.txt").read_text(encoding="utf-8").startswith("MesterSync 2.3"))
 
     def test_launcher_has_python_fallbacks_and_visible_failure_message(self):
         launcher = (APP_DIR / "MesterSync.vbs").read_text(encoding="utf-8-sig").lower()

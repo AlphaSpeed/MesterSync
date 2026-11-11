@@ -236,6 +236,7 @@ class MesterSyncApp:
         self.settings_building = False
         self.initialize_settings_state()
         self.compact_dashboard = bool(self.config.get("compact_dashboard", True))
+        self.simple_dashboard = bool(self.config.get("simple_dashboard", False))
         self.history_records: List[Dict[str, Any]] = self.load_history()
         self.checksum_db: Dict[str, Any] = {}
         self.load_checksum_database()
@@ -361,7 +362,7 @@ class MesterSyncApp:
         self.current_transfer_id: Optional[str] = None
         self.current_process_paused = False
         self.sleep_prevention_active = False
-        self.import_priority_enabled = False
+        self.import_priority_enabled = bool(self.config.get("import_priority_enabled", False))
         self.thumbnail_popup = ThumbnailPopup(self.root, zoom=3)
         self.thumbnail_generation_requested: set[str] = set()
         self.thumbnail_queue: "queue.Queue[Tuple[str, Path, float]]" = queue.Queue()
@@ -408,7 +409,7 @@ class MesterSyncApp:
                 name="ThumbnailCleanup",
             ).start(),
         )
-        self.log("Ready. Use Add files or Start all.")
+        self.log("Ready. Use Add files." if self.simple_dashboard else "Ready. Use Add files or Start all.")
         self.update_startup_warning()
         if self.required_startup_settings_missing():
             self.root.after(300, self.run_setup_wizard)
@@ -472,7 +473,19 @@ class MesterSyncApp:
 
     def get_config(self) -> Dict[str, Any]:
         with self.config_lock:
-            return json.loads(json.dumps(self.config))
+            config = json.loads(json.dumps(self.config))
+        # Keep the user's import mode in the saved config and give workers the effective mode.
+        if config.get("simple_dashboard"):
+            config["import_mode"] = "select"
+        return config
+
+    @property
+    def import_priority_enabled(self) -> bool:
+        return getattr(self, "simple_dashboard", False) or getattr(self, "_import_priority_enabled", False)
+
+    @import_priority_enabled.setter
+    def import_priority_enabled(self, enabled: bool) -> None:
+        self._import_priority_enabled = enabled
 
     def ui_int(self, var: tk.StringVar, default: int, minimum: Optional[int] = None) -> int:
         try:
@@ -531,6 +544,8 @@ class MesterSyncApp:
             self.config["auto_underscore_renames"] = bool(self.auto_underscore_var.get())
             self.config["prevent_sleep_while_working"] = bool(self.prevent_sleep_var.get())
             self.config["compact_dashboard"] = bool(self.compact_dashboard)
+            self.config["simple_dashboard"] = self.simple_dashboard
+            self.config["import_priority_enabled"] = self._import_priority_enabled
             if hasattr(self, "preset_folder_var"):
                 preset_folder_value = self.preset_folder_var.get().strip()
                 if preset_folder_value != str(self.config.get("preset_folder", "")):
@@ -566,6 +581,9 @@ class MesterSyncApp:
                 "auto_underscore_renames": bool(self.auto_underscore_var.get()),
                 "prevent_sleep_while_working": bool(self.prevent_sleep_var.get()) if hasattr(self, "prevent_sleep_var") else bool(self.config.get("prevent_sleep_while_working", True)),
                 "compact_dashboard": bool(self.compact_dashboard),
+                "simple_dashboard": self.simple_dashboard,
+                "import_priority_enabled": self._import_priority_enabled,
+                "import_mode": self.config.get("import_mode", "auto"),
                 "preset_folder": self.preset_folder_var.get().strip() if hasattr(self, "preset_folder_var") else str(self.get_preset_folder()),
                 "default_preset_name": self.top_preset_var.get() if hasattr(self, "top_preset_var") else self.config.get("default_preset_name", "Current settings"),
                 "ffmpeg_args": self.ui_ffmpeg_args(),
@@ -600,11 +618,11 @@ class MesterSyncApp:
         missing = self.missing_required_settings()
         if missing:
             self.startup_warning_var.set("Setup needed: choose " + ", ".join(missing) + " before starting.")
-            if not self.startup_warning_frame.winfo_ismapped():
+            if not self.startup_warning_frame.winfo_manager():
                 self.startup_warning_frame.pack(side="left", padx=(12, 0))
         else:
             self.startup_warning_var.set("")
-            if self.startup_warning_frame.winfo_ismapped():
+            if self.startup_warning_frame.winfo_manager():
                 self.startup_warning_frame.pack_forget()
 
     def save_config(self) -> None:
@@ -664,7 +682,7 @@ class MesterSyncApp:
 
     def refresh_settings_ui_from_config(self) -> None:
         if hasattr(self, "import_mode_var"):
-            self.import_mode_var.set(self.config.get("import_mode", "auto"))
+            self.import_mode_var.set(self.get_config().get("import_mode", "auto"))
         if not hasattr(self, "input_folder_var"):
             return
         self.settings_ui_refreshing = True
@@ -687,6 +705,10 @@ class MesterSyncApp:
             self.auto_underscore_var.set(bool(self.config.get("auto_underscore_renames", False)))
             self.prevent_sleep_var.set(bool(self.config.get("prevent_sleep_while_working", True)))
             self.compact_dashboard = bool(self.config.get("compact_dashboard", True))
+            simple = bool(self.config.get("simple_dashboard", False))
+            if simple != self.simple_dashboard:
+                self.simple_dashboard = simple
+                self.apply_simple_dashboard()
             self.preset_folder_var.set(self.config.get("preset_folder") or str(preset_dir()))
             if not self.settings_built:
                 self.update_compact_dashboard_button()
@@ -743,8 +765,11 @@ class MesterSyncApp:
             with self.config_lock:
                 self.config = cfg
                 write_json_file(config_path(), self.config)
+            self.import_priority_enabled = bool(cfg.get("import_priority_enabled", False))
             self.load_checksum_database()
             self.refresh_settings_ui_from_config()
+            self.update_import_cancel_button()
+            self.refresh_import_priority()
             self.saved_settings_snapshot = self.current_settings_snapshot()
             self.log(f"Settings backup imported: {source}")
             self.show_notification("Settings backup imported.", "success")
@@ -1900,6 +1925,7 @@ class MesterSyncApp:
         # Build overlays last so the floating notification controls stay above
         # the Dashboard, History, and Settings surfaces.
         self.build_notification_toast()
+        self.update_simple_dashboard_controls()
         self.update_status()
 
     def build_header(self) -> None:
@@ -1949,7 +1975,7 @@ class MesterSyncApp:
         self.start_btn.pack(side="left")
         self.pause_btn = self.button(left, "Pause", self.toggle_pause, self.CARD3)
         self.pause_btn.pack(side="left", padx=(10, 0))
-        self.import_mode_var = tk.StringVar(value=self.config.get("import_mode", "auto"))
+        self.import_mode_var = tk.StringVar(value=self.get_config().get("import_mode", "auto"))
         self.mode_switch = ModeSwitch(controls, self.import_mode_var, self.change_import_mode,
                                       self.CARD2, self.BLUE, self.TEXT, self.MUTED)
         self.mode_switch.grid(row=0, column=1, padx=16)
@@ -2018,11 +2044,13 @@ class MesterSyncApp:
             head.pack(fill="x")
             dot = tk.Canvas(head, width=14, height=14, bg=self.CARD, highlightthickness=0)
             dot.pack(side="left")
-            tk.Label(head, text=title, bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 14, "bold")).pack(side="left", padx=(9, 0))
+            heading = tk.Label(head, text=title, bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 14, "bold"))
+            heading.pack(side="left", padx=(9, 0))
             btn = self.small_button(head, "Stop", lambda k=key: self.toggle_stage(k), self.CARD3)
             btn.pack(side="right")
             cancel_btn = None
             priority_btn = None
+            import_actions = None
             if key == "import":
                 import_actions = tk.Frame(card, bg=self.CARD)
                 import_actions.pack(side="bottom", fill="x", pady=(3, 0))
@@ -2043,16 +2071,26 @@ class MesterSyncApp:
             bar = ttk.Progressbar(card, maximum=100, variable=pvar, style=style)
             bar.pack(fill="x", pady=(6, 3))
             percent = tk.StringVar(value="0%")
+            header_percent = tk.Label(head, textvariable=percent, bg=self.CARD, fg=self.TEXT,
+                                      font=("Segoe UI", 16, "bold"), anchor="e")
             metrics = tk.Frame(card, bg=self.CARD)
             metrics.pack(fill="x")
             if key == "conversion":
                 tk.Label(metrics, textvariable=eta_var, bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10, "bold"), anchor="w").pack(side="left")
             tk.Label(metrics, textvariable=percent, bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10, "bold"), anchor="e").pack(side="right")
+            queue_label = None
             if key == "conversion":
                 self.conversion_queue_eta_var = tk.StringVar(value="Queue: estimating…")
-                tk.Label(card, textvariable=self.conversion_queue_eta_var, bg=self.CARD, fg=self.MUTED,
-                         font=("Segoe UI", 10), anchor="w").pack(fill="x", pady=(2, 0))
-            self.stage_cards[key] = {"outer": outer, "card": card, "dot": dot, "label": label_var, "eta": eta_var, "progress": pvar, "percent": percent, "button": btn, "cancel_button": cancel_btn, "priority_button": priority_btn, "title": title}
+                queue_label = tk.Label(card, textvariable=self.conversion_queue_eta_var, bg=self.CARD, fg=self.MUTED,
+                                       font=("Segoe UI", 10), anchor="w")
+                queue_label.pack(fill="x", pady=(2, 0))
+            self.stage_cards[key] = {
+                "outer": outer, "card": card, "dot": dot, "title": title,
+                "label": label_var, "eta": eta_var, "progress": pvar, "percent": percent,
+                "button": btn, "cancel_button": cancel_btn, "priority_button": priority_btn,
+                "bar": bar, "heading": heading, "header_percent": header_percent, "detail_row": detail_row,
+                "metrics": metrics, "queue_label": queue_label, "import_actions": import_actions,
+            }
 
     def build_body(self) -> None:
         body = tk.Frame(self.main, bg=self.BG)
@@ -2069,6 +2107,8 @@ class MesterSyncApp:
         tk.Frame(left, bg=self.CARD).pack(fill="both", expand=True)
         self.dashboard_side_controls = tk.Frame(left, bg=self.CARD)
         self.dashboard_side_controls.pack(fill="x", side="bottom")
+        self.simple_dashboard_btn = self.button(self.dashboard_side_controls, "", self.toggle_simple_dashboard, self.CARD3)
+        self.simple_dashboard_btn.pack(fill="x", pady=(0, 10))
         self.compact_dashboard_btn = self.button(
             self.dashboard_side_controls,
             "",
@@ -2528,6 +2568,51 @@ class MesterSyncApp:
         self.button(header, "Clear history", self.clear_history, self.CARD3).pack(side="right")
         self.history_canvas, self.history_inner = self.make_canvas_area(self.history_frame)
 
+    def toggle_simple_dashboard(self) -> None:
+        with self.config_lock:
+            self.simple_dashboard = not self.simple_dashboard
+            self.config["simple_dashboard"] = self.simple_dashboard
+        self.apply_simple_dashboard()
+        self.schedule_config_autosave()
+
+    def apply_simple_dashboard(self) -> None:
+        self.update_simple_dashboard_controls()
+        self.update_status()
+        self.update_import_cancel_button()
+        self.refresh_import_priority()
+        if self.select_view and self.import_mode_var.get() == "auto":
+            self.update_import_mode_view()
+
+    def update_simple_dashboard_controls(self) -> None:
+        simple = self.simple_dashboard
+        color = self.BLUE if simple else self.CARD3
+        self.simple_dashboard_btn.configure(text="Simple: On" if simple else "Simple: Off",
+                                            bg=color, activebackground=color)
+        self.import_mode_var.set(self.get_config().get("import_mode", "auto"))
+        if simple:
+            self.top_control_bar.pack_forget()
+        else:
+            self.top_control_bar.pack(fill="x", padx=18, pady=(0, 10), after=self.header_frame)
+        for card in self.stage_cards.values():
+            card["outer"].configure(height=124 if simple else 160)
+            card["card"].configure(pady=14 if simple else 3)
+            card["heading"].configure(font=("Segoe UI", 16 if simple else 14, "bold"))
+            card["bar"].pack_configure(pady=(13, 3) if simple else (6, 3))
+            if simple:
+                card["header_percent"].pack(side="right")
+                for key in ("button", "detail_row", "metrics", "queue_label", "import_actions"):
+                    if card[key] is not None:
+                        card[key].pack_forget()
+            else:
+                card["header_percent"].pack_forget()
+                card["button"].pack(side="right")
+                card["detail_row"].pack(fill="x", pady=(6, 1), before=card["bar"])
+                card["metrics"].pack(fill="x", after=card["bar"])
+                if card["queue_label"] is not None:
+                    card["queue_label"].pack(fill="x", pady=(2, 0), after=card["metrics"])
+                if card["import_actions"] is not None:
+                    card["import_actions"].pack(side="bottom", fill="x", pady=(3, 0), before=card["detail_row"])
+
     def update_compact_dashboard_button(self) -> None:
         button = getattr(self, "compact_dashboard_btn", None)
         if not button:
@@ -2896,9 +2981,9 @@ class MesterSyncApp:
             self.thumbnail_queue_var.set("Previews: idle")
         if hasattr(self, "thumbnail_queue_label"):
             should_show = active or pending > 0 or queued > 0
-            if should_show and not self.thumbnail_queue_label.winfo_ismapped():
+            if should_show and not self.thumbnail_queue_label.winfo_manager():
                 self.thumbnail_queue_label.pack(side="left", padx=(12, 0))
-            elif not should_show and self.thumbnail_queue_label.winfo_ismapped():
+            elif not should_show and self.thumbnail_queue_label.winfo_manager():
                 self.thumbnail_queue_label.pack_forget()
 
     def add_advanced_section(self, parent: tk.Widget, title: str = "Advanced") -> tk.Frame:
@@ -4005,6 +4090,8 @@ class MesterSyncApp:
             self.refresh_session_summary_idle_timer()
             self.refresh_sleep_prevention()
             self.refresh_import_priority()
+            if self.simple_dashboard:
+                self.update_status()
             self.prune_removed_drive_notifications()
             # Safety net: a settings/tab focus change must not make a live task vanish
             # from the Dashboard. If a row widget is missing but the task still exists,
@@ -4114,22 +4201,29 @@ class MesterSyncApp:
     def update_status(self) -> None:
         with self.preset_test_process_lock:
             preset_test_running = self.preset_test_running
+        with self.task_lock:
+            importing_now = self.importing_count > 0
+        running_any = self.started and (self.import_enabled or self.conversion_enabled or self.transfer_enabled)
         if self.pause_event.is_set():
             text = "Paused"
             color = self.YELLOW
-        elif preset_test_running and not (self.started and (self.import_enabled or self.conversion_enabled or self.transfer_enabled)):
+        elif preset_test_running and not running_any:
             text = "Preset test"
             color = self.BLUE
-        elif self.started and (self.import_enabled or self.conversion_enabled or self.transfer_enabled):
+        elif self.simple_dashboard:
+            if importing_now or self.current_import_id or self.current_conversion_id or self.current_transfer_id:
+                text, color = "Processing", self.GREEN
+            elif self.started and self.import_enabled:
+                text, color = "Watching", self.GREEN
+            else:
+                text, color = "Ready to select", self.MUTED
+        elif running_any:
             text = "Running" if (self.import_enabled and self.conversion_enabled and self.transfer_enabled) else "Partially running"
             color = self.GREEN
         else:
             text = "Stopped"
             color = self.MUTED
-        with self.task_lock:
-            importing_now = self.importing_count > 0
         activity = "File importing..." if importing_now else ("Testing preset..." if preset_test_running else "")
-        running_any = self.started and (self.import_enabled or self.conversion_enabled or self.transfer_enabled)
         view = (
             text,
             color,
@@ -4256,7 +4350,9 @@ class MesterSyncApp:
                     btn.configure(state="normal", bg=self.CARD3, activebackground=self.CARD3, fg="white")
                 elif btn.winfo_manager():
                     btn.pack_forget()
-            if priority_btn:
+            if priority_btn and getattr(self, "simple_dashboard", False):
+                priority_btn.pack_forget()
+            elif priority_btn:
                 if not priority_btn.winfo_manager():
                     priority_btn.pack(side="right", padx=(0, 8))
                 active = self.import_priority_enabled
@@ -4284,6 +4380,8 @@ class MesterSyncApp:
             self.queue_condition.notify_all()
 
     def toggle_import_priority(self) -> None:
+        if getattr(self, "simple_dashboard", False):
+            return
         self.import_priority_enabled = not self.import_priority_enabled
         if self.import_priority_enabled:
             self.log("Import priority enabled. Conversion will wait while imports are active.")
@@ -4291,6 +4389,7 @@ class MesterSyncApp:
             self.log("Import priority disabled. Conversion can run during imports.")
         self.refresh_import_priority()
         self.emit_status()
+        self.schedule_config_autosave()
 
     # ---------------- controls ----------------
     def ensure_workers_running(self) -> None:
@@ -4577,7 +4676,8 @@ class MesterSyncApp:
         self.import_enabled = False
         self.conversion_enabled = False
         self.transfer_enabled = False
-        self.import_priority_enabled = False
+        if not getattr(self, "simple_dashboard", False):
+            self.import_priority_enabled = False
         self.pause_event.clear()
         self.stop_conversion_work()
         self.cancel_import_queue("Import cancelled by Stop all")
@@ -6332,9 +6432,15 @@ class MesterSyncApp:
 
     # ---------------- add/import/scan ----------------
     def change_import_mode(self) -> None:
+        if getattr(self, "simple_dashboard", False):
+            self.import_mode_var.set("select")
+            return
         with self.config_lock:
             self.config["import_mode"] = self.import_mode_var.get()
         self.schedule_config_autosave()
+        self.update_import_mode_view()
+
+    def update_import_mode_view(self) -> None:
         if self.import_mode_var.get() == "auto":
             if self.import_selection is not None and not self.import_selection.busy:
                 self.import_selection.cancel()
@@ -6366,7 +6472,7 @@ class MesterSyncApp:
             # Honor a mode change made while the drive scan's GUI event was pending.
             with self.task_lock:
                 self.selection_path_keys.difference_update(path_key(path) for path in paths)
-            if self.shutdown_event.is_set():
+            if context.get("require_confirmation") or self.shutdown_event.is_set():
                 return
             name, args = self.default_task_preset_snapshot()
             selected = [(path_key(path), path, context, name, list(args)) for path in paths]
@@ -7163,8 +7269,10 @@ class MesterSyncApp:
                 time.sleep(2)
                 return
             self.emit_log(f"Found {len(found)} importable video(s) on {root}.")
-            if self.get_config().get("import_mode", "auto") == "select":
-                self.offer_import_selection(found, source_label=str(root), disk_batch=True, source_id=drive_id)
+            mode = self.get_config()
+            if cfg.get("simple_dashboard") or mode.get("import_mode", "auto") == "select":
+                self.offer_import_selection(found, source_label=str(root), disk_batch=True, source_id=drive_id,
+                                            require_confirmation=bool(cfg.get("simple_dashboard") or mode.get("simple_dashboard")))
                 return
             self.set_import_progress_snapshot(scan_progress_id, f"Import/watching: found {len(found)} video(s), starting soon", 0, None)
             delay = int(cfg.get("auto_import_delay_seconds", 5))
@@ -7175,8 +7283,10 @@ class MesterSyncApp:
                 time.sleep(1)
             queued_items: List[Tuple[Path, str]] = []
             total = len(found)
-            if self.get_config().get("import_mode", "auto") == "select":
-                self.offer_import_selection(found, source_label=str(root), disk_batch=True, source_id=drive_id)
+            mode = self.get_config()
+            if mode.get("import_mode", "auto") == "select":
+                self.offer_import_selection(found, source_label=str(root), disk_batch=True, source_id=drive_id,
+                                            require_confirmation=bool(mode.get("simple_dashboard")))
                 return
             for src in found:
                 if not self.import_enabled or self.import_cancel_requested.is_set() or self.shutdown_event.is_set():
