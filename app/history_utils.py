@@ -5,7 +5,7 @@ from threading import Event
 from typing import Any, Dict, List, Optional, Sequence, Set, TypeVar
 
 from file_utils import path_key
-from duplicates import cached_quick_fingerprint, quick_fingerprint
+from duplicates import cached_quick_fingerprint, cached_sha256_file, quick_fingerprint
 
 
 Record = TypeVar("Record")
@@ -41,6 +41,10 @@ def retained_media_is_unchanged(path: Path, record: Dict[str, Any], cache: Dict[
         return False
     try:
         stat = path.stat()
+        if "sha256" in record:
+            if record.get("size") is not None and record["size"] != stat.st_size:
+                return False
+            return cached_sha256_file(path, cache, stop) == record["sha256"]
         signature = [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
         if record.get("signature") != signature:
             return False

@@ -76,9 +76,25 @@ def scan_drive_importable_videos(
 ) -> Tuple[List[Path], int]:
     found: List[Path] = []
     exclude_folders = set(str(x).lower() for x in cfg.get("exclude_folders", []))
+    managed_folders = {
+        Path(str(cfg[key])).resolve()
+        for key in ("input_folder", "output_folder", "nas_folder")
+        if str(cfg.get(key) or "").strip()
+    }
     scanned = 0
     last_scan_update = 0.0
-    for dirpath, dirnames, filenames in os.walk(root):
+    def on_walk_error(exc: OSError) -> None:
+        # An unreadable drive root is retryable, not an empty completed scan.
+        if not exc.filename or Path(exc.filename) == root:
+            raise exc
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=on_walk_error):
+        if should_stop():
+            break
+        directory = Path(dirpath).resolve()
+        if directory in managed_folders or any(parent in managed_folders for parent in directory.parents):
+            dirnames.clear()
+            continue
         dirnames[:] = [
             d
             for d in dirnames

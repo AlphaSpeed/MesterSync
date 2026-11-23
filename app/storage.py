@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import errno
 import shutil
 import sys
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, BinaryIO, Dict, Optional
 
 from tasks import (
     STAGE_CHECKING,
@@ -86,6 +87,27 @@ def user_storage_root() -> Path:
             return Path(local_app_data) / APP_DATA_DIRNAME
         return Path.home() / "AppData" / "Local" / APP_DATA_DIRNAME
     return Path.home() / f".{APP_DATA_DIRNAME.lower()}"
+
+
+def lock_user_storage() -> Optional[BinaryIO]:
+    """Hold one OS-managed lock per data directory until the application exits."""
+    root = user_storage_root()
+    root.mkdir(parents=True, exist_ok=True)
+    handle = (root / "session.lock").open("a+b")
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        if exc.errno in (errno.EACCES, errno.EAGAIN):
+            return None
+        raise
+    return handle
 
 
 def _command_line_migration_root() -> Optional[Path]:
@@ -302,20 +324,25 @@ def migrate_record_thumbnail_paths(record: Dict[str, Any]) -> Dict[str, Any]:
     return migrated
 
 
-def read_json_file(path: Path, default: Any) -> Any:
+def read_json_file(path: Path, default: Any, expected_type: Optional[type] = None) -> Any:
     backup = path.with_suffix(path.suffix + ".bak")
-    try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8-sig"))
-    except Exception as exc:
-        log_storage_warning(f"Could not read JSON file {path}: {exc}")
-    try:
-        if backup.exists():
-            recovered = json.loads(backup.read_text(encoding="utf-8-sig"))
+    issue = None
+    for candidate in (path, backup):
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8-sig"))
+            if expected_type is not None and not isinstance(data, expected_type):
+                raise ValueError(f"Expected {expected_type.__name__} in {candidate}")
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            issue = exc
+            log_storage_warning(f"Could not read JSON file {candidate}: {exc}")
+            continue
+        if candidate == backup:
             log_storage_warning(f"Recovered JSON data from backup {backup}")
-            return recovered
-    except Exception as backup_exc:
-        log_storage_warning(f"Could not read JSON backup {backup}: {backup_exc}")
+        return data
+    if expected_type is not None and issue is not None:
+        raise ValueError(f"Could not recover {path} from its primary file or backup: {issue}") from issue
     return default
 
 
@@ -334,7 +361,9 @@ def write_json_file(path: Path, data: Any) -> None:
                 os.fsync(fh.fileno())
             if path.exists():
                 try:
-                    json.loads(path.read_text(encoding="utf-8-sig"))
+                    old_data = json.loads(path.read_text(encoding="utf-8-sig"))
+                    if type(old_data) is not type(data):
+                        raise ValueError("Unexpected JSON data type")
                 except Exception as exc:
                     log_storage_warning(f"Did not replace good JSON backup with invalid primary {path}: {exc}")
                 else:
@@ -352,9 +381,7 @@ def write_json_file(path: Path, data: Any) -> None:
 
 
 def load_history_records() -> list[Dict[str, Any]]:
-    data = read_json_file(history_path(), [])
-    if not isinstance(data, list):
-        return []
+    data = read_json_file(history_path(), [], list)
     return [migrate_record_thumbnail_paths(record) for record in data if isinstance(record, dict)]
 
 
@@ -363,9 +390,7 @@ def save_history_records(records: list[Dict[str, Any]]) -> None:
 
 
 def load_task_records() -> list[Dict[str, Any]]:
-    data = read_json_file(tasks_path(), [])
-    if not isinstance(data, list):
-        return []
+    data = read_json_file(tasks_path(), [], list)
     return [migrate_record_thumbnail_paths(record) for record in data if isinstance(record, dict)]
 
 
@@ -406,15 +431,14 @@ def normalize_config_data(config_data: Dict[str, Any], default_ffmpeg_args: list
 
 def load_config_data(default_config: Dict[str, Any], default_ffmpeg_args: list[str]) -> Dict[str, Any]:
     cfg = dict(default_config)
-    saved = read_json_file(config_path(), {})
+    saved = read_json_file(config_path(), {}, dict)
     if isinstance(saved, dict):
         cfg.update(saved)
     return normalize_config_data(cfg, default_ffmpeg_args)
 
 
 def load_checksum_records(path: Path) -> Dict[str, Any]:
-    data = read_json_file(path, {})
-    return dict(data) if isinstance(data, dict) else {}
+    return read_json_file(path, {}, dict)
 
 
 def save_checksum_records(path: Path, records: Dict[str, Any]) -> None:
@@ -430,6 +454,12 @@ def _validated_retained_media_records(data: Any) -> Dict[str, Dict[str, Any]]:
     for value in data.values():
         if not isinstance(value, dict) or not isinstance(value.get("path"), str) or not value["path"].strip():
             raise ValueError("A retained video safety record has no valid file location.")
+        if "sha256" in value:
+            digest = value["sha256"]
+            if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError("A completed working copy has an invalid checksum.")
+            records[path_key(value["path"])] = dict(value)
+            continue
         signature = value.get("signature")
         quick = value.get("quick_fingerprint")
         if (
@@ -483,6 +513,8 @@ def task_to_record(task: TaskState) -> Dict[str, Any]:
         "local_input_path": path_value(task.local_input_path),
         "output_path": path_value(task.output_path),
         "nas_path": path_value(task.nas_path),
+        "pending_nas_path": path_value(task.pending_nas_path),
+        "transfer_checksum": task.transfer_checksum,
         "rename_base": task.rename_base,
         "output_ext": task.output_ext,
         "stage": task.stage,
@@ -553,6 +585,8 @@ def record_to_task(record: Dict[str, Any]) -> Optional[TaskState]:
             local_input_path=Path(record["local_input_path"]) if record.get("local_input_path") else None,
             output_path=Path(record["output_path"]) if record.get("output_path") else None,
             nas_path=Path(record["nas_path"]) if record.get("nas_path") else None,
+            pending_nas_path=Path(record["pending_nas_path"]) if record.get("pending_nas_path") else None,
+            transfer_checksum=str(record.get("transfer_checksum") or ""),
             rename_base=str(record.get("rename_base") or original_path.stem),
             output_ext=str(record.get("output_ext") or ".mp4"),
             stage=str(record.get("stage") or STAGE_STOPPED),
@@ -598,6 +632,7 @@ def record_to_task(record: Dict[str, Any]) -> Optional[TaskState]:
             STAGE_WAITING_TRANSFER,
             STAGE_TRANSFERRING,
             STAGE_WAITING,
+            STAGE_COMPLETE,
         }:
             task.stage = STAGE_STOPPED
             task.detail = "Ready to resume after restart."

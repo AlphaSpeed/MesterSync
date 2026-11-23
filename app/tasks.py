@@ -72,6 +72,9 @@ class TaskState:
     conversion_stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
     transfer_stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
     copy_thread_active: bool = False
+    # Reserved destination survives interruption between publishing and verifying a NAS copy.
+    pending_nas_path: Optional[Path] = None
+    transfer_checksum: str = ""
 
     def final_name(self) -> str:
         base = self.rename_base or Path(self.display_name).stem

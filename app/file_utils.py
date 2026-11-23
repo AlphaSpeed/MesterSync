@@ -251,6 +251,10 @@ def free_space_bytes(path: Path) -> Optional[int]:
         return None
 
 
+def file_signature(stat: os.stat_result) -> Tuple[int, int, int, int, int]:
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
 def sha256_file(
     path: Path,
     stop_event: Optional[threading.Event] = None,
@@ -273,11 +277,7 @@ def sha256_file(
                     last_percent = percent
                     progress_callback(percent, processed, total)
         final_stat = path.stat()
-        if (
-            processed != total
-            or final_stat.st_size != initial_stat.st_size
-            or final_stat.st_mtime_ns != initial_stat.st_mtime_ns
-        ):
+        if processed != total or file_signature(final_stat) != file_signature(initial_stat):
             return None
         if progress_callback:
             progress_callback(100, processed, total)

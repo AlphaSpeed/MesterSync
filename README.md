@@ -1,8 +1,12 @@
-# MesterSync 2.3
+# MesterSync 2.3.1
 
 MesterSync is a Windows desktop tool for safely importing, renaming, converting, and transferring video files. It uses FFmpeg for conversion and FFprobe to verify completed media before local working files are removed.
 
 ## Auto and Select import modes
+
+Simple mode starts Import/watching, Conversion, and Transfer together, including when the app reopens in Simple mode. Configure the Importfolder, Output folder, FFmpeg, and NAS destination first. Select the recordings to import. Import has priority, and each validated conversion goes to the transfer queue as soon as it finishes.
+
+If a transfer is interrupted, restore access to the original NAS folder and click **Retry** on the job. MesterSync remembers the destination filename and checks any existing copy against the local output. A checksum mismatch leaves both files available for inspection. Local cleanup starts after verification and a successful History save.
 
 Use the **Auto / Select** switch in the center of the top bar. Both modes show the normal Dashboard until a recording drive is detected with Import/watching enabled. Auto starts importing automatically; Select opens a review of that drive's new videos inside the main view. Switching modes alone does not open review. No processing task for those device videos is created until **Import selected** is clicked.
 

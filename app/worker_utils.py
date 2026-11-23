@@ -13,10 +13,12 @@ def wait_for_conversion_task(
     conversion_enabled: Callable[[], bool],
     pause_event: Event,
     shutdown_event: Event,
+    import_priority_blocks: Callable[[], bool] = lambda: False,
 ) -> Optional[Tuple[str, bool]]:
     with condition:
         while (
             not conversion_queue
+            or import_priority_blocks()
             or (not conversion_enabled() and not any(task_id in force_ids for task_id in conversion_queue))
             or pause_event.is_set()
         ) and not shutdown_event.is_set():

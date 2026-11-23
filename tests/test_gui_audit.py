@@ -342,16 +342,13 @@ class GuiAuditTests(unittest.TestCase):
                     self.assertEqual(source.read_bytes(), b"original video")
 
                 with mock.patch.object(app, "start_all", wraps=app.start_all) as start_all, mock.patch.object(
-                    app, "ensure_workers_running",
+                    app, "ensure_workers_running", side_effect=lambda: setattr(app, "started", True),
                 ) as start_workers, mock.patch.multiple(
-                    app, import_enabled=True, conversion_enabled=True, transfer_enabled=False,
+                    app, started=False, import_enabled=True, conversion_enabled=True, transfer_enabled=False,
                 ):
                     app.update_status()
-                    original_appearance = {
-                        key: (card["outer"].fill, card["outer"].border, card["bar"].cget("style"))
-                        for key, card in app.stage_cards.items()
-                    }
                     check_skip_and_remove(False)
+                    app.pause_event.set()
                     first.eta_seconds = 12
                     app.render_task(first.task_id)
                     app.select_task(first.task_id)
@@ -374,18 +371,20 @@ class GuiAuditTests(unittest.TestCase):
                                     self.assertEqual(app.import_priority_enabled, simple)
                                     self.assertEqual(app.get_config()["import_mode"], "select" if simple else "auto")
                                     self.assertEqual(app.top_control_bar.winfo_manager(), "" if simple else "pack")
-                                    self.assertEqual(app.status_var.get(), "Ready to select" if simple else "Stopped")
-                                    self.assertFalse(app.started)
-                                    self.assertTrue(app.import_enabled and app.conversion_enabled)
-                                    self.assertFalse(app.transfer_enabled)
+                                    self.assertEqual(app.status_var.get(), "Watching" if simple else "Running")
+                                    self.assertTrue(app.started)
+                                    self.assertFalse(app.pause_event.is_set())
+                                    self.assertTrue(app.import_enabled and app.conversion_enabled and app.transfer_enabled)
                                     for control in hidden_controls:
                                         self.assertEqual(bool(control.winfo_manager()), not simple)
                                     for index, (stage, card) in enumerate(app.stage_cards.items(), start=1):
                                         progress = 20 * index + int(simple)
                                         app.update_stage_card(stage, f"{stage}: file {index}", progress, 45)
                                         self.assertEqual(int(card["outer"].cget("height")), 124 if simple else 160)
-                                        self.assertEqual((card["outer"].fill, card["outer"].border,
-                                                          card["bar"].cget("style")), original_appearance[stage])
+                                        self.assertEqual(card["outer"].fill, {
+                                            "import": app.DARK_ORANGE, "conversion": app.DARK_GREEN,
+                                            "transfer": app.DARK_PURPLE,
+                                        }[stage])
                                         self.assertEqual(card["progress"].get(), progress)
                                         self.assertEqual(float(card["bar"].cget("value")), progress)
                                         self.assertEqual(card["percent"].get(), f"{progress}%")
@@ -419,8 +418,15 @@ class GuiAuditTests(unittest.TestCase):
                                         self.assertEqual(saved["import_mode"], "auto")
                                         self.assertFalse(saved["import_priority_enabled"])
                     self.assertLess(heights[True], heights[False])
-                    start_all.assert_not_called()
-                    start_workers.assert_not_called()
+                    self.assertEqual(start_all.call_count, 2)
+                    self.assertEqual(start_workers.call_count, 2)
+                    with mock.patch.object(app, "show_notification") as notice:
+                        app.nas_folder_var.set("")
+                        app.simple_dashboard_btn.invoke()
+                        self.assertFalse(app.simple_dashboard)
+                        self.assertIn("NAS folder is required", notice.call_args.args[0])
+                        self.assertEqual(start_workers.call_count, 2)
+                        app.nas_folder_var.set(str(folder / "nas"))
                     app.clear_task_selection()
                     app.mode_switch.choose("select")
                     app.toggle_import_priority()

@@ -4,7 +4,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
-from file_utils import path_key, sha256_file
+from file_utils import file_signature, path_key, sha256_file
 
 
 QUICK_SAMPLE_BYTES = 2 * 1024 * 1024
@@ -15,14 +15,7 @@ UNCERTAIN_DUPLICATE_REASON = "Duplicate safety check could not read the complete
 
 def _file_signature(path: Path) -> Optional[Tuple[int, int, int, int, int]]:
     try:
-        stat = path.stat()
-        return (
-            int(stat.st_dev),
-            int(stat.st_ino),
-            int(stat.st_size),
-            int(stat.st_mtime_ns),
-            int(stat.st_ctime_ns),
-        )
+        return file_signature(path.stat())
     except OSError:
         return None
 

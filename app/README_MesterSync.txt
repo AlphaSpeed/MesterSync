@@ -1,4 +1,4 @@
-MesterSync 2.3
+MesterSync 2.3.1
 
 Installed use:
 - Open MesterSync from the Start menu or desktop shortcut.
@@ -6,6 +6,8 @@ Installed use:
 - Stop active media work before installing an update.
 
 Notes:
+- Simple mode starts all three stages and gives imports priority. Choose the recordings on the drive, and each finished conversion transfers to the configured NAS.
+- After an interrupted transfer, restore access to the same NAS folder and choose Retry. MesterSync verifies any existing destination and keeps the local files if the checksums differ.
 - Log opens a full-width panel at the bottom of the app. Compact reduces whole-row height and tightens Select cards; Comfortable restores the larger controls and progress layout.
 - Auto starts importing when a recording drive is detected. Select opens review automatically for that drive; the switch alone keeps the normal Dashboard visible.
 - In review, click a card to select it, hover its thumbnail to scrub, or click the thumbnail for fullscreen. Per-video dropdown choices override group presets. Cancel returns to the Dashboard without importing candidates.

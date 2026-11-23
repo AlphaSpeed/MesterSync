@@ -1,3 +1,4 @@
+import hashlib
 import os
 import sys
 import tempfile
@@ -14,6 +15,19 @@ from file_utils import path_key
 
 
 class RetainedMediaTests(unittest.TestCase):
+    def test_locked_working_copy_is_recognized_only_while_its_verified_bytes_match(self):
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(storage, "data_dir", return_value=Path(folder)):
+            path = Path(folder) / "camera.mp4"
+            path.write_bytes(b"first movie")
+            key = path_key(path)
+            expected = hashlib.sha256(path.read_bytes()).hexdigest()
+            storage.save_retained_media_records({key: {"path": str(path), "sha256": expected, "size": 11}})
+            record = storage.load_retained_media_records()[key]
+            cache = {}
+            self.assertTrue(history_utils.retained_media_is_unchanged(path, record, cache, threading.Event()))
+            path.write_bytes(b"other movie")
+            self.assertFalse(history_utils.retained_media_is_unchanged(path, record, cache, threading.Event()))
+
     def test_unchanged_retained_video_is_recognized_after_restart(self):
         with tempfile.TemporaryDirectory() as folder, mock.patch.object(storage, "data_dir", return_value=Path(folder)):
             source = Path(folder) / "converted.mp4"

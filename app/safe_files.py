@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
-from file_utils import force_delete, format_size, free_space_bytes, path_key, sha256_file
+from file_utils import file_signature, force_delete, format_size, free_space_bytes, path_key, sha256_file
 
 
 LogCallback = Callable[[str], None]
@@ -41,9 +41,15 @@ def _delete_windows_file_if_checksum_matches(path: Path, expected: str, log: Log
 
     # GENERIC_READ | DELETE; no sharing; OPEN_EXISTING; sequential read,
     # OPEN_REPARSE_POINT so a replaced symlink cannot redirect cleanup.
-    handle = create_file(str(path), 0x80000000 | 0x00010000, 0, None, 3, 0x08200000, None)
-    if handle == ctypes.c_void_p(-1).value:
+    deadline = time.monotonic() + 2
+    while True:
+        handle = create_file(str(path), 0x80000000 | 0x00010000, 0, None, 3, 0x08200000, None)
+        if handle != ctypes.c_void_p(-1).value:
+            break
         error = ctypes.get_last_error()
+        if error == 32 and time.monotonic() < deadline:  # A preview may still be reading the file.
+            time.sleep(0.1)
+            continue
         if error in (2, 3):  # File/path genuinely absent.
             return True
         log(f"Kept working file because it could not be locked for safe cleanup: {path} ({ctypes.WinError(error)})")
@@ -251,7 +257,7 @@ def copy_file_safely(
             dst.flush()
             os.fsync(dst.fileno())
         final_source_stat = source.stat()
-        if copied != total or final_source_stat.st_size != total or final_source_stat.st_mtime_ns != source_stat.st_mtime_ns:
+        if copied != total or file_signature(final_source_stat) != file_signature(source_stat):
             force_delete(temp)
             log(f"Copy stopped because the source changed while it was being read: {source}")
             return False

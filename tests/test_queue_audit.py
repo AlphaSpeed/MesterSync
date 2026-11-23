@@ -28,6 +28,36 @@ loader.exec_module(app_module)
 
 
 class QueueAuditTests(unittest.TestCase):
+    def test_failed_import_checkpoint_keeps_batch_blocked_without_a_ready_notice(self):
+        task = tasks.TaskState("disk-job", Path("disk.mp4"), "disk.mp4", stage=tasks.STAGE_IMPORTED)
+        app = self.bare_app(task)
+        app.import_condition = threading.Condition()
+        app.import_job_batch = {task.task_id: "batch"}
+        app.import_job_requires_enabled = {task.task_id: True}
+        app.import_enqueue_after_success = set()
+        batch = dict(pending={task.task_id}, blocked=set(), imported=[], conversion_released=False,
+                     disk_batch=True, cancelled=False, ready_notified=False, total=1)
+        app.import_batches = {"batch": batch}
+        app.save_pending_tasks.side_effect = [OSError("disk full"), None]
+        app.complete_import_job(task.task_id, success=True, blocked=False)
+        self.assertFalse(batch["ready_notified"])
+        self.assertEqual(batch["blocked"], {task.task_id})
+        self.assertEqual(task.stage, tasks.STAGE_ERROR)
+        self.assertTrue(app.gui_queue.empty())
+
+    def test_forced_conversion_also_waits_for_prioritized_import(self):
+        condition = threading.Condition()
+        shutdown = threading.Event()
+        waiting = deque(["side-job"])
+        with mock.patch.object(condition, "wait", side_effect=lambda **_: shutdown.set()) as wait:
+            result = worker_utils.wait_for_conversion_task(
+                condition, waiting, set(waiting), set(waiting), lambda: True,
+                threading.Event(), shutdown, lambda: True,
+            )
+        wait.assert_called_once()
+        self.assertIsNone(result)
+        self.assertEqual(list(waiting), ["side-job"])
+
     def test_explicit_in_place_work_bypasses_stopped_queue_without_reordering_it(self):
         ordinary = [f"stopped-{index}" for index in range(1000)]
         waiting = deque([*ordinary, "in-place"])

@@ -39,6 +39,48 @@ loader.exec_module(app_module)
 
 
 class CoreSafetyTests(unittest.TestCase):
+    def test_storage_lock_blocks_a_second_writer_and_releases_on_close(self):
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(os.environ, {"MESTERSYNC_DATA_DIR": value}):
+            with storage.lock_user_storage():
+                self.assertIsNone(storage.lock_user_storage())
+            with storage.lock_user_storage() as acquired:
+                self.assertFalse(acquired.closed)
+
+    def test_wrong_json_type_recovers_backup_and_preserves_it_on_next_write(self):
+        with tempfile.TemporaryDirectory() as value, mock.patch.object(storage, "log_storage_warning"):
+            path = Path(value) / "queue.json"
+            backup = path.with_suffix(".json.bak")
+            path.write_text("{}", encoding="utf-8")
+            backup.write_text('[{"task_id": "existing"}]', encoding="utf-8")
+            expected = [{"task_id": "existing"}]
+            self.assertEqual(storage.read_json_file(path, [], list), expected)
+            storage.write_json_file(path, expected + [{"task_id": "new"}])
+            self.assertEqual(storage.read_json_file(backup, [], list), expected)
+            path.write_text("corrupt", encoding="utf-8")
+            backup.write_text("corrupt", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Could not recover"):
+                storage.read_json_file(path, [], list)
+            self.assertEqual(path.read_text(), "corrupt")
+
+    def test_missing_drive_root_is_a_retryable_scan_error(self):
+        with tempfile.TemporaryDirectory() as value:
+            with self.assertRaises(FileNotFoundError):
+                importer.scan_drive_importable_videos(Path(value) / "offline", {}, lambda: False, lambda *_: None)
+
+    def test_history_remove_targets_rendered_record_after_a_new_transfer(self):
+        app = self.bare_app()
+        app.task_lock, app.history_lock = threading.RLock(), threading.RLock()
+        app.tasks_save_pending = False
+        old, new = {"display_name": "old"}, {"display_name": "new"}
+        app.history_records = [new, old]
+        app.save_history = mock.Mock()
+        app.cleanup_history_thumbnails = mock.Mock()
+        app.show_notification = mock.Mock()
+        app.refresh_history_view = mock.Mock()
+        app.remove_history_entry(old)
+        self.assertEqual(app.history_records, [new])
+        app.cleanup_history_thumbnails.assert_called_once_with(old)
+
     def bare_app(self):
         app = app_module.MesterSyncApp.__new__(app_module.MesterSyncApp)
         app.shutdown_event = threading.Event()
@@ -801,11 +843,11 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertEqual(ui_performance.bounded_log_count(990, 25, 1000), (15, 1000))
         self.assertEqual(ui_performance.bounded_log_count(1000, 80, 1000), (80, 1000))
 
-    def test_version_is_2_2(self):
-        self.assertEqual(app_module.APP_VERSION, "2.3")
-        self.assertIn('MyAppVersion "2.3"', (ROOT / "packaging" / "MesterSync.iss").read_text(encoding="utf-8"))
-        self.assertTrue((ROOT / "README.md").read_text(encoding="utf-8").startswith("# MesterSync 2.3"))
-        self.assertTrue((APP_DIR / "README_MesterSync.txt").read_text(encoding="utf-8").startswith("MesterSync 2.3"))
+    def test_installer_and_readmes_match_app_version(self):
+        version = app_module.APP_VERSION
+        self.assertIn(f'MyAppVersion "{version}"', (ROOT / "packaging" / "MesterSync.iss").read_text(encoding="utf-8"))
+        self.assertEqual((ROOT / "README.md").read_text(encoding="utf-8").splitlines()[0], f"# MesterSync {version}")
+        self.assertEqual((APP_DIR / "README_MesterSync.txt").read_text(encoding="utf-8").splitlines()[0], f"MesterSync {version}")
 
     def test_launcher_has_python_fallbacks_and_visible_failure_message(self):
         launcher = (APP_DIR / "MesterSync.vbs").read_text(encoding="utf-8-sig").lower()
@@ -1054,7 +1096,8 @@ class CoreSafetyTests(unittest.TestCase):
         canvas.yview_moveto.assert_called_once_with(0)
 
     def test_routine_messageboxes_have_been_removed(self):
-        source = (APP_DIR / "MesterSync.pyw").read_text(encoding="utf-8")
+        # Fatal startup errors are shown before the dashboard exists.
+        source = (APP_DIR / "MesterSync.pyw").read_text(encoding="utf-8").split("def main() -> None:")[0]
         self.assertNotIn("messagebox.showinfo", source)
         self.assertNotIn("messagebox.showwarning", source)
         self.assertNotIn("messagebox.showerror", source)
@@ -1901,11 +1944,13 @@ class CoreSafetyTests(unittest.TestCase):
 
         self.assertIs(app.tasks[task.task_id], task)
         self.assertEqual(task.stage, app_module.STAGE_ERROR)
-        self.assertEqual(pending_snapshots, [set(), {task.task_id}])
+        self.assertEqual(pending_snapshots, [{task.task_id}])
 
     def test_history_clear_and_single_remove_roll_back_when_save_fails(self):
         original = [{"display_name": "one"}, {"display_name": "two"}]
         app = self.bare_app()
+        app.task_lock = threading.RLock()
+        app.tasks_save_pending = False
         app.history_lock = threading.RLock()
         app.history_records = list(original)
         app.show_notification = mock.Mock()
@@ -1919,7 +1964,7 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertEqual(app.history_records, original)
         app.cleanup_history_thumbnails.assert_not_called()
 
-        app.remove_history_entry(0)
+        app.remove_history_entry(original[0])
 
         self.assertEqual(app.history_records, original)
         app.cleanup_history_thumbnails.assert_not_called()

@@ -29,7 +29,7 @@ except Exception:
 from config_defaults import COMMON_VIDEO_EXTENSIONS, DEFAULT_CONFIG, DEFAULT_FFMPEG_ARGS
 from diagnostics import query_video_encoders, run_diagnostics
 from duplicate_ledger import publish_shared_checksum_record, sync_shared_checksum_ledger
-from duplicates import exact_duplicate_reason, quick_fingerprint, remove_missing_checksum_entries
+from duplicates import cached_sha256_file, exact_duplicate_reason, quick_fingerprint, remove_missing_checksum_entries
 from file_utils import (
     ensure_folder,
     file_is_ready,
@@ -91,6 +91,7 @@ from storage import (
     load_checksum_records,
     load_config_data,
     load_history_records,
+    lock_user_storage,
     load_retained_media_records,
     load_task_records,
     normalize_config_data,
@@ -227,9 +228,11 @@ class MesterSyncApp:
         self.history_lock = threading.RLock()
         self.current_process_lock = threading.Lock()
         self.checksum_lock = threading.RLock()
-        self.import_condition = threading.Condition()
-        self.queue_condition = threading.Condition()
-        self.transfer_condition = threading.Condition()
+        # Claiming queue entries and changing their task state must be atomic.
+        # Import priority also consults import state while the conversion queue is locked.
+        self.import_condition = threading.Condition(self.task_lock)
+        self.queue_condition = threading.Condition(self.task_lock)
+        self.transfer_condition = threading.Condition(self.task_lock)
 
         self.config = self.load_config()
         self.settings_built = False
@@ -409,10 +412,13 @@ class MesterSyncApp:
                 name="ThumbnailCleanup",
             ).start(),
         )
-        self.log("Ready. Use Add files." if self.simple_dashboard else "Ready. Use Add files or Start all.")
         self.update_startup_warning()
         if self.required_startup_settings_missing():
             self.root.after(300, self.run_setup_wizard)
+        elif self.simple_dashboard:
+            self.start_simple_workflow()
+        else:
+            self.log("Ready. Use Add files or Start all.")
 
     def bind_keyboard_shortcuts(self) -> None:
         self.keyboard_shortcuts = [
@@ -767,7 +773,10 @@ class MesterSyncApp:
                 write_json_file(config_path(), self.config)
             self.import_priority_enabled = bool(cfg.get("import_priority_enabled", False))
             self.load_checksum_database()
+            entering_simple = not self.simple_dashboard and bool(cfg.get("simple_dashboard"))
             self.refresh_settings_ui_from_config()
+            if entering_simple:
+                self.start_simple_workflow()
             self.update_import_cancel_button()
             self.refresh_import_priority()
             self.saved_settings_snapshot = self.current_settings_snapshot()
@@ -915,6 +924,8 @@ class MesterSyncApp:
             set_wizard_notice("Setup settings saved.", success=True)
             if close_after_save:
                 wizard.destroy()
+            if self.simple_dashboard:
+                self.start_simple_workflow()
         self.button(buttons, "Save and close", lambda: save_setup(True), self.GREEN).pack(side="right")
         self.button(buttons, "Save", lambda: save_setup(False), self.BLUE).pack(side="right", padx=(0, 8))
         self.button(buttons, "Close", wizard.destroy, self.CARD3).pack(side="right", padx=(0, 8))
@@ -1018,8 +1029,8 @@ class MesterSyncApp:
             return
         self.history_save_after_id = None
         with self.history_lock:
-            self.history_save_pending = False
             save_history_records(self.history_records)
+            self.history_save_pending = False
 
     def total_converted_count(self) -> int:
         with self.history_lock:
@@ -1119,20 +1130,22 @@ class MesterSyncApp:
             return
         self.tasks_save_after_id = None
         with self.task_lock:
+            records = [task_to_record(task) for task in self.tasks.values()]
+            # A slower writer must never restore an older queue after a transfer archives it.
+            save_task_records(records)
             self.tasks_save_pending = False
-            records = [
-                task_to_record(task)
-                for task in self.tasks.values()
-                if task.stage not in {STAGE_COMPLETE, STAGE_CONVERTED_OUTPUT}
-            ]
-        save_task_records(records)
 
     def load_pending_tasks(self) -> None:
         records = load_task_records()
         restored = 0
         restored_checksums = 0
+        archived_ids = {item["task_id"] for item in getattr(self, "history_records", [])
+                        if isinstance(item.get("task_id"), str)}
+        remaining = [r for r in records if str(r.get("task_id")) not in archived_ids]
+        if len(remaining) != len(records):
+            save_task_records(remaining)
         with self.task_lock:
-            for record in records:
+            for record in remaining:
                 if not isinstance(record, dict):
                     continue
                 task = record_to_task(record)
@@ -1343,14 +1356,18 @@ class MesterSyncApp:
                     eta_seconds=eta,
                 )
                 self.set_import_progress_snapshot(task_id, f"Import/watching: {phase.lower()} for {path.name}", percent, eta)
-        reason = exact_duplicate_reason(
-            path,
-            cfg,
-            checksum_db,
-            self.import_cancel_requested,
-            on_progress,
-            getattr(self, "duplicate_fingerprint_cache", None),
-        )
+        try:
+            reason = exact_duplicate_reason(
+                path,
+                cfg,
+                checksum_db,
+                self.import_cancel_requested,
+                on_progress,
+                getattr(self, "duplicate_fingerprint_cache", None),
+            )
+        finally:
+            if task_id and progress_phase:
+                self.clear_import_progress_snapshot(task_id)
         if reason:
             return reason
         if shared_issue:
@@ -1569,6 +1586,10 @@ class MesterSyncApp:
             self.emit_progress("conversion", f"Remembering source: {source.name}", percent, eta)
 
         if task.original_checksum:
+            digest = cached_sha256_file(source, getattr(self, "duplicate_fingerprint_cache", None),
+                                        task.conversion_stop_event, on_progress)
+            if digest != task.original_checksum:
+                return False
             with self.checksum_lock:
                 already_remembered = task.original_checksum in self.checksum_db
             if already_remembered:
@@ -2573,6 +2594,19 @@ class MesterSyncApp:
             self.simple_dashboard = not self.simple_dashboard
             self.config["simple_dashboard"] = self.simple_dashboard
         self.apply_simple_dashboard()
+        if self.simple_dashboard:
+            self.start_simple_workflow()
+        self.schedule_config_autosave()
+
+    def start_simple_workflow(self) -> None:
+        if self.start_all():
+            self.update_status()
+            return
+        # Keep the controls accessible when folder or encoder setup needs attention.
+        with self.config_lock:
+            self.simple_dashboard = False
+            self.config["simple_dashboard"] = False
+        self.apply_simple_dashboard()
         self.schedule_config_autosave()
 
     def apply_simple_dashboard(self) -> None:
@@ -3298,7 +3332,8 @@ class MesterSyncApp:
                     task.ffmpeg_args = list(task.pending_conversion_args)
                     task.pending_conversion_args = None
                     task.preset_name, task.output_ext = "Custom · this video", detect_output_extension(task.ffmpeg_args)
-                    task.output_path = task.nas_path = None
+                    task.output_path = task.nas_path = task.pending_nas_path = None
+                    task.transfer_checksum = ""
                     task.output_size = task.converted_at = task.transferred_at = task.eta_seconds = None
                     task.output_validated = task.conversion_started = task.skipped = False
                     task.stage, task.progress, task.error_log, task.detail = STAGE_QUEUED, 0, "", "Restarting with new settings"
@@ -4073,12 +4108,20 @@ class MesterSyncApp:
     def flush_pending_tasks_from_timer(self) -> None:
         self.tasks_save_after_id = None
         if self.tasks_save_pending:
-            self.save_pending_tasks(force=True)
+            try:
+                self.save_pending_tasks(force=True)
+            except OSError as exc:
+                self.emit_log(f"Queue save failed. Retrying in five seconds: {exc}")
+                self.tasks_save_after_id = self.root.after(5000, self.flush_pending_tasks_from_timer)
 
     def flush_history_from_timer(self) -> None:
         self.history_save_after_id = None
         if self.history_save_pending:
-            self.save_history(force=True)
+            try:
+                self.save_history(force=True)
+            except OSError as exc:
+                self.emit_log(f"History save failed. Retrying in five seconds: {exc}")
+                self.history_save_after_id = self.root.after(5000, self.flush_history_from_timer)
 
     def tick(self) -> None:
         try:
@@ -4332,7 +4375,7 @@ class MesterSyncApp:
         with self.import_progress_lock:
             has_progress = bool(self.import_progress_by_task)
         with self.import_condition:
-            has_queued = bool(self.import_queue)
+            has_queued = bool(self.import_queue or self.current_import_id)
         with self.task_lock:
             has_import_task = any(t.stage in {STAGE_CHECKING, STAGE_IMPORTING, STAGE_STOPPING} or t.copy_thread_active for t in self.tasks.values())
         return bool(has_progress or has_queued or has_import_task)
@@ -4432,7 +4475,7 @@ class MesterSyncApp:
             for task in self.tasks.values():
                 if task.skipped or self.duplicate_review_required(task) or task.task_id == self.current_conversion_id or task.task_id in self.queued_conversion_ids:
                     continue
-                if task.output_path and task.output_path.exists():
+                if task.pending_nas_path or task.nas_path or (task.output_path and task.output_path.exists()):
                     continue
                 if task.stage not in recoverable_stages:
                     continue
@@ -4453,15 +4496,23 @@ class MesterSyncApp:
         candidates: List[str] = []
         with self.task_lock:
             for task in self.tasks.values():
-                if task.skipped or self.duplicate_review_required(task) or task.task_id == self.current_transfer_id or task.task_id in self.queued_transfer_ids:
+                if (task.skipped or self.duplicate_review_required(task)
+                        or task.task_id in {self.current_transfer_id, self.current_conversion_id}
+                        or task.task_id in self.queued_transfer_ids):
                     continue
-                if task.stage not in {STAGE_CONVERTED, STAGE_WAITING_TRANSFER, STAGE_TRANSFERRING, STAGE_STOPPED}:
+                if task.stage not in {STAGE_CONVERTED, STAGE_CONVERTED_OUTPUT, STAGE_CONVERTED_IN_PLACE,
+                                      STAGE_WAITING_TRANSFER, STAGE_TRANSFERRING, STAGE_STOPPED}:
                     continue
                 if task.output_path and task.output_path.exists():
                     candidates.append(task.task_id)
         for task_id in candidates:
-            if self.tasks[task_id].convert_in_place:
+            task = self.tasks.get(task_id)
+            if not task:
+                continue
+            if task.convert_in_place:
                 self.finalize_convert_in_place(task_id)
+            elif task.stage == STAGE_CONVERTED_OUTPUT:
+                self.finalize_converted_only(task_id)
             elif self.transfer_enabled:
                 self.enqueue_transfer(task_id)
             else:
@@ -4620,14 +4671,14 @@ class MesterSyncApp:
         else:
             self.start_all()
 
-    def start_all(self) -> None:
+    def start_all(self) -> bool:
         try:
             self.set_config_from_ui()
             cfg = self.get_config()
             folder_errors = [
                 validate_writable_folder(str(cfg.get("input_folder", "")), "Importfolder"),
                 validate_writable_folder(str(cfg.get("output_folder", "")), "Output folder"),
-                validate_writable_folder(str(cfg.get("nas_folder", "")), "NAS folder", required=False),
+                validate_writable_folder(str(cfg.get("nas_folder", "")), "NAS folder", required=self.simple_dashboard),
             ]
             folder_errors.extend(media_folder_overlap_errors(
                 cfg.get("input_folder", ""),
@@ -4637,29 +4688,39 @@ class MesterSyncApp:
             folder_errors = [error for error in folder_errors if error]
             if folder_errors:
                 self.show_notification("MesterSync cannot safely start with these folders:\n" + "\n".join(f"- {error}" for error in folder_errors), "error")
-                return
+                return False
             ffmpeg_value = str(cfg.get("ffmpeg_path", "")).strip()
             ffmpeg = Path(ffmpeg_value) if ffmpeg_value else None
             conversion_allowed = bool(ffmpeg and ffmpeg.is_file())
             if not conversion_allowed:
+                if self.simple_dashboard:
+                    self.show_notification("Choose FFmpeg.exe in Settings before starting Simple mode.", "error")
+                    return False
                 shown_path = str(ffmpeg) if ffmpeg else "Not configured"
                 if not messagebox.askyesno(
                     APP_NAME,
                     f"FFmpeg was not found at:\n{shown_path}\n\nStart importing without conversion?",
                 ):
-                    return
+                    return False
             transfer_allowed = bool(str(cfg.get("nas_folder", "")).strip())
         except Exception as exc:
             self.show_notification(f"Could not start safely: {exc}\nCheck that the configured folders are writable and not protected system folders.", "error")
-            return
+            return False
+        with self.task_lock:
+            start_conversion = conversion_allowed and not self.conversion_enabled
+            start_transfer = not self.transfer_enabled
+            self.import_cancel_requested.clear()
+            self.import_enabled = True
+            self.transfer_enabled = transfer_allowed
+            self.conversion_enabled = conversion_allowed
+            self.pause_event.clear()
+            if start_conversion:
+                self.queue_ready_conversions()
+        if start_transfer:
+            self.queue_recoverable_transfers()
         self.ensure_workers_running()
-        self.import_cancel_requested.clear()
-        self.import_enabled = True
-        self.conversion_enabled = conversion_allowed
-        self.transfer_enabled = transfer_allowed
-        self.pause_event.clear()
-        self.queue_ready_conversions()
-        self.queue_recoverable_transfers()
+        if not self.import_priority_blocks_conversion():
+            self.resume_current_process()
         with self.import_condition:
             self.import_condition.notify_all()
         with self.queue_condition:
@@ -4671,6 +4732,7 @@ class MesterSyncApp:
         else:
             self.log("Started all services." if transfer_allowed else "Started import/conversion. Transfer is off because no NAS folder is configured.")
         self.emit_status()
+        return True
 
     def stop_all(self) -> None:
         self.import_enabled = False
@@ -4721,7 +4783,8 @@ class MesterSyncApp:
             return
         if self.pause_event.is_set():
             self.pause_event.clear()
-            self.resume_current_process()
+            if not self.import_priority_blocks_conversion():
+                self.resume_current_process()
             self.log("Resumed.")
         else:
             self.pause_event.set()
@@ -5077,7 +5140,9 @@ class MesterSyncApp:
         return folders
 
     def collect_final_name_snapshot(self) -> List[Tuple[str, str]]:
-        names: List[Tuple[str, str]] = []
+        with self.task_lock:
+            names = [(path_key(t.pending_nas_path), t.pending_nas_path.name)
+                     for t in getattr(self, "tasks", {}).values() if t.pending_nas_path]
         for folder in self.final_name_folders():
             try:
                 if folder.exists():
@@ -5181,8 +5246,9 @@ class MesterSyncApp:
                     missing = not path.exists()
                 except OSError:
                     missing = False
-                if missing:
-                    self.cleanup_path_keys.discard(path_key(path))
+                key = path_key(path)
+                if missing or key in getattr(self, "retained_watchfolder_files", {}):
+                    self.cleanup_path_keys.discard(key)
 
     def remember_retained_media(self, *paths: Optional[Path]) -> None:
         """Persist unchanged-file exclusions independently of the visible History."""
@@ -5196,6 +5262,11 @@ class MesterSyncApp:
             records[path_key(path)] = record
         if not records:
             return
+        self.save_retained_identities(records)
+        with self.task_lock:
+            self.cleanup_path_keys.difference_update(records)
+
+    def save_retained_identities(self, records: Dict[str, Dict[str, Any]]) -> None:
         with self.retained_media_lock:
             if self.retained_media_load_issue:
                 # Never overwrite an unreadable existing safety database.
@@ -5205,12 +5276,6 @@ class MesterSyncApp:
             merged.update(records)
             save_retained_media_records(merged)
             self.retained_watchfolder_files = merged
-        # Do not acquire task_lock while holding retained_media_lock: a recovery
-        # action may already own task_lock when it finalizes an in-place video.
-        with self.task_lock:
-            # The signature/content check now owns these paths. A different
-            # recording reusing either filename must still be discovered.
-            self.cleanup_path_keys.difference_update(records)
 
     def update_task(self, task_id: str, **kwargs: Any) -> None:
         should_save = False
@@ -5816,7 +5881,8 @@ class MesterSyncApp:
         return ""
 
     def ordered_task_ids(self) -> List[str]:
-        return [tid for tid in self.tasks.keys() if tid in self.tasks]
+        with self.task_lock:
+            return list(self.tasks)
 
     def update_selection_visuals(self) -> None:
         for tid, row in self.row_widgets.items():
@@ -6611,14 +6677,13 @@ class MesterSyncApp:
                 "ready_notified": False,
                 "total": len(accepted),
             }
-            for _src, task_id in accepted:
+            for position, (_src, task_id) in enumerate(accepted, start=1):
+                self.update_task(task_id, stage=STAGE_DETECTED, detail=f"Waiting for import ({position}/{len(accepted)})", progress=0)
                 self.import_queue.append(task_id)
                 self.queued_import_ids.add(task_id)
                 self.import_job_requires_enabled[task_id] = require_import_enabled
                 self.import_job_batch[task_id] = batch_id
             self.import_condition.notify_all()
-        for position, (_src, task_id) in enumerate(accepted, start=1):
-            self.update_task(task_id, stage=STAGE_DETECTED, detail=f"Waiting for import ({position}/{len(accepted)})", progress=0)
         self.emit_status()
         return batch_id
 
@@ -6652,15 +6717,15 @@ class MesterSyncApp:
                         continue
                     self.import_queue.remove(task_id)
                     self.queued_import_ids.discard(task_id)
+                    self.current_import_id = task_id
                     break
             if not task_id or self.shutdown_event.is_set():
                 continue
             task = self.tasks.get(task_id)
-            if not task or task.skipped:
-                self.complete_import_job(task_id, success=False, blocked=False)
-                continue
-            self.current_import_id = task_id
             try:
+                if not task or task.skipped:
+                    self.complete_import_job(task_id, success=False, blocked=False)
+                    continue
                 cfg = self.get_config()
                 source = task.original_path
                 if task.force_import:
@@ -6691,7 +6756,7 @@ class MesterSyncApp:
                 self.complete_import_job(task_id, success=import_success, blocked=import_blocked)
             except Exception as exc:
                 self.update_task(task_id, stage=STAGE_ERROR, detail=f"Import worker error: {exc}", error_log=traceback.format_exc())
-                self.emit_log(f"Import worker error for {task.display_name}: {exc}")
+                self.emit_log(f"Import worker error for {task.display_name if task else task_id}: {exc}")
                 self.complete_import_job(task_id, success=False, blocked=True)
             finally:
                 self.current_import_id = None
@@ -6749,6 +6814,15 @@ class MesterSyncApp:
         conversions: List[str] = []
         ready_notice: Optional[Dict[str, str]] = None
         enqueue_now = False
+        if success or blocked:
+            try:
+                self.save_pending_tasks(force=True)
+            except OSError as exc:
+                success, blocked = False, True
+                self.update_task(task_id, stage=STAGE_ERROR,
+                                 detail=f"Import state could not be saved. Keep the recording disk connected. {exc}")
+                self.emit_log(f"Could not save import state for {task_id}: {exc}")
+                self.save_pending_tasks()
         with self.import_condition:
             batch_id = self.import_job_batch.get(task_id, "")
             batch = self.import_batches.get(batch_id)
@@ -6757,6 +6831,8 @@ class MesterSyncApp:
             self.import_job_requires_enabled.pop(task_id, None)
             if batch:
                 batch["pending"].discard(task_id)
+                if not success and not blocked:
+                    batch["cancelled"] = True
                 if success and task_id not in batch["imported"]:
                     batch["imported"].append(task_id)
                     if batch["conversion_released"]:
@@ -6769,10 +6845,6 @@ class MesterSyncApp:
                 conversions, ready_notice = self.import_batch_actions_locked(batch_id)
             else:
                 self.import_job_batch.pop(task_id, None)
-        if success or blocked:
-            # A verified import or a review/error state must be durable before a
-            # recording disk can be declared ready to remove.
-            self.save_pending_tasks(force=True)
         if conversions:
             self.queue_imported_batch_for_conversion(conversions)
         elif enqueue_now and success:
@@ -6960,9 +7032,6 @@ class MesterSyncApp:
             if not current_task:
                 self.emit_log(f"Imported copy was kept because its dashboard task was removed: {target}")
                 return
-            if self.import_cancel_requested.is_set() or stop_event.is_set():
-                self.update_task(task_id, stage=STAGE_STOPPED, detail="Import cancelled after copy; conversion was not queued", progress=100)
-                return
             with self.task_lock:
                 task = self.tasks.get(task_id)
                 if not task:
@@ -6973,6 +7042,11 @@ class MesterSyncApp:
                 task.original_checksum = copied_digest
                 task.import_verified = False
                 self.task_by_path[path_key(target)] = task_id
+            self.save_pending_tasks(force=True)
+            if self.import_cancel_requested.is_set() or stop_event.is_set():
+                self.update_task(task_id, stage=STAGE_SKIPPED if task.skipped else STAGE_STOPPED,
+                                 detail="Import stopped after copy. Resume will verify the local file.", progress=100)
+                return
             if copied_digest:
                 verify_start = time.time()
                 def on_verify_progress(percent: int, checked: int, total: int) -> None:
@@ -6980,7 +7054,8 @@ class MesterSyncApp:
                     eta = (elapsed / percent * (100 - percent)) if percent > 0 else None
                     self.set_import_progress_snapshot(task_id, f"Import/watching: verifying copy of {src.name}", percent, eta)
                     self.update_task(task_id, stage=STAGE_IMPORTING, progress=percent, detail=f"Verifying imported copy {format_size(checked)} / {format_size(total)}", eta_seconds=eta)
-                verified_digest = sha256_file(target, stop_event, on_verify_progress)
+                verified_digest = cached_sha256_file(target, getattr(self, "duplicate_fingerprint_cache", None),
+                                                     stop_event, on_verify_progress)
                 if not verified_digest or verified_digest != copied_digest:
                     error = "Imported copy could not be verified. Both files were kept; Retry will verify the local copy before conversion."
                     self.update_task(task_id, stage=STAGE_ERROR, detail=error, progress=0, error_log=f"Checksum verification failed for imported copy: {target}")
@@ -7127,10 +7202,16 @@ class MesterSyncApp:
                 if key in self.skipped_path_keys:
                     continue
                 with self.task_lock:
-                    retained = getattr(self, "retained_watchfolder_files", {}).get(key)
-                    if retained and retained_media_is_unchanged(
-                        path, retained, getattr(self, "duplicate_fingerprint_cache", {}), self.shutdown_event
-                    ):
+                    if key in self.task_by_path or key in getattr(self, "cleanup_path_keys", set()):
+                        continue
+                retained = getattr(self, "retained_watchfolder_files", {}).get(key)
+                if retained and retained_media_is_unchanged(
+                    path, retained, getattr(self, "duplicate_fingerprint_cache", {}), self.shutdown_event
+                ):
+                    continue
+                with self.task_lock:
+                    # Cleanup may have finished while we checked an older identity.
+                    if retained is not getattr(self, "retained_watchfolder_files", {}).get(key):
                         continue
                     if (
                         key in self.task_by_path
@@ -7139,11 +7220,19 @@ class MesterSyncApp:
                         or key in getattr(self, "reserved_output_paths", set())
                     ):
                         continue
-                task_id = self.create_task(path, stage=STAGE_CHECKING, imported=True, new_only=True)
+                    # The directory listing can predate a just-finished transfer and cleanup.
+                    if not path.is_file():
+                        continue
+                    task_id = self.create_task(path, stage=STAGE_CHECKING, imported=True, new_only=True)
                 if not task_id:
                     continue
                 self.update_task(task_id, progress=0, detail="Checking Importfolder file against duplicate history")
-                duplicate_reason = self.duplicate_reason_for(path, cfg, task_id)
+                try:
+                    duplicate_reason = self.duplicate_reason_for(path, cfg, task_id)
+                except Exception as exc:
+                    self.update_task(task_id, stage=STAGE_ERROR, detail=f"Importfolder check failed: {exc}")
+                    self.emit_log(f"Could not check {path}: {exc}")
+                    continue
                 count += 1
                 if duplicate_reason:
                     self.update_task(
@@ -7219,15 +7308,23 @@ class MesterSyncApp:
                 continue
             cfg = self.get_config()
             try:
-                self.scan_existing_input_as_detected()
+                try:
+                    self.scan_existing_input_as_detected()
+                except Exception as exc:
+                    self.emit_log(f"Importfolder scan failed; will retry: {exc}")
                 drives = list_candidate_drives(cfg.get("ignored_drives", []))
                 current_ids = {d for _, d in drives}
                 self.update_connected_drive_memory(current_ids)
                 for root, drive_id in drives:
                     if drive_id in self.processed_drive_ids:
                         continue
-                    self.processed_drive_ids.add(drive_id)
-                    self.import_drive(Path(root), drive_id)
+                    try:
+                        self.import_drive(Path(root), drive_id)
+                    except Exception as exc:
+                        self.emit_log(f"Drive scan failed for {root}; will retry: {exc}")
+                    else:
+                        if self.import_enabled:
+                            self.processed_drive_ids.add(drive_id)
             except Exception as exc:
                 self.emit_log(f"Drive monitor error: {exc}")
             self.shutdown_event.wait(max(1, int(cfg.get("scan_interval_seconds", 3))))
@@ -7290,6 +7387,8 @@ class MesterSyncApp:
                 return
             for src in found:
                 if not self.import_enabled or self.import_cancel_requested.is_set() or self.shutdown_event.is_set():
+                    for _, task_id in queued_items:
+                        self.update_task(task_id, stage=STAGE_STOPPED, detail="Disk import stopped before copying")
                     return
                 task_id = self.create_task(src, stage=STAGE_DETECTED, imported=False, generate_thumbnail=False, new_only=True)
                 if not task_id:
@@ -7297,27 +7396,26 @@ class MesterSyncApp:
                 self.update_task(task_id, detail="Waiting for import check...", progress=0)
                 queued_items.append((src, task_id))
             self.queue_import_batch(queued_items, True, str(root), disk_batch=True, source_id=drive_id)
-            self.emit_log(f"Queued {total} video(s) from {root}. Imports will run one at a time.")
+            self.emit_log(f"Queued {len(queued_items)} of {total} video(s) from {root}. Imports will run one at a time.")
         finally:
             self.clear_import_progress_snapshot(scan_progress_id)
 
     # ---------------- conversion ----------------
     def enqueue_conversion(self, task_id: str, force: bool = False) -> None:
-        task = self.tasks.get(task_id)
-        if not task or task.skipped or self.keep_duplicate_for_review(task):
-            return
         with self.queue_condition:
+            task = self.tasks.get(task_id)
+            if not task or task.skipped or self.keep_duplicate_for_review(task):
+                return
             if task_id == getattr(self, "current_conversion_id", None) or task_id in self.queued_conversion_ids:
                 return
             task.conversion_stop_event = threading.Event()
             if force:
                 self.force_conversion_ids.add(task_id)
-            if task_id not in self.queued_conversion_ids:
-                self.conversion_queue.append(task_id)
-                self.queued_conversion_ids.add(task_id)
-                self.queue_condition.notify_all()
-        detail = "Waiting for in-place conversion" if force else "Waiting for conversion"
-        self.update_task(task_id, stage=STAGE_QUEUED, detail=detail, progress=0)
+            detail = "Waiting for in-place conversion" if force else "Waiting for conversion"
+            self.update_task(task_id, stage=STAGE_QUEUED, detail=detail, progress=0)
+            self.conversion_queue.append(task_id)
+            self.queued_conversion_ids.add(task_id)
+            self.queue_condition.notify_all()
 
     def move_to_top(self, task_id: str) -> None:
         self.set_task_priority_index(task_id, 0)
@@ -7370,32 +7468,31 @@ class MesterSyncApp:
 
     def conversion_worker(self) -> None:
         while not self.shutdown_event.is_set():
-            next_item = wait_for_conversion_task(
-                self.queue_condition,
-                self.conversion_queue,
-                self.queued_conversion_ids,
-                self.force_conversion_ids,
-                lambda: self.conversion_enabled and not self.import_priority_blocks_conversion(),
-                self.pause_event,
-                self.shutdown_event,
-            )
-            if next_item is None:
-                continue
-            task_id, _force = next_item
-            with self.task_lock:
+            with self.queue_condition:
+                next_item = wait_for_conversion_task(
+                    self.queue_condition,
+                    self.conversion_queue,
+                    self.queued_conversion_ids,
+                    self.force_conversion_ids,
+                    lambda: self.conversion_enabled,
+                    self.pause_event,
+                    self.shutdown_event,
+                    self.import_priority_blocks_conversion,
+                )
+                if next_item is None:
+                    continue
+                task_id, _force = next_item
                 task = self.tasks.get(task_id)
                 if not task or task.skipped or self.keep_duplicate_for_review(task):
-                    with self.queue_condition:
-                        self.force_conversion_ids.discard(task_id)
+                    self.force_conversion_ids.discard(task_id)
                     continue
                 # A one-video editor must finish saving before this worker owns
                 # the task and snapshots its encoding parameters.
                 # A restart can replace a ticket already popped by this worker.
                 # Claim that replacement too so it cannot run a second time.
-                with self.queue_condition:
-                    while task_id in self.conversion_queue:
-                        self.conversion_queue.remove(task_id)
-                    self.queued_conversion_ids.discard(task_id)
+                while task_id in self.conversion_queue:
+                    self.conversion_queue.remove(task_id)
+                self.queued_conversion_ids.discard(task_id)
                 self.current_conversion_id = task_id
             try:
                 self.convert_task(task_id)
@@ -7426,23 +7523,27 @@ class MesterSyncApp:
 
     def prepare_conversion_source(self, task: TaskState, source: Path, cfg: Dict[str, Any]) -> bool:
         """Complete interrupted verification and claim watched originals before FFmpeg."""
-        if task.convert_in_place or task.import_verified:
+        if task.convert_in_place:
             return True
         is_copy = bool(task.local_input_path and path_key(source) != path_key(task.original_path))
-        if not is_copy and not task.force_import:
+        if not task.import_verified and not is_copy and not task.force_import:
             reason = self.duplicate_reason_for(source, cfg, task.task_id)
             if reason:
                 self.update_task(task.task_id, stage=STAGE_DUPLICATE_REVIEW, duplicate=True,
                                  duplicate_reason=reason, detail=reason)
                 return False
         self.update_task(task.task_id, detail="Verifying source before conversion")
-        digest = sha256_file(source, task.import_stop_event)
-        if not digest or (is_copy and digest != task.original_checksum):
+        digest = cached_sha256_file(source, getattr(self, "duplicate_fingerprint_cache", None), task.conversion_stop_event)
+        if task.skipped or self.shutdown_event.is_set() or task.conversion_stop_event.is_set():
+            self.update_task(task.task_id, stage=STAGE_SKIPPED if task.skipped else STAGE_STOPPED,
+                             detail="Source verification stopped")
+            return False
+        if not digest or ((is_copy or task.import_verified) and digest != task.original_checksum):
             self.update_task(task.task_id, stage=STAGE_ERROR,
                              detail="Local source could not be verified. Files were kept; check the original recording.")
             return False
-        if task.skipped or self.shutdown_event.is_set() or task.import_stop_event.is_set():
-            return False
+        if task.import_verified:
+            return True
         size = source.stat().st_size
         task.original_checksum = digest
         task.imported_size = size
@@ -7479,7 +7580,7 @@ class MesterSyncApp:
             error = self.validate_converted_output(task.output_path, source, ffmpeg, args, duration)
         if error:
             retry_detail = ""
-            if duration:
+            if duration and not (task.nas_path or task.pending_nas_path):
                 previous_output = task.output_path
                 try:
                     self.remember_retained_media(previous_output)
@@ -7508,7 +7609,7 @@ class MesterSyncApp:
                     or (not self.conversion_enabled and not task.convert_in_place))
 
         def wait_for_resume() -> None:
-            while self.pause_event.is_set() and not cancelled():
+            while not cancelled() and (self.pause_event.is_set() or self.import_priority_blocks_conversion()):
                 self.shutdown_event.wait(0.2)
 
         if cancelled():
@@ -7687,7 +7788,7 @@ class MesterSyncApp:
                     self.update_task(
                         task_id,
                         stage=STAGE_ERROR,
-                        detail="Conversion finished, but the source fingerprint could not be saved. Output and source were both kept.",
+                        detail="Conversion finished, but the source fingerprint could not be verified or saved. Output and source were kept.",
                         progress=100,
                         output_path=None,
                         output_size=output_size,
@@ -7699,15 +7800,12 @@ class MesterSyncApp:
                     self.record_session_saved_bytes(saved_bytes)
                 self.record_session_stat("converted")
                 self.update_task(task_id, stage=STAGE_CONVERTED, converted_at=now_iso(), progress=100, detail=space_savings, output_path=output_path, output_size=output_size, imported_size=source_size, space_savings=space_savings, eta_seconds=0, output_validated=True)
+                self.save_pending_tasks(force=True)
                 self.emit_log(f"Conversion complete: {output_path.name} | {space_savings}")
                 if task.convert_in_place:
                     self.finalize_convert_in_place(task_id)
                 else:
                     self.after_conversion(task_id)
-                if task_id in self.tasks:
-                    # Persist the output path and its next stage immediately. A
-                    # restart can then resume transfer without reconverting.
-                    self.save_pending_tasks(force=True)
             else:
                 force_delete(temp_output)
                 msg = " | ".join(last_lines[-4:]) if last_lines else f"Return code {code}"
@@ -7739,7 +7837,8 @@ class MesterSyncApp:
         task = self.tasks.get(task_id)
         if not task or not task.output_path:
             return
-        if self.transfer_enabled:
+        if self.transfer_enabled or getattr(self, "simple_dashboard", False):
+            # A stop racing the end of a Simple-mode encode must leave its NAS transfer recoverable.
             self.enqueue_transfer(task_id)
         else:
             self.emit_log(f"Transfer is disabled; keeping converted file in output folder: {task.output_path.name}")
@@ -7747,6 +7846,10 @@ class MesterSyncApp:
 
     def finalize_converted_only(self, task_id: str) -> None:
         task = self.tasks.get(task_id)
+        if task and (task.pending_nas_path or task.nas_path):
+            self.update_task(task_id, stage=STAGE_WAITING_TRANSFER,
+                             detail="Enable Transfer to finish checking the recorded NAS destination.")
+            return
         if task and task.convert_in_place:
             self.finalize_convert_in_place(task_id)
             return
@@ -7769,6 +7872,7 @@ class MesterSyncApp:
             task.stage = STAGE_CONVERTED_OUTPUT
             task.detail = "Converted to output folder; not transferred"
             task.progress = 100
+            self.save_pending_tasks(force=True)
             self.update_checksum_final_path(task, task.output_path)
             self.hold_paths_during_completed_cleanup(working_input)
             self.archive_task(task_id, status="converted_only")
@@ -7802,37 +7906,35 @@ class MesterSyncApp:
 
     # ---------------- transfer ----------------
     def enqueue_transfer(self, task_id: str) -> None:
-        with self.task_lock:
+        with self.transfer_condition:
             task = self.tasks.get(task_id)
             if not task or task.skipped or self.keep_duplicate_for_review(task):
                 return
             if task_id == self.current_transfer_id or task_id in self.queued_transfer_ids:
                 return
-            if task and task_id != self.current_transfer_id and task.transfer_stop_event.is_set():
+            if task.transfer_stop_event.is_set():
                 task.transfer_stop_event = threading.Event()
-        if task.convert_in_place:
-            self.finalize_convert_in_place(task_id)
-            return
-        with self.transfer_condition:
-            if task_id not in self.queued_transfer_ids:
+            if not task.convert_in_place:
+                self.update_task(task_id, stage=STAGE_WAITING_TRANSFER, detail="Waiting for transfer", progress=100)
                 self.transfer_queue.append(task_id)
                 self.queued_transfer_ids.add(task_id)
                 self.transfer_condition.notify_all()
-        self.update_task(task_id, stage=STAGE_WAITING_TRANSFER, detail="Waiting for transfer", progress=100)
+                return
+        self.finalize_convert_in_place(task_id)
 
     def transfer_worker(self) -> None:
         while not self.shutdown_event.is_set():
-            task_id = wait_for_transfer_task(
-                self.transfer_condition,
-                self.transfer_queue,
-                self.queued_transfer_ids,
-                lambda: self.transfer_enabled,
-                self.pause_event,
-                self.shutdown_event,
-            )
-            if task_id is None:
-                continue
-            with self.task_lock:
+            with self.transfer_condition:
+                task_id = wait_for_transfer_task(
+                    self.transfer_condition,
+                    self.transfer_queue,
+                    self.queued_transfer_ids,
+                    lambda: self.transfer_enabled,
+                    self.pause_event,
+                    self.shutdown_event,
+                )
+                if task_id is None:
+                    continue
                 task = self.tasks.get(task_id)
                 if not task or task.skipped or not task.output_path:
                     continue
@@ -7860,12 +7962,37 @@ class MesterSyncApp:
             self.emit_log(f"Transfer failed because converted file is missing: {source}")
             return
         cfg = self.get_config()
-        nas_folder = Path(cfg["nas_folder"])
-        dest = self.reserve_safe_final_target(task, nas_folder, "reserved_nas_paths")
+        nas_value = str(cfg.get("nas_folder", "")).strip()
+        if not nas_value:
+            self.update_task(task_id, stage=STAGE_ERROR, detail="Choose a NAS folder and retry. The converted file is in Output.")
+            return
+        nas_folder = Path(nas_value)
+        overlap = media_folder_overlap_errors(cfg.get("input_folder", ""), cfg.get("output_folder", ""), nas_value)
+        if overlap:
+            self.update_task(task_id, stage=STAGE_ERROR, detail=" ".join(overlap))
+            return
+        previous_dest = task.nas_path or task.pending_nas_path
+        if previous_dest and path_key(previous_dest.parent) != path_key(nas_folder):
+            self.update_task(task_id, stage=STAGE_ERROR,
+                             detail=f"Restore the NAS folder {previous_dest.parent} to resume this transfer.")
+            return
+        dest = previous_dest or self.reserve_safe_final_target(task, nas_folder, "reserved_nas_paths")
         working_input = task.local_input_path
         try:
+            if any(path and path_key(path) == path_key(dest) for path in (source, working_input, task.original_path)):
+                self.update_task(task_id, stage=STAGE_ERROR, detail=f"The transfer destination overlaps a source file: {dest}")
+                return
+            # Save the intended name before a successful copy can appear on the NAS.
+            # Older tasks may have only nas_path from an already verified transfer.
+            self.update_task(task_id, pending_nas_path=dest, stage=STAGE_TRANSFERRING)
+            self.save_pending_tasks(force=True)
+            reverify = previous_dest is not None and dest.is_file()
+            if (task.transferred_at or task.nas_path) and not reverify:
+                self.update_task(task_id, stage=STAGE_ERROR,
+                                 detail=f"Previously verified NAS file is unavailable. Restore access and retry: {dest}")
+                return
             source_size = source.stat().st_size if source.exists() else 0
-            disk_warning = self.low_disk_warning(dest, source_size, "Transfer", cfg)
+            disk_warning = "" if reverify else self.low_disk_warning(dest, source_size, "Transfer", cfg)
             if disk_warning:
                 if "cannot start" in disk_warning:
                     self.update_task(task_id, stage=STAGE_ERROR, detail=disk_warning, error_log=disk_warning)
@@ -7874,7 +8001,7 @@ class MesterSyncApp:
                 self.update_task(task_id, detail=disk_warning)
                 self.emit_log(disk_warning)
             self.update_task(task_id, stage=STAGE_TRANSFERRING, detail=f"To NAS: {dest.name}", progress=0)
-            self.emit_log(f"Starting NAS transfer: {source.name}")
+            self.emit_log(f"Rechecking recorded NAS destination: {dest}" if reverify else f"Starting NAS transfer: {source.name}")
             start = time.time()
             def on_progress(percent: int, copied: int, total: int) -> None:
                 elapsed = time.time() - start
@@ -7886,7 +8013,12 @@ class MesterSyncApp:
                 nonlocal copied_digest
                 copied_digest = digest
 
-            ok = self.copy_file_safely(source, dest, task.transfer_stop_event, on_progress, on_checksum)
+            if reverify:
+                self.update_task(task_id, detail="Checking local output against the existing NAS file")
+                copied_digest = sha256_file(source, task.transfer_stop_event) or ""
+                ok = bool(copied_digest)
+            else:
+                ok = self.copy_file_safely(source, dest, task.transfer_stop_event, on_progress, on_checksum)
             if not ok:
                 if task.transfer_stop_event.is_set() or task.skipped:
                     self.update_task(task_id, stage=STAGE_SKIPPED if task.skipped else STAGE_STOPPED, detail="Transfer stopped; converted file kept in output folder")
@@ -7917,14 +8049,17 @@ class MesterSyncApp:
             if task.transfer_stop_event.is_set() or task.skipped:
                 self.update_task(task_id, stage=STAGE_SKIPPED if task.skipped else STAGE_STOPPED, detail="NAS verification stopped; local files and NAS copy kept for inspection")
                 return
-            if not copied_digest or not verified_digest or copied_digest != verified_digest:
+            if (not copied_digest or not verified_digest or copied_digest != verified_digest
+                    or (task.transfer_checksum and task.transfer_checksum != verified_digest)):
                 error = "NAS copy failed checksum verification; local files and NAS copy were kept for inspection"
                 self.update_task(task_id, stage=STAGE_ERROR, detail=error, error_log=f"Checksum verification failed for NAS copy: {dest}")
                 self.emit_log(f"{error}: {dest}")
                 return
             self.emit_log(f"Transfer checksum verified on NAS: {dest.name}")
             task.rename_base = dest.stem
-            self.update_task(task_id, stage=STAGE_COMPLETE, progress=100, transferred_at=now_iso(), nas_path=dest, detail=f"Transferred to NAS: {dest.name}", eta_seconds=0)
+            self.update_task(task_id, stage=STAGE_COMPLETE, progress=100, transferred_at=task.transferred_at or now_iso(),
+                             nas_path=dest, transfer_checksum=verified_digest, detail=f"Transferred to NAS: {dest.name}", eta_seconds=0)
+            self.save_pending_tasks(force=True)
             self.update_checksum_final_path(task, dest)
             shared_issue = self.publish_task_to_shared_duplicate_history(task, cfg)
             if shared_issue:
@@ -7953,7 +8088,8 @@ class MesterSyncApp:
                 else:
                     self.emit_log(f"Kept local imported source because safe cleanup could not prove it was unchanged; it will not be converted again this session: {working_input}")
         finally:
-            self.release_nas_target(dest)
+            if previous_dest is None:
+                self.release_nas_target(dest)
             self.release_cleaned_paths(source, working_input)
             self.emit_progress("transfer", "Transfer: idle", 0, None)
 
@@ -8000,8 +8136,10 @@ class MesterSyncApp:
         for p in [task.original_path, task.local_input_path, task.output_path]:
             if p:
                 self.skipped_path_keys.discard(path_key(p))
+        if self.transfer_output_missing(task):
+            return
 
-        if task.output_path and task.output_path.exists() and task.stage in {STAGE_WAITING_TRANSFER, STAGE_STOPPED}:
+        if task.output_path and task.output_path.exists():
             self.ensure_workers_running()
             if task.convert_in_place:
                 self.finalize_convert_in_place(task_id)
@@ -8053,6 +8191,8 @@ class MesterSyncApp:
             self.skipped_path_keys.discard(path_key(task.local_input_path))
         if task.output_path:
             self.skipped_path_keys.discard(path_key(task.output_path))
+        if self.transfer_output_missing(task):
+            return
 
         if task.output_path and task.output_path.exists():
             self.ensure_workers_running()
@@ -8165,6 +8305,8 @@ class MesterSyncApp:
             return
         if self.keep_duplicate_for_review(task):
             return
+        if self.transfer_output_missing(task):
+            return
         self.ensure_workers_running()
         if task.convert_in_place:
             if task.output_path and task.output_path.exists():
@@ -8201,6 +8343,13 @@ class MesterSyncApp:
             self.log(f"Resumed: {task.display_name}")
             return
         self.update_task(task_id, stage=STAGE_ERROR, detail="Resume failed: source file is missing", progress=0)
+
+    def transfer_output_missing(self, task: TaskState) -> bool:
+        if not (task.pending_nas_path or task.nas_path) or (task.output_path and task.output_path.is_file()):
+            return False
+        self.update_task(task.task_id, stage=STAGE_ERROR,
+                         detail=f"Restore the converted output to verify the existing transfer: {task.output_path}")
+        return True
 
     def resume_import_when_ready(self, task_id: str) -> None:
         for _ in range(100):
@@ -8343,8 +8492,18 @@ class MesterSyncApp:
 
     def archive_task(self, task_id: str, status: str) -> None:
         with self.task_lock:
-            if self.tasks.get(task_id) and self.tasks[task_id].pending_conversion_args is not None:
+            task = self.tasks.get(task_id)
+            if not task:
+                return
+            if task.pending_conversion_args is not None:
                 raise RuntimeError("Conversion settings restart requested; existing files kept.")
+        if status in {"transferred", "converted_only"} and task.local_input_path and task.original_checksum:
+            # The copy can survive a lock or crash after archive. Remember only the
+            # verified original bytes, never a replacement now occupying their path.
+            path = task.local_input_path
+            self.save_retained_identities({path_key(path): {
+                "path": str(path), "sha256": task.original_checksum, "size": task.imported_size,
+            }})
         if status == "converted_in_place":
             task = self.tasks.get(task_id)
             if not task:
@@ -8352,33 +8511,9 @@ class MesterSyncApp:
             # Save before releasing task ownership; a crash or cleared History
             # must not turn either intentionally kept file into fresh input.
             self.remember_retained_media(task.local_input_path, task.output_path)
-        with self.task_lock:
-            if self.tasks.get(task_id) and self.tasks[task_id].pending_conversion_args is not None:
-                raise RuntimeError("Conversion settings restart requested; existing files kept.")
-            task = self.tasks.pop(task_id, None)
-            if not task:
-                return
-            for p in [task.original_path, task.local_input_path, task.output_path, task.nas_path]:
-                if p:
-                    self.task_by_path.pop(path_key(p), None)
-        self.remove_import_job(task_id, resolve_batch=True)
-        with self.queue_condition:
-            self.force_conversion_ids.discard(task_id)
-            self.queued_conversion_ids.discard(task_id)
-            try:
-                self.conversion_queue.remove(task_id)
-            except ValueError:
-                pass
-        with self.transfer_condition:
-            self.queued_transfer_ids.discard(task_id)
-            try:
-                self.transfer_queue.remove(task_id)
-            except ValueError:
-                pass
         if status == "skipped":
             detail = "Skipped"
             final_path = ""
-            self.record_session_stat("skipped")
         elif status == "converted_only":
             detail = "Converted to output folder; not transferred"
             final_path = str(task.output_path) if task.output_path else ""
@@ -8388,8 +8523,8 @@ class MesterSyncApp:
         else:
             detail = "Transferred to NAS"
             final_path = str(task.nas_path) if task.nas_path else ""
-            self.record_session_stat("transferred")
         record = {
+            "task_id": task_id,
             "status": status,
             "display_name": task.display_name,
             "final_name": task.final_name(),
@@ -8411,33 +8546,49 @@ class MesterSyncApp:
         if status == "converted_in_place":
             record["retained_media"] = [self.retained_watchfolder_files[path_key(path)]
                                         for path in (task.local_input_path, task.output_path) if path]
-        try:
-            self.save_pending_tasks(force=True)
-            with self.history_lock:
-                self.history_records.insert(0, record)
-                try:
-                    self.save_history(force=True)
-                except Exception:
-                    if self.history_records and self.history_records[0] is record:
+        # Commit History while the job is still owned. If the process exits
+        # before the queue write, startup reconciles the two files by task ID.
+        with self.task_lock:
+            if self.tasks.get(task_id) is not task:
+                return
+            if task.pending_conversion_args is not None:
+                raise RuntimeError("Conversion settings restart requested; existing files kept.")
+            try:
+                with self.history_lock:
+                    self.history_records.insert(0, record)
+                    try:
+                        self.save_history(force=True)
+                    except Exception:
                         self.history_records.pop(0)
-                    raise
-        except Exception:
-            # Atomic file writes preserve the previous files, and restoring the
-            # in-memory task keeps the failure visible/retryable in this session.
-            with self.task_lock:
-                self.tasks[task_id] = task
+                        raise
+            except Exception:
                 task.stage = STAGE_ERROR
                 task.detail = "Could not save completion state; final media was kept"
                 task.skip_archive_due = None
-                for path in (task.original_path, task.local_input_path, task.output_path, task.nas_path):
-                    if path:
-                        self.task_by_path[path_key(path)] = task_id
+                self.emit_task(task_id)
+                self.save_pending_tasks(force=True)
+                raise
+            del self.tasks[task_id]
+            for path in (task.original_path, task.local_input_path, task.output_path, task.nas_path):
+                if path and self.task_by_path.get(path_key(path)) == task_id:
+                    self.task_by_path.pop(path_key(path))
             try:
                 self.save_pending_tasks(force=True)
-            except Exception as recovery_exc:
-                self.emit_log(f"Could not persist restored completion task {task.display_name}: {recovery_exc}")
-            self.emit_task(task_id)
-            raise
+            except Exception as exc:
+                self.emit_log(f"History saved. Retrying queue save for completed {task.display_name}: {exc}")
+                self.save_pending_tasks()
+        self.remove_import_job(task_id, resolve_batch=True)
+        with self.queue_condition:
+            self.force_conversion_ids.discard(task_id)
+            self.queued_conversion_ids.discard(task_id)
+            if task_id in self.conversion_queue:
+                self.conversion_queue.remove(task_id)
+        with self.transfer_condition:
+            self.queued_transfer_ids.discard(task_id)
+            if task_id in self.transfer_queue:
+                self.transfer_queue.remove(task_id)
+        if status in {"skipped", "transferred"}:
+            self.record_session_stat(status)
         self.gui_queue.put(("archive_ui", task_id))
         self.gui_queue.put(("history", None))
 
@@ -8606,8 +8757,8 @@ class MesterSyncApp:
         if status == "skipped" and rec.get("original_delete_pending"):
             tk.Label(btns, text="Deleting original...", bg=bg, fg=self.MUTED, font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 8))
         elif status == "skipped" and rec.get("input_path"):
-            self.small_button(btns, "Delete original file", lambda i=index: self.delete_history_original_file(i), self.RED).pack(side="left", padx=(0, 6))
-        self.small_button(btns, "Remove from history", lambda i=index: self.remove_history_entry(i), self.CARD3).pack(side="left")
+            self.small_button(btns, "Delete original file", lambda: self.delete_history_original_file(rec), self.RED).pack(side="left", padx=(0, 6))
+        self.small_button(btns, "Remove from history", lambda: self.remove_history_entry(rec), self.CARD3).pack(side="left")
         self.history_widgets.append(outer)
 
     def clear_history(self) -> None:
@@ -8620,10 +8771,12 @@ class MesterSyncApp:
             f"Remove all {count} history entries?\n\nThis clears MesterSync's history only. It does not delete any video files.",
         ):
             return
-        with self.history_lock:
+        with self.task_lock, self.history_lock:
             records = list(self.history_records)
             self.history_records.clear()
             try:
+                if self.tasks_save_pending:
+                    self.save_pending_tasks(force=True)
                 self.save_history(force=True)
             except Exception as exc:
                 self.history_records[:] = records
@@ -8634,12 +8787,15 @@ class MesterSyncApp:
         self.refresh_history_view()
         self.show_notification(f"Removed {count} history entr{'y' if count == 1 else 'ies'}. No video files were deleted.", "success")
 
-    def remove_history_entry(self, index: int) -> None:
+    def remove_history_entry(self, record: Dict[str, Any]) -> None:
         removed: Optional[Dict[str, Any]] = None
-        with self.history_lock:
-            if 0 <= index < len(self.history_records):
+        with self.task_lock, self.history_lock:
+            index = next((i for i, row in enumerate(self.history_records) if row is record), None)
+            if index is not None:
                 removed = self.history_records.pop(index)
                 try:
+                    if self.tasks_save_pending:
+                        self.save_pending_tasks(force=True)
                     self.save_history(force=True)
                 except Exception as exc:
                     self.history_records.insert(index, removed)
@@ -8653,11 +8809,10 @@ class MesterSyncApp:
     def history_original_file(self, record: Dict[str, Any]) -> Optional[Path]:
         return recorded_input_file(record, str(self.get_config().get("input_folder", "")))
 
-    def delete_history_original_file(self, index: int) -> None:
+    def delete_history_original_file(self, record: Dict[str, Any]) -> None:
         with self.history_lock:
-            if not 0 <= index < len(self.history_records):
+            if record.get("original_delete_pending") or not any(row is record for row in self.history_records):
                 return
-            record = self.history_records[index]
             candidate = self.history_original_file(record)
         if not candidate:
             self.show_notification("The original file is missing or is no longer inside the recorded import folder.", "warning")
@@ -8670,8 +8825,9 @@ class MesterSyncApp:
         if not messagebox.askyesno(APP_NAME, f"Permanently delete this original import-folder file?\n\n{candidate}\n\nSize: {size_text}"):
             return
         with self.history_lock:
-            if 0 <= index < len(self.history_records) and self.history_records[index] is record:
-                record["original_delete_pending"] = True
+            if not any(row is record for row in self.history_records):
+                return
+            record["original_delete_pending"] = True
         self.refresh_history_view()
         threading.Thread(
             target=self.delete_history_original_worker,
@@ -8701,6 +8857,8 @@ class MesterSyncApp:
 
 
 def main() -> None:
+    session_lock = None
+    root = None
     try:
         if os.name == "nt":
             try:
@@ -8708,14 +8866,25 @@ def main() -> None:
             except Exception:
                 pass
         root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
+        session_lock = lock_user_storage()
+        if session_lock is None:
+            root.withdraw()
+            messagebox.showinfo(APP_NAME, "MesterSync is already open for this data folder.", parent=root)
+            root.destroy()
+            return
         MesterSyncApp(root)
         root.mainloop()
-    except Exception:
+    except Exception as exc:
         try:
             (app_dir() / "mestersync_startup_error.log").write_text(traceback.format_exc(), encoding="utf-8")
         except Exception:
             pass
+        if root is not None:
+            messagebox.showerror(APP_NAME, f"MesterSync could not start.\n\n{exc}", parent=root)
         raise
+    finally:
+        if session_lock is not None:
+            session_lock.close()
 
 
 if __name__ == "__main__":

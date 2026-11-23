@@ -8,10 +8,12 @@ import tempfile
 import threading
 import unittest
 from collections import deque
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
 from test_core_safety import app_module
+import storage
 from tasks import TaskState, STAGE_IMPORTED, STAGE_DUPLICATE_REVIEW, STAGE_CONVERTING, STAGE_ERROR
 from file_utils import path_key
 
@@ -92,6 +94,168 @@ class AppAuditTests(unittest.TestCase):
             "-c:v", "mpeg4", "-c:a", "aac", str(path),
         ], capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def pending_transfer(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        folder = Path(directory.name)
+        patches = ExitStack()
+        self.addCleanup(patches.close)
+        patches.enter_context(mock.patch.dict(os.environ, {"MESTERSYNC_DATA_DIR": str(folder / "state")}))
+        patches.enter_context(mock.patch.object(storage, "_legacy_storage_roots", return_value=[]))
+        app = self.make_app(folder)
+        del app.archive_task
+        del app.save_pending_tasks
+        app.tasks_save_after_id = None
+        app.ensure_output_validated = mock.Mock(return_value=True)
+        app.remove_import_job = mock.Mock()
+        original = folder / "card" / "camera.mp4"
+        local = folder / "imports" / original.name
+        output = folder / "output" / original.name
+        original.write_bytes(b"untouched card original")
+        local.write_bytes(original.read_bytes())
+        output.write_bytes(b"converted recording")
+        task = TaskState("camera", original, original.name, rename_base=original.stem,
+                         local_input_path=local, output_path=output, import_verified=True,
+                         output_validated=True, imported_size=local.stat().st_size,
+                         original_checksum=hashlib.sha256(local.read_bytes()).hexdigest())
+        app.tasks[task.task_id] = task
+        return app, task, folder / "nas" / original.name
+
+    def test_retry_after_metadata_failure_verifies_one_copy_and_archives_once(self):
+        app, task, dest = self.pending_transfer()
+        with mock.patch.object(app_module, "save_retained_media_records", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                app.transfer_task(task.task_id)
+        saved = storage.load_task_records()[0]
+        self.assertEqual(saved["nas_path"], str(dest))
+        self.assertEqual(saved["transfer_checksum"], hashlib.sha256(dest.read_bytes()).hexdigest())
+        self.assertTrue(task.local_input_path.exists() and task.output_path.exists())
+        self.assertFalse(storage.load_history_records())
+        app.update_task(task.task_id, stage=STAGE_ERROR)
+        app.retry_task(task.task_id)
+        self.assertEqual(list(app.transfer_queue), [task.task_id])
+        with mock.patch.object(app, "copy_file_safely", side_effect=AssertionError("recopied completed transfer")):
+            app.transfer_task(task.task_id)
+        self.assertEqual(list(dest.parent.glob("*.mp4")), [dest])
+        self.assertEqual([r["path"] for r in storage.load_history_records()], [str(dest)])
+        self.assertEqual(storage.load_task_records(), [])
+        self.assertEqual(task.original_path.read_bytes(), b"untouched card original")
+        self.assertFalse(task.local_input_path.exists() or task.output_path.exists())
+
+    def test_restart_after_promotion_rejects_changed_destination_and_can_resume(self):
+        app, task, dest = self.pending_transfer()
+        copy = app.copy_file_safely
+        def interrupted_copy(*args):
+            self.assertTrue(copy(*args))
+            raise OSError("interruption after destination appeared")
+        with mock.patch.object(app, "copy_file_safely", side_effect=interrupted_copy):
+            with self.assertRaises(OSError):
+                app.transfer_task(task.task_id)
+        self.assertEqual(storage.load_task_records()[0]["pending_nas_path"], str(dest))
+        app.tasks.clear()
+        app.load_pending_tasks()
+        restored = app.tasks[task.task_id]
+        app.queue_recoverable_transfers()
+        self.assertEqual(list(app.transfer_queue), [task.task_id])
+        output = task.output_path.read_bytes()
+        changed = b"x" * len(output)
+        dest.write_bytes(changed)
+        with mock.patch.object(app, "copy_file_safely", side_effect=AssertionError("unexpected copy")):
+            app.transfer_task(task.task_id)
+            self.assertEqual(restored.stage, STAGE_ERROR)
+            self.assertEqual(task.output_path.read_bytes(), output)
+            self.assertTrue(task.local_input_path.is_file())
+            self.assertEqual(dest.read_bytes(), changed)
+            self.assertFalse(storage.load_history_records())
+            dest.write_bytes(output)
+            app.retry_task(task.task_id)
+            app.transfer_task(task.task_id)
+        self.assertEqual(list(dest.parent.glob("*.mp4")), [dest])
+        self.assertEqual(len(storage.load_history_records()), 1)
+
+    def test_failed_queue_save_after_history_commit_is_reconciled_on_restart(self):
+        app, task, dest = self.pending_transfer()
+        def save_until_archived(records):
+            if not records:
+                raise OSError("disk unavailable")
+            storage.save_task_records(records)
+        with mock.patch.object(app_module, "save_task_records", side_effect=save_until_archived):
+            app.transfer_task(task.task_id)
+        self.assertEqual([r["task_id"] for r in storage.load_task_records()], [task.task_id])
+        app.history_records = storage.load_history_records()
+        app.load_pending_tasks()
+        self.assertFalse(app.tasks)
+        self.assertEqual(storage.load_task_records(), [])
+        self.assertEqual([r["path"] for r in app.history_records], [str(dest)])
+
+    def test_retry_waits_for_a_previously_verified_nas_file_to_return(self):
+        app, task, dest = self.pending_transfer()
+        with mock.patch.object(app_module, "save_history_records", side_effect=OSError("history unavailable")):
+            with self.assertRaises(OSError):
+                app.transfer_task(task.task_id)
+        self.assertEqual(task.stage, STAGE_ERROR)
+        self.assertFalse(storage.load_history_records())
+        # Older pending records only stored nas_path after verifying the transfer.
+        task.pending_nas_path = None
+        dest.rename(dest.with_suffix(".offline"))
+        with mock.patch.object(app, "copy_file_safely", side_effect=AssertionError("replaced verified file")):
+            app.retry_task(task.task_id)
+            app.transfer_task(task.task_id)
+            self.assertEqual(task.stage, STAGE_ERROR)
+            self.assertIn("Restore access", task.detail)
+            self.assertFalse(dest.exists())
+            self.assertTrue(task.local_input_path.exists() and task.output_path.exists())
+            dest.with_suffix(".offline").rename(dest)
+            app.retry_task(task.task_id)
+            app.transfer_task(task.task_id)
+        self.assertEqual([r["path"] for r in storage.load_history_records()], [str(dest)])
+
+    def test_cancel_after_import_copy_keeps_verified_resume_and_watcher_ownership(self):
+        with tempfile.TemporaryDirectory() as value:
+            folder = Path(value)
+            app = self.make_app(folder)
+            src = folder / "card" / "camera.mp4"
+            src.write_bytes(b"card bytes")
+            task = TaskState("cancelled", src, src.name)
+            app.tasks[task.task_id] = task
+            copy = app.copy_file_safely
+            def stop_after_copy(*args):
+                result = copy(*args)
+                task.import_stop_event.set()
+                return result
+            with mock.patch.object(app, "copy_file_safely", side_effect=stop_after_copy):
+                app.import_single_file(src, task.task_id, False)
+            self.assertEqual(task.stage, app_module.STAGE_STOPPED)
+            self.assertFalse(task.import_verified)
+            self.assertEqual(task.local_input_path.read_bytes(), src.read_bytes())
+            self.assertEqual(task.original_checksum, hashlib.sha256(src.read_bytes()).hexdigest())
+            self.assertEqual(app.scan_existing_input_as_detected(), 0)
+
+    def test_changed_verified_working_copy_blocks_conversion(self):
+        app, task, _ = self.pending_transfer()
+        task.local_input_path.write_bytes(b"another camera recording")
+        self.assertFalse(app.prepare_conversion_source(task, task.local_input_path, app.get_config()))
+        self.assertEqual(task.stage, STAGE_ERROR)
+        self.assertEqual(task.original_path.read_bytes(), b"untouched card original")
+
+    def test_scan_error_on_one_drive_allows_next_drive_and_retries_first(self):
+        with tempfile.TemporaryDirectory() as value:
+            app = self.make_app(Path(value))
+            app.processed_drive_ids = set()
+            app.update_connected_drive_memory = mock.Mock()
+            app.scan_existing_input_as_detected = mock.Mock(side_effect=OSError("watch folder offline"))
+            attempts = []
+            def scan(root, drive_id):
+                attempts.append(drive_id)
+                if attempts == ["first"]:
+                    raise OSError("unavailable")
+            app.import_drive = scan
+            with mock.patch.object(app_module, "list_candidate_drives", return_value=[("D:/", "first"), ("E:/", "second")]), \
+                    mock.patch.object(app.shutdown_event, "wait", side_effect=[None, None]), \
+                    mock.patch.object(app.shutdown_event, "is_set", side_effect=[False, False, True]):
+                app.drive_monitor_loop()
+            self.assertEqual(attempts, ["first", "second", "first"])
 
     @unittest.skipUnless(Path(FFMPEG).is_file(), "FFmpeg not available for real-media integration")
     def test_real_import_conversion_transfer_and_rescan_preserve_card(self):
