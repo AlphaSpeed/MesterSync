@@ -110,6 +110,7 @@ class ConversionOptionTests(unittest.TestCase):
             app.force_conversion_ids = set()
             app.shutdown_event, app.pause_event = threading.Event(), threading.Event()
             app.emit_status = mock.Mock()
+            app.emit_progress = mock.Mock()
             app.conversion_queue.append(task.task_id)
             app.queued_conversion_ids.add(task.task_id)
             def convert(tid):
@@ -121,6 +122,7 @@ class ConversionOptionTests(unittest.TestCase):
             with mock.patch.object(app_module, "wait_for_conversion_task", return_value=(task.task_id, False)):
                 app.conversion_worker()
             app.convert_task.assert_called_once()
+            app.emit_progress.assert_called_once_with("conversion", "Conversion: idle", 0, None)
 
     def test_warning_notification_explains_high_bitrate_and_is_not_repeated(self):
         app, task, _ = self.custom_app()

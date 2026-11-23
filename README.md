@@ -1,4 +1,4 @@
-# MesterSync 2.3.1
+# MesterSync 2.3.2
 
 MesterSync is a Windows desktop tool for safely importing, renaming, converting, and transferring video files. It uses FFmpeg for conversion and FFprobe to verify completed media before local working files are removed.
 

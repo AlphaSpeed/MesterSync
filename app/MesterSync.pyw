@@ -127,6 +127,7 @@ from tasks import (
     STAGE_STOPPING,
     STAGE_TRANSFERRING,
     STAGE_WAITING,
+    STAGE_VERIFYING_SOURCE,
     STAGE_WAITING_TRANSFER,
     TaskState,
 )
@@ -192,7 +193,7 @@ class MesterSyncApp:
     ORANGE = "#d87a22"
     HISTORY_YELLOW = "#3a3114"
 
-    ACTIVE_STAGES = {STAGE_CHECKING, STAGE_IMPORTING, STAGE_QUEUED, STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE, STAGE_WAITING_TRANSFER, STAGE_TRANSFERRING, STAGE_DETECTED}
+    ACTIVE_STAGES = {STAGE_CHECKING, STAGE_IMPORTING, STAGE_QUEUED, STAGE_VERIFYING_SOURCE, STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE, STAGE_WAITING_TRANSFER, STAGE_TRANSFERRING, STAGE_DETECTED}
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -4166,6 +4167,7 @@ class MesterSyncApp:
                     STAGE_IMPORTING,
                     STAGE_QUEUED,
                     STAGE_WAITING,
+                    STAGE_VERIFYING_SOURCE,
                     STAGE_CONVERTING,
                     STAGE_CONVERTING_IN_PLACE,
                     STAGE_WAITING_TRANSFER,
@@ -5304,7 +5306,7 @@ class MesterSyncApp:
             return "RowError.Horizontal.TProgressbar"
         if task.stage == STAGE_IMPORTING:
             return "RowImport.Horizontal.TProgressbar"
-        if task.stage in {STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE, STAGE_CONVERTED, STAGE_COMPLETE, STAGE_CONVERTED_OUTPUT}:
+        if task.stage in {STAGE_VERIFYING_SOURCE, STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE, STAGE_CONVERTED, STAGE_COMPLETE, STAGE_CONVERTED_OUTPUT}:
             return "RowConvert.Horizontal.TProgressbar"
         if task.stage in {STAGE_WAITING_TRANSFER, STAGE_TRANSFERRING}:
             return "RowTransfer.Horizontal.TProgressbar"
@@ -5352,7 +5354,7 @@ class MesterSyncApp:
     def task_preset_locked(self, task: TaskState) -> bool:
         """Once conversion has started, the preset is locked because FFmpeg args are already chosen."""
         return bool(getattr(task, "conversion_started", False)) or task.stage in {
-            STAGE_WAITING, STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE, STAGE_CONVERTED, STAGE_CONVERTED_OUTPUT,
+            STAGE_WAITING, STAGE_VERIFYING_SOURCE, STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE, STAGE_CONVERTED, STAGE_CONVERTED_OUTPUT,
             STAGE_WAITING_TRANSFER, STAGE_TRANSFERRING, STAGE_COMPLETE, STAGE_STOPPED, STAGE_ERROR,
         }
 
@@ -5387,7 +5389,7 @@ class MesterSyncApp:
         cache = row["render_cache"]
         selected = view.selected
         is_error = view.stage == STAGE_ERROR
-        active_green = view.stage in {STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE}
+        active_green = view.stage in {STAGE_VERIFYING_SOURCE, STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE}
         skipped_bg = "#221b1e" if view.skipped else None
         error_bg = "#3a1018" if is_error else None
         card_bg = error_bg or (self.DARK_GREEN if active_green else (skipped_bg or self.CARD))
@@ -7503,6 +7505,7 @@ class MesterSyncApp:
                 with self.queue_condition:
                     self.force_conversion_ids.discard(task_id)
                 self.current_conversion_id = None
+                self.emit_progress("conversion", "Conversion: idle", 0, None)
                 self.emit_status()
 
     def get_duration(self, input_path: Path, ffmpeg_path: Path) -> Optional[float]:
@@ -7525,26 +7528,45 @@ class MesterSyncApp:
         """Complete interrupted verification and claim watched originals before FFmpeg."""
         if task.convert_in_place:
             return True
-        is_copy = bool(task.local_input_path and path_key(source) != path_key(task.original_path))
+        # A verified import already identifies its local copy by checksum.
+        # Resolving the old recording drive on restart can block even if the copy is available.
+        is_copy = not task.import_verified and bool(task.local_input_path and path_key(source) != path_key(task.original_path))
         if not task.import_verified and not is_copy and not task.force_import:
             reason = self.duplicate_reason_for(source, cfg, task.task_id)
             if reason:
                 self.update_task(task.task_id, stage=STAGE_DUPLICATE_REVIEW, duplicate=True,
                                  duplicate_reason=reason, detail=reason)
                 return False
-        self.update_task(task.task_id, detail="Verifying source before conversion")
-        digest = cached_sha256_file(source, getattr(self, "duplicate_fingerprint_cache", None), task.conversion_stop_event)
+        label = f"Verifying source: {source.name}"
+        self.update_task(task.task_id, stage=STAGE_VERIFYING_SOURCE, detail="Verifying local source before encoding",
+                         progress=0, eta_seconds=None)
+        self.emit_progress("conversion", label, 0)
+        self.emit_log(f"Verifying local source before conversion: {source}")
+        started = time.monotonic()
+
+        def on_progress(percent: int, checked: int, total: int) -> None:
+            eta = (time.monotonic() - started) * (total - checked) / checked if checked else None
+            amount = f"{format_size(checked)} / {format_size(total)}"
+            self.update_task(task.task_id, progress=percent, detail=f"Verifying source: {amount}", eta_seconds=eta)
+            self.emit_progress("conversion", f"{label} · {amount}", percent, eta)
+
+        digest = cached_sha256_file(source, getattr(self, "duplicate_fingerprint_cache", None),
+                                    task.conversion_stop_event, on_progress)
         if task.skipped or self.shutdown_event.is_set() or task.conversion_stop_event.is_set():
             self.update_task(task.task_id, stage=STAGE_SKIPPED if task.skipped else STAGE_STOPPED,
                              detail="Source verification stopped")
             return False
         if not digest or ((is_copy or task.import_verified) and digest != task.original_checksum):
-            self.update_task(task.task_id, stage=STAGE_ERROR,
-                             detail="Local source could not be verified. Files were kept; check the original recording.")
+            reason = "Local file changed or could not be read" if not digest else "Local file does not match the saved source checksum"
+            error = f"{reason}: {source}. Check the local recording before retrying."
+            self.update_task(task.task_id, stage=STAGE_ERROR, detail=error, error_log=error, eta_seconds=None)
+            self.emit_log(error)
             return False
         if task.import_verified:
             return True
         size = source.stat().st_size
+        self.update_task(task.task_id, detail="Checking duplicate history before encoding", eta_seconds=None)
+        self.emit_progress("conversion", f"Checking duplicate history: {source.name}", 0)
         task.original_checksum = digest
         task.imported_size = size
         if not self.remember_original_checksum(digest, source.name, size, source):
@@ -7640,10 +7662,16 @@ class MesterSyncApp:
         stable = int(cfg.get("file_stable_seconds", 10))
         max_wait = int(cfg.get("max_ready_wait_seconds", 7200))
         start_wait = time.time()
-        self.update_task(task_id, conversion_started=True, stage=STAGE_WAITING, detail="Waiting for source file to be stable", progress=0)
+        self.update_task(task_id, conversion_started=True, stage=STAGE_WAITING, detail="Waiting for source file to be stable", progress=0, eta_seconds=None)
+        self.emit_progress("conversion", f"Waiting for stable source: {source.name}", 0)
         while not file_is_ready(source, stable, 1.0):
             if time.time() - start_wait > max_wait or cancelled():
                 self.update_task(task_id, stage=STAGE_STOPPED, detail="Conversion did not start")
+                return
+            if not source.is_file():
+                error = f"Conversion source became unavailable: {source}. Restore access and retry."
+                self.update_task(task_id, stage=STAGE_ERROR, detail=error, error_log=error)
+                self.emit_log(error)
                 return
             wait_for_resume()
         wait_for_resume()
@@ -7652,6 +7680,8 @@ class MesterSyncApp:
             return
         if not self.prepare_conversion_source(task, source, cfg):
             return
+        self.update_task(task_id, stage=STAGE_WAITING, detail="Preparing output for FFmpeg", progress=0, eta_seconds=None)
+        self.emit_progress("conversion", f"Preparing output: {source.name}", 0)
         raw_ffmpeg_args = list(task.ffmpeg_args or cfg.get("ffmpeg_args", DEFAULT_FFMPEG_ARGS))
         self.gui_queue.put(("preset_warning", task_id))
         # A preset must never be able to force overwriting the selected output.
@@ -7696,6 +7726,7 @@ class MesterSyncApp:
         stage_text = STAGE_CONVERTING_IN_PLACE if task.convert_in_place else STAGE_CONVERTING
         self.update_task(task_id, stage=stage_text, detail=f"Output: {output_path.name} | Preset: {task.preset_name}", output_path=output_path, output_ext=ext, progress=0, output_validated=False, converted_at=None, output_size=None)
         self.emit_log(f"Starting conversion {mode_text}: {source.name}")
+        self.emit_progress("conversion", f"Starting FFmpeg: {source.name}", 0)
         time_pattern = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
         fps_pattern = re.compile(r"fps=\s*([0-9.]+)")
         speed_pattern = re.compile(r"speed=\s*([0-9.]+x)")
@@ -7831,7 +7862,6 @@ class MesterSyncApp:
                     self.current_process = None
                     self.current_process_paused = False
             self.release_output_target(output_path)
-            self.emit_progress("conversion", "Conversion: idle", 0, None)
 
     def after_conversion(self, task_id: str) -> None:
         task = self.tasks.get(task_id)

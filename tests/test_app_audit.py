@@ -239,6 +239,26 @@ class AppAuditTests(unittest.TestCase):
         self.assertEqual(task.stage, STAGE_ERROR)
         self.assertEqual(task.original_path.read_bytes(), b"untouched card original")
 
+    def test_restored_import_reports_local_bytes_before_ffmpeg_without_its_card(self):
+        app, task, _ = self.pending_transfer()
+        task.stage = app_module.STAGE_VERIFYING_SOURCE
+        task.eta_seconds = 5400
+        task = storage.record_to_task(storage.task_to_record(task))
+        self.assertEqual(task.stage, app_module.STAGE_STOPPED)
+        self.assertIsNone(task.eta_seconds)
+        app.tasks[task.task_id] = task
+        task.original_path.unlink()
+        content = b"x" * (9 * 1024 * 1024)
+        task.local_input_path.write_bytes(content)
+        task.original_checksum = hashlib.sha256(content).hexdigest()
+        events = []
+        app.emit_progress = lambda *args: events.append((task.stage, task.detail, args))
+        with mock.patch.object(app_module, "path_key", side_effect=AssertionError("resolved the old card")):
+            self.assertTrue(app.prepare_conversion_source(task, task.local_input_path, app.get_config()))
+        self.assertTrue(all(stage == app_module.STAGE_VERIFYING_SOURCE for stage, _, _ in events))
+        self.assertTrue(any("4.00 MB / 9.00 MB" in detail and 0 < args[2] < 100 for _, detail, args in events))
+        self.assertEqual(events[-1][2][2], 100)
+
     def test_scan_error_on_one_drive_allows_next_drive_and_retries_first(self):
         with tempfile.TemporaryDirectory() as value:
             app = self.make_app(Path(value))

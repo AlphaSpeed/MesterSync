@@ -266,6 +266,7 @@ def sha256_file(
         total = initial_stat.st_size
         processed = 0
         last_percent = -1
+        last_report = time.monotonic()
         with path.open("rb") as fh:
             for chunk in iter(lambda: fh.read(4 * 1024 * 1024), b""):
                 if stop_event and stop_event.is_set():
@@ -273,9 +274,11 @@ def sha256_file(
                 h.update(chunk)
                 processed += len(chunk)
                 percent = int(processed / total * 100) if total else 100
-                if progress_callback and percent != last_percent:
-                    last_percent = percent
-                    progress_callback(percent, processed, total)
+                if progress_callback:
+                    now = time.monotonic()
+                    if percent != last_percent or now - last_report >= 1:
+                        last_percent, last_report = percent, now
+                        progress_callback(percent, processed, total)
         final_stat = path.stat()
         if processed != total or file_signature(final_stat) != file_signature(initial_stat):
             return None

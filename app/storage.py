@@ -27,6 +27,7 @@ from tasks import (
     STAGE_STOPPED,
     STAGE_STOPPING,
     STAGE_TRANSFERRING,
+    STAGE_VERIFYING_SOURCE,
     STAGE_WAITING,
     STAGE_WAITING_TRANSFER,
     TaskState,
@@ -632,11 +633,13 @@ def record_to_task(record: Dict[str, Any]) -> Optional[TaskState]:
             STAGE_WAITING_TRANSFER,
             STAGE_TRANSFERRING,
             STAGE_WAITING,
+            STAGE_VERIFYING_SOURCE,
             STAGE_COMPLETE,
         }:
             task.stage = STAGE_STOPPED
             task.detail = "Ready to resume after restart."
             task.progress = 0
+            task.eta_seconds = None
         return task
     except Exception:
         return None

@@ -3,7 +3,7 @@ import math
 
 from file_utils import format_duration
 from tasks import (STAGE_CHECKING, STAGE_DETECTED, STAGE_IMPORTING, STAGE_IMPORTED,
-                   STAGE_QUEUED, STAGE_WAITING, STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE)
+                   STAGE_QUEUED, STAGE_WAITING, STAGE_VERIFYING_SOURCE, STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE)
 
 
 def positive(value):
@@ -17,7 +17,7 @@ def positive(value):
 def queue_estimate(tasks, current_id, rates, default_args, enabled=True, paused=False):
     eligible = [task for task in tasks if not task.skipped and not (task.duplicate and not task.force_import)
                 and task.stage in {STAGE_CHECKING, STAGE_DETECTED, STAGE_IMPORTING, STAGE_IMPORTED,
-                                   STAGE_QUEUED, STAGE_WAITING, STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE}]
+                                   STAGE_QUEUED, STAGE_WAITING, STAGE_VERIFYING_SOURCE, STAGE_CONVERTING, STAGE_CONVERTING_IN_PLACE}]
     if not eligible:
         return "Queue: no conversions waiting"
     if paused:
@@ -31,7 +31,7 @@ def queue_estimate(tasks, current_id, rates, default_args, enabled=True, paused=
         eligible = forced
     known, unknown = 0.0, 0
     for task in eligible:
-        if task.task_id == current_id:
+        if task.task_id == current_id and task.stage != STAGE_VERIFYING_SOURCE:
             remaining = positive(task.eta_seconds)
             if remaining is not None:
                 known += remaining
